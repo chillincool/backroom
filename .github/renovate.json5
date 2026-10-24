@@ -1,0 +1,47 @@
+{
+  $schema: 'https://docs.renovatebot.com/renovate-schema.json',
+  extends: [
+    'config:recommended',
+    ':dependencyDashboard',
+    ':semanticCommits',
+    // Keep GitHub Actions pinned to commit SHAs (with a version comment).
+    'helpers:pinGitHubActionDigests',
+    ':timezone(America/Chicago)',
+  ],
+  dependencyDashboardTitle: 'Renovate Dashboard 🤖',
+  // One batch of update PRs a week. Security fixes ignore the schedule.
+  schedule: ['before 6am on monday'],
+  vulnerabilityAlerts: {
+    schedule: ['at any time'],
+    labels: ['security'],
+  },
+  // config:recommended skips test/ folders; here test/e2e/compose.yaml pins
+  // the soju, Keycloak, ergo and Caddy images, so scan it.
+  ignorePaths: ['**/node_modules/**', '**/vendor/**'],
+  labels: ['dependencies'],
+  packageRules: [
+    {
+      description: 'All GitHub Actions in one PR',
+      matchManagers: ['github-actions'],
+      groupName: 'GitHub Actions',
+    },
+    {
+      description: 'Non-major crate updates in one PR; majors stay separate',
+      matchManagers: ['cargo'],
+      matchUpdateTypes: ['minor', 'patch'],
+      groupName: 'Rust crates',
+    },
+    {
+      description: 'Developer and test tooling (mise, e2e images) in one PR',
+      matchFileNames: ['mise.toml', 'test/e2e/**', 'scripts/**'],
+      groupName: 'dev and test tooling',
+    },
+    // Later rules override earlier ones.
+    {
+      description: 'soju and Keycloak track production (chillincool-infra); review those bumps on their own',
+      matchFileNames: ['test/e2e/**'],
+      matchDepNames: ['codeberg.org/emersion/soju', 'quay.io/keycloak/keycloak'],
+      groupName: null,
+    },
+  ],
+}

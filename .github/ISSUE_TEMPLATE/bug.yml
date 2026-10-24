@@ -1,0 +1,38 @@
+name: Bug report
+description: Something doesn't work as documented
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations: { required: true }
+  - type: input
+    id: version
+    attributes:
+      label: Backroom version or commit
+      description: Shown by `backroom --version`.
+    validations: { required: true }
+  - type: dropdown
+    id: transport
+    attributes:
+      label: How do you connect?
+      options: [WebSocket (wss://), TLS (ircs://), plain TCP (irc+insecure://)]
+    validations: { required: true }
+  - type: dropdown
+    id: login
+    attributes:
+      label: Login method
+      options: [OAUTHBEARER (OAuth/OIDC), PLAIN with an OAuth token, PLAIN with a soju password]
+    validations: { required: true }
+  - type: input
+    id: server
+    attributes:
+      label: soju version and auth setup
+      placeholder: e.g. soju 0.11.1, auth oauth2 with Keycloak 26.8
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output
+      description: Run with `--raw -v` for IRC traffic (AUTHENTICATE lines are redacted). Remove any other secrets first.
+      render: text

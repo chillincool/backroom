@@ -1,0 +1,59 @@
+# End-to-end stack, driven by scripts/e2e.sh. Every port is bound to
+# 127.0.0.1 only. Images are pinned by digest; Renovate keeps them current.
+#
+#   keycloak       18080        e2e realm (test/e2e/keycloak/realm.json)
+#   soju-oauth2    18081 ws   16667 irc+insecure   16697 ircs
+#   soju-internal  28081 ws   26667 irc+insecure   26697 ircs
+#   soju-http      38081 ws   36667 irc+insecure   36697 ircs
+#   ergo           (internal) upstream IRC server for history tests
+#   httpauth       (internal) stub for soju's `auth http`
+name: backroom-e2e
+
+x-soju: &soju
+  image: codeberg.org/emersion/soju:v0.11.1@sha256:d96e0e796eab43fdea143e2ccfdd586bb5b04e3bb6a6dc544b01c35ebeaef74a
+  tmpfs: [/data, /run/soju]
+
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.8.1@sha256:a78d6b79572168cb25886b80a8b5b8d4ed4390743e3eecb810538683e209dd6b
+    command: [start-dev, --import-realm]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      # Tests get tokens via localhost:18080, soju introspects them via
+      # keycloak:8080. A fixed hostname keeps `iss` the same for both, and
+      # back-channel endpoints follow the host the request came in on.
+      KC_HOSTNAME: http://localhost:18080
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+    ports: ["127.0.0.1:18080:8080"]
+    volumes:
+      - ./keycloak/realm.json:/opt/keycloak/data/import/realm.json:ro
+
+  ergo:
+    image: ghcr.io/ergochat/ergo:v2.19.1@sha256:ef885e44f7fa19101bbbc41baef11dc280dc8107465dccaf6f0860f41b48a682
+
+  httpauth:
+    image: caddy:2.11.7-alpine@sha256:eb4d35b7452d1ab6171fbdbe8d9275b2301dad6dad92115d91e19fb9b24d510f
+    volumes:
+      - ./httpauth/Caddyfile:/etc/caddy/Caddyfile:ro
+
+  soju-oauth2:
+    <<: *soju
+    ports: ["127.0.0.1:18081:8080", "127.0.0.1:16667:6667", "127.0.0.1:16697:6697"]
+    volumes:
+      - ./soju/oauth2.conf:/soju-config:ro
+      - ../../.e2e/certs:/certs:ro
+
+  soju-internal:
+    <<: *soju
+    ports: ["127.0.0.1:28081:8080", "127.0.0.1:26667:6667", "127.0.0.1:26697:6697"]
+    volumes:
+      - ./soju/internal.conf:/soju-config:ro
+      - ../../.e2e/certs:/certs:ro
+
+  soju-http:
+    <<: *soju
+    ports: ["127.0.0.1:38081:8080", "127.0.0.1:36667:6667", "127.0.0.1:36697:6697"]
+    volumes:
+      - ./soju/http.conf:/soju-config:ro
+      - ../../.e2e/certs:/certs:ro

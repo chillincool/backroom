@@ -1,0 +1,48 @@
+# Tools and tasks for working on Backroom. CI runs the same tasks, so
+# `mise run ci` and `mise run e2e` locally do exactly what GitHub Actions does.
+#   mise install        install the pinned tools
+#   mise tasks          list tasks
+
+[tools]
+rust = { version = "1.93.0", components = "clippy,rustfmt" }
+"aqua:EmbarkStudios/cargo-deny" = "0.20.2"
+
+[tasks.fmt]
+description = "Fail if any Rust file needs rustfmt"
+run = "cargo fmt --all --check"
+
+[tasks.clippy]
+description = "Clippy, warnings are errors"
+run = "cargo clippy --workspace --all-targets --locked -- -D warnings"
+
+[tasks.test]
+description = "Unit tests (no network, no Docker)"
+run = "cargo test --workspace --locked"
+
+[tasks.deny]
+description = "cargo-deny: vulnerable or unmaintained crates, licences, sources (deny.toml)"
+run = "cargo deny check"
+
+[tasks.ci]
+description = "Everything CI checks except e2e"
+depends = ["fmt", "clippy", "test", "deny"]
+
+[tasks.e2e]
+description = "End-to-end tests against soju, Keycloak and ergo in Docker (start, test, stop)"
+run = "scripts/e2e.sh all"
+
+[tasks."e2e:up"]
+description = "Start the e2e stack and keep it running"
+run = "scripts/e2e.sh up"
+
+[tasks."e2e:test"]
+description = "Rerun the e2e tests on the running stack"
+run = "scripts/e2e.sh test"
+
+[tasks."e2e:down"]
+description = "Stop the e2e stack and delete its data"
+run = "scripts/e2e.sh down"
+
+[tasks."e2e:realm"]
+description = "Regenerate test/e2e/keycloak/realm.json from build-realm.sh (slow)"
+run = "scripts/e2e.sh realm"

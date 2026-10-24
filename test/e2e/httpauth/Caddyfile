@@ -1,0 +1,16 @@
+# Stub for soju's `auth http`: 200 for carol / http-secret, 403 otherwise
+# (Caddy answers bad Basic credentials with 401; soju wants 403).
+{
+	admin off
+}
+
+:8080 {
+	basic_auth {
+		carol $2a$14$vqrLYC2j1wCGgLJgGgCvXOdkvX8dgbw5kz4tdTXUo0aPvE8cBm8Om
+	}
+	respond 200
+
+	handle_errors {
+		respond 403
+	}
+}

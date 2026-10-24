@@ -1,0 +1,43 @@
+# cargo-deny: run by `mise run deny` and CI.
+#   advisories  known vulnerabilities and unmaintained crates (RustSec)
+#   licenses    every dependency must use one of the licences below
+#   bans        no duplicate-version warnings yet (oauth2 pins older crates)
+#   sources     crates only from crates.io
+
+[graph]
+all-features = false
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+# Permissive licences only. Crates offering a choice (e.g. "MIT OR Apache-2.0")
+# pass if any option is here.
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "CDLA-Permissive-2.0", # webpki-roots (Mozilla's CA list)
+  "ISC",
+  "MIT",
+  "Unicode-3.0",
+]
+exceptions = [
+  # Weak, file-level copyleft; used unmodified via `dirs` in the CLI only.
+  { crate = "option-ext", allow = ["MPL-2.0"] },
+]
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+# The CLI depends on the core by path; both are publish = false.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
