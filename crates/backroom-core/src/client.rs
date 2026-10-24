@@ -65,6 +65,14 @@ pub enum ClientError {
     Fail { line: String },
 }
 
+/// One unit of incoming traffic: a message outside any batch, or a completed
+/// top-level batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Incoming {
+    Message(Message),
+    Batch(Batch),
+}
+
 pub struct Client {
     transport: Box<dyn Transport>,
     info: Registered,
@@ -197,6 +205,32 @@ impl Client {
             )
             .await?;
         Ok(batch.messages)
+    }
+
+    /// Reads the next message or completed batch. PINGs are returned like any
+    /// other message; the caller answers them.
+    ///
+    /// Cancel-safe: the only await point is reading a line, and partial
+    /// batches are kept in `self`, so this can be used in `tokio::select!`.
+    pub async fn next_incoming(&mut self) -> Result<Incoming, ClientError> {
+        loop {
+            let Some(line) = self.transport.recv().await? else {
+                return Err(ClientError::Closed);
+            };
+            tracing::trace!(target: RAW, "<- {line}");
+            let msg = match Message::parse(&line) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!(error = %e, "ignoring unparseable line");
+                    continue;
+                }
+            };
+            match self.batches.feed(msg) {
+                Feed::Unbatched(msg) => return Ok(Incoming::Message(msg)),
+                Feed::Completed(batch) => return Ok(Incoming::Batch(batch)),
+                Feed::Buffered => {}
+            }
+        }
     }
 
     /// Reads until an unbatched message matches `pred`, answering PINGs.

@@ -65,8 +65,10 @@ up() {
 
 	log "Creating soju users"
 	# Fails harmlessly when the user exists (re-running `up`).
-	"${COMPOSE[@]}" exec -T soju-internal sojuctl -config /soju-config \
-		user create -username dave -password dave-secret || true
+	for user in dave erin; do
+		"${COMPOSE[@]}" exec -T soju-internal sojuctl -config /soju-config \
+			user create -username "$user" -password "$user-secret" || true
+	done
 }
 
 test_() {

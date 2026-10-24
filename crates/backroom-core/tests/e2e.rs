@@ -15,6 +15,8 @@ use backroom_core::auth::{
     CredentialProvider, OidcClient, OidcConfig, OidcCredentials, StaticCredentials, StoreError,
     TokenSet, TokenStore,
 };
+use backroom_core::live::{self, Command, ConnectionState, Event, SessionConfig};
+use backroom_core::model::{BufferKind, MessageKind};
 use backroom_core::proto::Message;
 use backroom_core::sasl::SaslCredentials;
 use backroom_core::session::RegistrationError;
@@ -366,6 +368,33 @@ async fn ircs_rejects_an_untrusted_certificate() {
 // ---------------------------------------------------------------------------
 // Bouncer networks and chat history, with ergo as the upstream server
 
+/// Adds ergo as an upstream network for `user` and waits until soju is
+/// connected to it. Returns the network ID.
+async fn add_ergo_network(creds: &StaticCredentials, user: &str, name: &str, nick: &str) -> String {
+    let mut control = connect(SOJU_INTERNAL.irc, creds, user, None).await.unwrap();
+    control
+        .send(&Message::new(
+            "BOUNCER",
+            [
+                "ADDNETWORK".to_owned(),
+                format!("name={name};host=ergo;port=6667;tls=0;nickname={nick}"),
+            ],
+        ))
+        .await
+        .unwrap();
+    for _ in 0..30 {
+        let networks = control.list_networks().await.unwrap();
+        if let Some(n) = networks.iter().find(|n| n.name() == Some(name))
+            && n.state() == Some("connected")
+        {
+            control.quit().await.ok();
+            return n.id.clone();
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    panic!("soju never connected {user} to ergo");
+}
+
 #[tokio::test]
 #[ignore = "needs the e2e stack (scripts/e2e.sh)"]
 async fn history_round_trip_through_ergo() {
@@ -375,35 +404,7 @@ async fn history_round_trip_through_ergo() {
     let nick = format!("dave{id}");
     let channel = format!("#e2e-{id}");
 
-    // Add ergo as an upstream network and wait until soju is connected.
-    let mut control = connect(SOJU_INTERNAL.irc, &creds, "dave", None)
-        .await
-        .unwrap();
-    control
-        .send(&Message::new(
-            "BOUNCER",
-            [
-                "ADDNETWORK".to_owned(),
-                format!("name={network};host=ergo;port=6667;tls=0;nickname={nick}"),
-            ],
-        ))
-        .await
-        .unwrap();
-    let netid = {
-        let mut found = None;
-        for _ in 0..30 {
-            let networks = control.list_networks().await.unwrap();
-            if let Some(n) = networks.iter().find(|n| n.name() == Some(network.as_str()))
-                && n.state() == Some("connected")
-            {
-                found = Some(n.id.clone());
-                break;
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-        found.expect("soju never connected to ergo")
-    };
-    control.quit().await.ok();
+    let netid = add_ergo_network(&creds, "dave", &network, &nick).await;
 
     // Bound connection: join, talk, then read it back.
     for url in SOJU_INTERNAL.urls() {
@@ -455,4 +456,153 @@ async fn history_round_trip_through_ergo() {
         "every message has server-time"
     );
     client.quit().await.ok();
+}
+
+// ---------------------------------------------------------------------------
+// Long-lived session (backroom_core::live)
+
+/// Next event matching `pred`, failing after 30 seconds.
+async fn next_event(
+    events: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+    what: &str,
+    pred: impl Fn(&Event) -> bool,
+) -> Event {
+    let wait = async {
+        loop {
+            let event = events.recv().await.expect("session stopped");
+            if pred(&event) {
+                return event;
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(30), wait)
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+}
+
+#[tokio::test]
+#[ignore = "needs the e2e stack (scripts/e2e.sh)"]
+async fn live_session_talks_loads_history_and_syncs_read_markers() {
+    let id = unique();
+    let channel = format!("#live-{id}");
+    let erin_nick = format!("erin{id}");
+
+    // erin joins the channel with an ordinary connection.
+    let erin_creds = plain("erin", "erin-secret");
+    let erin_net =
+        add_ergo_network(&erin_creds, "erin", &format!("ergo-erin-{id}"), &erin_nick).await;
+    let mut erin = connect(SOJU_INTERNAL.irc, &erin_creds, &erin_nick, Some(erin_net))
+        .await
+        .unwrap();
+    erin.send(&Message::new("JOIN", [channel.clone()]))
+        .await
+        .unwrap();
+    erin.wait_for("erin's JOIN", |m| m.command == "JOIN")
+        .await
+        .unwrap();
+
+    // dave runs a live session.
+    let dave_net = add_ergo_network(
+        &plain("dave", "dave-secret"),
+        "dave",
+        &format!("ergo-live-{id}"),
+        &format!("dave{id}"),
+    )
+    .await;
+    let connector = connector_for_url(SOJU_INTERNAL.ws, tls()).unwrap();
+    let (session, mut events) = live::start(SessionConfig::new(
+        Arc::from(connector),
+        Arc::new(plain("dave", "dave-secret")),
+        "dave",
+    ));
+    next_event(&mut events, "dave's network to connect", |e| {
+        matches!(e, Event::Connection { network: Some(n), state: ConnectionState::Connected } if *n == dave_net)
+    })
+    .await;
+
+    let in_channel = |e: &Event, text: &str| {
+        matches!(e, Event::Message { network, buffer, message }
+            if *network == dave_net && buffer.eq_ignore_ascii_case(&channel) && message.text == text)
+    };
+
+    // Join through the session; the channel appears as a buffer.
+    session.send(Command::Join {
+        network: dave_net.clone(),
+        channel: channel.clone(),
+    });
+    next_event(&mut events, "channel buffer", |e| {
+        matches!(e, Event::BufferAdded { network, name, kind: BufferKind::Channel }
+            if *network == dave_net && name.eq_ignore_ascii_case(&channel))
+    })
+    .await;
+
+    // erin talks; dave's session sees it live.
+    erin.send(&Message::new(
+        "PRIVMSG",
+        [channel.clone(), "hi dave".into()],
+    ))
+    .await
+    .unwrap();
+    let Event::Message { message, .. } =
+        next_event(&mut events, "erin's message", |e| in_channel(e, "hi dave")).await
+    else {
+        unreachable!()
+    };
+    assert_eq!(message.sender, erin_nick);
+    assert!(!message.own);
+
+    // dave answers; the echo comes back as his own message, and erin gets it.
+    session.send(Command::SendMessage {
+        network: dave_net.clone(),
+        target: channel.clone(),
+        text: "hi erin".into(),
+    });
+    let Event::Message { message: reply, .. } =
+        next_event(&mut events, "dave's echo", |e| in_channel(e, "hi erin")).await
+    else {
+        unreachable!()
+    };
+    assert!(reply.own);
+    erin.wait_for("dave's reply", |m| {
+        m.command == "PRIVMSG" && m.param(1) == Some("hi erin")
+    })
+    .await
+    .unwrap();
+
+    // History has both, in order.
+    session.send(Command::LoadHistory {
+        network: dave_net.clone(),
+        target: channel.clone(),
+        before: None,
+        limit: 10,
+    });
+    let Event::History { messages, .. } = next_event(&mut events, "history", |e| {
+        matches!(e, Event::History { network, buffer, .. } if *network == dave_net && buffer.eq_ignore_ascii_case(&channel))
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    let texts: Vec<&str> = messages
+        .iter()
+        .filter(|m| m.kind == MessageKind::Privmsg)
+        .map(|m| m.text.as_str())
+        .collect();
+    assert_eq!(texts, ["hi dave", "hi erin"]);
+
+    // Read marker round trip.
+    session.send(Command::MarkRead {
+        network: dave_net.clone(),
+        target: channel.clone(),
+        time: reply.time,
+    });
+    next_event(&mut events, "read marker", |e| {
+        matches!(e, Event::ReadMarker { network, buffer, time: Some(t) }
+            if *network == dave_net && buffer.eq_ignore_ascii_case(&channel) && *t == reply.time)
+    })
+    .await;
+
+    session.shutdown();
+    next_event(&mut events, "shutdown", |e| *e == Event::Stopped).await;
+    erin.quit().await.ok();
 }
