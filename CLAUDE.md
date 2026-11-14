@@ -136,6 +136,32 @@ with `MockConnector::concurrent`.
   and the member list is a `LazyVStack`; a sectioned `List` with ~1,600 rows
   made channel switching take seconds.
 
+## Pick up here (2026-11-14)
+
+- Branch `feat/app-polish`, 3+ commits ahead of `main`, **not pushed**. When
+  ready: `git push -u origin feat/app-polish`, `gh pr create`, then
+  `gh pr merge --squash --auto` (dismiss CodeQL test-password alerts if any).
+- Just changed: the app requests `offline_access` so its refresh token
+  outlives Keycloak's 30-min idle session (`ssoSessionIdleTimeout`); before,
+  any reconnect after 30 min connected logged the user out
+  (`REFRESH_TOKEN_ERROR … Token is not active`). **Verify** after the owner
+  logs out/in: alice should have an offline session for `backroom`
+  (Keycloak admin API: `GET /admin/realms/e2e/users/<id>/offline-sessions/<client-uuid>`).
+  Production: confirm the `backroom` client has `offline_access` as an
+  optional client scope before relying on it.
+- Owner still has to rejoin channels in the test stack (`/j libera,linux,backroom-dev`
+  on libera, `/j backroom` on ergo-test, `/j 420` on P2P-Network).
+- Dev setup running: e2e stack up (`mise run e2e:up`), soju-oauth2 data on
+  volume `soju-oauth2-data` (survives recreation; `e2e.sh down` deletes it),
+  alice has networks ergo-test, libera (nick backroom-dev), P2P-Network
+  (nick chillin-dev). Rex backroom tab panes: nvim, lazygit, bacon
+  (`clippy-all`), Claude, shell, plus soju log, CI watcher and the bob test
+  bot (scratchpad script; gone after this session).
+- Not done / ideas: production use (add `backroom://oauth/callback` to
+  production Keycloak's `backroom` client), notifications, search, nick
+  completion, multiple accounts, mIRC colours, offline start without
+  Keycloak reachable, `macos` as a required check (deferred by owner).
+
 ## Decisions
 
 - Bundle ID `net.chillincool.backroom`; login redirect
