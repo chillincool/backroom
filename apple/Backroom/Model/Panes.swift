@@ -47,6 +47,12 @@ struct PaneLayout: Codable, Equatable {
         }
     }
 
+    /// Back to one pane: the focused one.
+    mutating func closeOthers() {
+        guard let pane = focusedPane else { return }
+        root = .pane(pane)
+    }
+
     /// Sets the sizes of a split's children (fractions summing to 1).
     mutating func resize(split: UUID, fractions: [Double]) {
         root.updateSplit(split) { $0.fractions = fractions }

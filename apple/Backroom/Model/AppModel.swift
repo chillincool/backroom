@@ -378,6 +378,10 @@ final class AppModel {
         layout.close(pane ?? layout.focused)
     }
 
+    func closeOtherPanes() {
+        layout.closeOthers()
+    }
+
     func moveFocus(_ direction: PaneDirection) {
         if let next = layout.neighbour(direction) { layout.focused = next }
     }

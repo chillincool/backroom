@@ -86,6 +86,9 @@ struct ChatCommands: Commands {
             Button("Close Pane") { model.closePane() }
                 .keyboardShortcut("w")
                 .disabled(model.layout.panes.count < 2)
+            Button("Close Other Panes") { model.closeOtherPanes() }
+                .keyboardShortcut("w", modifiers: [.command, .option])
+                .disabled(model.layout.panes.count < 2)
             Menu("Move Focus") {
                 Button("Left") { model.moveFocus(.left) }
                     .keyboardShortcut(.leftArrow, modifiers: [.command, .option])

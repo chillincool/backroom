@@ -498,7 +498,10 @@ let net = Network(id: "1", name: "libera", upstreamState: "connected", attribute
         model.apply(.bufferRemoved(network: "1", name: "#c"))
         #expect(!model.layout.panes.contains { $0.buffer == c })
 
-        model.closePane()
+        let focused = model.layout.focused
+        model.closeOtherPanes()
+        #expect(model.layout.panes.map(\.id) == [focused])
+        model.split(.horizontal)
         model.closePane()
         #expect(model.layout.panes.count == 1)
         model.closePane()

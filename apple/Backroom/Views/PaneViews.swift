@@ -132,14 +132,33 @@ struct PaneHeader: View {
                 .lineLimit(1)
                 .layoutPriority(1)
             if let topic = buffer?.topic {
-                Text(MessageText.attributed(topic, formatting: prefs.showFormatting, theme: theme))
-                    .foregroundStyle(theme.mutedColor)
-                    .lineLimit(expanded ? nil : 1)
-                    .help(stripFormatting(text: topic))
-                    .textSelection(.enabled)
-                    .onTapGesture { expanded.toggle() }
+                let text = Text(MessageText.attributed(topic, formatting: prefs.showFormatting, theme: theme))
+                Group {
+                    // Selectable text takes clicks for itself, so the
+                    // collapsed topic isn't: a click on it expands it.
+                    if expanded {
+                        text.textSelection(.enabled)
+                    } else {
+                        text
+                            .contentShape(Rectangle())
+                            .onTapGesture { expanded = true }
+                    }
+                }
+                .foregroundStyle(theme.mutedColor)
+                .lineLimit(expanded ? nil : 1)
+                .fixedSize(horizontal: false, vertical: expanded)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .help(expanded ? "" : stripFormatting(text: topic))
+                Button {
+                    expanded.toggle()
+                } label: {
+                    Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                }
+                .buttonStyle(.borderless)
+                .help(expanded ? "Show the topic on one line" : "Show the whole topic")
+            } else {
+                Spacer(minLength: 0)
             }
-            Spacer(minLength: 0)
             if closable {
                 Button {
                     model.closePane(pane.id)

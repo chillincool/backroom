@@ -20,6 +20,17 @@ use crate::proto::Message;
 use crate::proto::message::escape_tag_value;
 use crate::session::Registered;
 
+/// Messages fetched to check whether a correspondent from TARGETS ever
+/// sent more than notices.
+const PROBE_LIMIT: usize = 50;
+
+/// A CTCP request other than ACTION (VERSION, PING, …): not conversation.
+fn is_ctcp_query(msg: &Message) -> bool {
+    msg.param(1)
+        .and_then(|t| t.strip_prefix('\u{1}'))
+        .is_some_and(|t| !t.starts_with("ACTION"))
+}
+
 /// `RPL_LIST` entries per [`Event::ChannelList`]: few enough events for
 /// a 50,000-channel network, each small enough to apply quickly.
 const LIST_CHUNK: usize = 500;
@@ -73,6 +84,9 @@ struct Network {
     who_pending: HashSet<String>,
     /// WHOIS replies being collected, by nick key.
     whois: HashMap<String, WhoisInfo>,
+    /// Correspondents from CHATHISTORY TARGETS whose recent history we're
+    /// checking for real messages (keys).
+    probing: HashSet<String>,
 }
 
 impl Network {
@@ -403,6 +417,7 @@ impl Coordinator {
                                 who_requested: HashSet::new(),
                                 who_pending: HashSet::new(),
                                 whois: HashMap::new(),
+                                probing: HashSet::new(),
                             },
                         );
                         info
@@ -430,6 +445,7 @@ impl Coordinator {
         net.who_requested.clear();
         net.who_pending.clear();
         net.whois.clear();
+        net.probing.clear();
         net.whox = false;
         for (key, value) in &reg.isupport {
             net.set_isupport(key, Some(value));
@@ -461,27 +477,55 @@ impl Coordinator {
     fn batch(&mut self, id: &str, batch: Batch) {
         match batch.kind.as_str() {
             "draft/chathistory-targets" => {
+                let Some(net) = self.networks.get_mut(id) else {
+                    return;
+                };
                 for msg in &batch.messages {
                     // CHATHISTORY TARGETS <target> <latest timestamp>
                     // Only private conversations: channel buffers come from
-                    // JOINs, so channels we've left don't come back.
+                    // JOINs, so channels we've left don't come back. soju
+                    // also lists everyone who only sent us notices (network
+                    // announcements, services), so check the latest messages
+                    // first; the buffer appears if there's a real one.
                     if msg.command == "CHATHISTORY"
                         && msg.param(0) == Some("TARGETS")
                         && let Some(target) = msg.param(1)
-                        && self
-                            .networks
-                            .get(id)
-                            .is_some_and(|net| !net.ctx().is_channel(target))
+                        && !net.ctx().is_channel(target)
+                        && !net.buffers.contains_key(&buffer_key(target))
+                        && net.probing.insert(buffer_key(target))
                     {
-                        self.ensure_buffer(id, target, BufferKind::Query);
+                        let probe = Message::new(
+                            "CHATHISTORY",
+                            [
+                                "LATEST".into(),
+                                target.to_owned(),
+                                "*".into(),
+                                PROBE_LIMIT.to_string(),
+                            ],
+                        );
+                        let _ = net.conn.send(ToConn::Send(probe));
                     }
                 }
             }
             "chathistory" => {
-                let Some(net) = self.networks.get(id) else {
+                let Some(target) = batch.params.first() else {
                     return;
                 };
-                let Some(target) = batch.params.first() else {
+                if self
+                    .networks
+                    .get_mut(id)
+                    .is_some_and(|net| net.probing.remove(&buffer_key(target)))
+                {
+                    let real = batch
+                        .messages
+                        .iter()
+                        .any(|m| m.command == "PRIVMSG" && !is_ctcp_query(m));
+                    if real {
+                        self.ensure_buffer(id, target, BufferKind::Query);
+                    }
+                    return;
+                }
+                let Some(net) = self.networks.get(id) else {
                     return;
                 };
                 let ctx = net.ctx();
@@ -828,9 +872,18 @@ impl Coordinator {
         let Some(net) = self.networks.get(id) else {
             return;
         };
-        let Some((buffer, kind, message)) = route(msg, &net.ctx()) else {
+        let Some((mut buffer, mut kind, message)) = route(msg, &net.ctx()) else {
             return;
         };
+        // Notices to us (network announcements, services) go to the server
+        // buffer unless we're already talking with the sender.
+        if kind == BufferKind::Query
+            && message.kind == MessageKind::Notice
+            && !net.buffers.contains_key(&buffer_key(&buffer))
+        {
+            buffer = SERVER_BUFFER.to_owned();
+            kind = BufferKind::Server;
+        }
         let replayed_join = message.own
             && message.kind == MessageKind::Join
             && !self
@@ -1037,18 +1090,56 @@ mod tests {
             Some("1".into()),
             FromConn::Incoming(Incoming::Batch(batch.clone())),
         );
-        let ev = h.events();
-        // Channels come from JOINs, so ones we've left don't come back.
-        assert!(
-            !ev.iter()
-                .any(|e| matches!(e, Event::BufferAdded { name, .. } if name == "#rust"))
+        // Channels come from JOINs, so ones we've left don't come back;
+        // correspondents are checked for real messages first.
+        assert!(h.events().is_empty());
+        assert_eq!(h.sent(Some("1")), ["CHATHISTORY LATEST alice * 50"]);
+        let history = |target: &str, lines: &[&str]| Batch {
+            kind: "chathistory".into(),
+            params: vec![target.into()],
+            tags: vec![],
+            messages: lines.iter().map(|l| Message::parse(l).unwrap()).collect(),
+            children: vec![],
+        };
+        h.c.on_connection(
+            Some("1".into()),
+            FromConn::Incoming(Incoming::Batch(history(
+                "alice",
+                &[":alice!u@h NOTICE me :hi", ":alice!u@h PRIVMSG me :hello"],
+            ))),
         );
-        assert!(ev.contains(&Event::BufferAdded {
-            network: "1".into(),
-            name: "alice".into(),
-            kind: BufferKind::Query
-        }));
+        assert_eq!(
+            h.events(),
+            [Event::BufferAdded {
+                network: "1".into(),
+                name: "alice".into(),
+                kind: BufferKind::Query
+            }]
+        );
         assert_eq!(h.sent(Some("1")), ["MARKREAD alice"]);
+
+        // Someone who only ever sent notices doesn't get a buffer.
+        batch.messages = vec![
+            Message::parse("CHATHISTORY TARGETS Global timestamp=2026-10-02T00:00:00.000Z")
+                .unwrap(),
+        ];
+        h.c.on_connection(
+            Some("1".into()),
+            FromConn::Incoming(Incoming::Batch(batch.clone())),
+        );
+        h.c.on_connection(
+            Some("1".into()),
+            FromConn::Incoming(Incoming::Batch(history(
+                "Global",
+                &[":Global!s@net NOTICE me :[Logon News] donate"],
+            ))),
+        );
+        assert!(h.events().is_empty());
+        batch.messages = vec![
+            Message::parse("CHATHISTORY TARGETS #rust timestamp=2026-10-01T00:00:00.000Z").unwrap(),
+            Message::parse("CHATHISTORY TARGETS alice timestamp=2026-10-02T00:00:00.000Z").unwrap(),
+        ];
+        h.sent(Some("1"));
 
         // Known buffers aren't announced twice.
         batch.messages.truncate(1);
@@ -1548,6 +1639,35 @@ mod tests {
         // Once per connection.
         joined_with(&mut h, "#a", "alice me");
         assert!(!h.sent(Some("1")).iter().any(|l| l.starts_with("WHO")));
+    }
+
+    #[test]
+    fn notices_to_us_go_to_the_server_buffer() {
+        let mut h = Harness::new();
+        h.connected_network(&[]);
+        h.line(
+            Some("1"),
+            ":Global!services@net NOTICE me :[Logon News] hello",
+        );
+        let ev = h.events();
+        assert!(
+            !ev.iter()
+                .any(|e| matches!(e, Event::BufferAdded { name, .. } if name == "Global"))
+        );
+        assert_eq!(
+            messages(&ev),
+            [(
+                SERVER_BUFFER.into(),
+                MessageKind::Notice,
+                "Global".into(),
+                "[Logon News] hello".into()
+            )]
+        );
+        // Once we're talking, their notices stay in the conversation.
+        h.line(Some("1"), ":bob!u@h PRIVMSG me :hi");
+        h.line(Some("1"), ":bob!u@h NOTICE me :psst");
+        let ev = h.events();
+        assert_eq!(messages(&ev)[1].0, "bob");
     }
 
     #[test]
