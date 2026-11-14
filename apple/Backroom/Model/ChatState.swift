@@ -1,5 +1,6 @@
 import BackroomCore
 import Foundation
+import Observation
 
 /// A buffer is identified by its network and case-folded name.
 struct BufferID: Hashable, Sendable {
@@ -12,33 +13,56 @@ struct BufferID: Hashable, Sendable {
     }
 }
 
-struct BufferState: Identifiable {
+/// One buffer's state. A class of its own so views observe just the
+/// buffer they show: a message in one channel doesn't redraw the others.
+@MainActor @Observable
+final class BufferModel: Identifiable {
     let id: BufferID
     /// Name as the server spelled it; used as the IRC target.
     var name: String
     var kind: BufferKind
-    var messages: [ChatMessage] = []
+    private(set) var messages: [ChatMessage] = []
     /// Everything up to here has been read (on any device).
     var readMarker: Date?
     var historyRequested = false
     var historyLoading = false
     /// The server has no older messages.
     var historyExhausted = false
+    /// Channel topic, mIRC formatting included; nil if none.
+    var topic: String?
+    /// The topic the user closed the banner on; it returns if the topic changes.
+    var dismissedTopic: String?
+    /// Channel members, highest rank first.
+    var members: [Member] = [] {
+        didSet { prefixByNick = Dictionary(members.map { ($0.nick.lowercased(), $0.prefix) }) { a, _ in a } }
+    }
+    /// Membership prefix by case-folded nick, for colouring senders.
+    private(set) var prefixByNick: [String: String] = [:]
+
+    @ObservationIgnored private var knownIDs: Set<String> = []
+
+    init(id: BufferID, name: String, kind: BufferKind) {
+        self.id = id
+        self.name = name
+        self.kind = kind
+    }
 
     /// Messages from others after the read marker.
     var unread: Int {
-        messages.reduce(0) { count, m in
-            let counts = !m.own && m.kind.isChat && (readMarker.map { m.time > $0 } ?? true)
-            return counts ? count + 1 : count
+        var count = 0
+        for m in messages.reversed() {
+            if let marker = readMarker, m.time <= marker { break }
+            if !m.own && m.kind.isChat { count += 1 }
         }
+        return count
     }
 
     /// Adds messages, skipping ones already present (history and live
     /// messages overlap), keeping time order.
-    mutating func merge(_ incoming: [ChatMessage]) {
-        let known = Set(messages.compactMap(\.id))
-        let fresh = incoming.filter { $0.id.map { !known.contains($0) } ?? true }
+    func merge(_ incoming: [ChatMessage]) {
+        let fresh = incoming.filter { m in m.id.map { !knownIDs.contains($0) } ?? true }
         guard !fresh.isEmpty else { return }
+        knownIDs.formUnion(fresh.compactMap(\.id))
         if let last = messages.last, fresh.allSatisfy({ $0.time >= last.time }) {
             messages.append(contentsOf: fresh)
         } else {

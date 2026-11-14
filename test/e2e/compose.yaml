@@ -43,6 +43,12 @@ services:
     volumes:
       - ./soju/oauth2.conf:/soju-config:ro
       - ../../.e2e/certs:/certs:ro
+    # Like production (chillincool-infra soju helmrelease): two of
+    # P2P-Network's servers only offer TLS that soju's Go runtime refuses,
+    # so pin the name to one that works. (Compose keeps one entry per name;
+    # production lists all five working servers.)
+    extra_hosts:
+      - "irc.p2p-network.net:159.65.204.61"
 
   soju-internal:
     <<: *soju

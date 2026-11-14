@@ -41,3 +41,20 @@ struct ServerSettings: Codable, Equatable, Sendable {
         }
     }
 }
+
+/// What the network form edits, as soju network attributes.
+struct NetworkFields: Equatable {
+    var name: String
+    var host: String
+    var port: Int
+    var tls: Bool
+    var nick: String
+
+    func attributes(keepEmpty: Bool) -> [String: String] {
+        var attributes = ["host": host, "port": String(port), "tls": tls ? "1" : "0"]
+        for (key, value) in [("name", name), ("nickname", nick)] where keepEmpty || !value.isEmpty {
+            attributes[key] = value
+        }
+        return attributes
+    }
+}

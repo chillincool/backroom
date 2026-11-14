@@ -6,12 +6,18 @@ enum ComposerAction: Equatable {
     case action(String)
     case join(String)
     case part(channel: String, reason: String?)
+    /// Open a private conversation, optionally sending a first message.
+    case query(nick: String, text: String?)
+    /// Sent to the server as is.
+    case raw(String)
     case invalid(String)
 }
 
 enum Composer {
-    /// Parses one line. `buffer` is the current buffer, the default for
-    /// `/part`. Returns nil for blank input.
+    private static let channelPrefixes = "#&+!"
+
+    /// Parses one line. `buffer` is the current buffer, the default target
+    /// of `/part` and `/topic`. Returns nil for blank input.
     static func parse(_ input: String, buffer: String) -> ComposerAction? {
         let line = input.trimmingCharacters(in: .newlines)
         guard !line.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
@@ -19,29 +25,49 @@ enum Composer {
         // `//text` sends `/text` literally.
         if line.hasPrefix("//") { return .message(String(line.dropFirst())) }
 
-        let body = line.dropFirst()
-        let parts = body.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
+        let parts = line.dropFirst().split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
         let command = parts.first.map { $0.lowercased() } ?? ""
         let rest = parts.count > 1 ? String(parts[1]).trimmingCharacters(in: .whitespaces) : ""
+        let (first, remainder) = splitWord(rest)
 
         switch command {
         case "me":
             return rest.isEmpty ? .invalid("Usage: /me <action>") : .action(rest)
         case "join", "j":
-            guard let channel = rest.split(separator: " ").first else {
-                return .invalid("Usage: /join <#channel>")
+            guard let first else { return .invalid("Usage: /join <#channel>") }
+            // `/j foo` means #foo, as in most clients.
+            let channels = first.split(separator: ",").map { name in
+                channelPrefixes.contains(name.first!) ? String(name) : "#" + name
             }
-            return .join(String(channel))
-        case "part", "leave":
-            let words = rest.split(separator: " ", maxSplits: 1)
-            if let first = words.first, first.first.map({ "#&+!".contains($0) }) == true {
-                let reason = words.count > 1 ? String(words[1]) : nil
-                return .part(channel: String(first), reason: reason)
+            return .join(channels.joined(separator: ","))
+        case "part", "p", "leave":
+            if let first, channelPrefixes.contains(first.first!) {
+                return .part(channel: first, reason: remainder)
             }
             return .part(channel: buffer, reason: rest.isEmpty ? nil : rest)
+        case "msg", "m":
+            guard let first, let remainder else { return .invalid("Usage: /msg <nick> <message>") }
+            return .query(nick: first, text: remainder)
+        case "query", "q":
+            guard let first else { return .invalid("Usage: /query <nick> [message]") }
+            return .query(nick: first, text: remainder)
+        case "topic", "t":
+            return .raw(rest.isEmpty ? "TOPIC \(buffer)" : "TOPIC \(buffer) :\(rest)")
+        case "quote", "raw":
+            return rest.isEmpty ? .invalid("Usage: /quote <IRC line>") : .raw(rest)
+        case "":
+            return .invalid("Type a command after the slash, or start with // to send a slash.")
         default:
-            return .invalid("Unknown command /\(command). Start with // to send a slash.")
+            // Anything else goes to the server as is: /whois, /nick, /away, …
+            return .raw(rest.isEmpty ? command.uppercased() : "\(command.uppercased()) \(rest)")
         }
+    }
+
+    /// The first word and what follows it (nil if nothing does).
+    private static func splitWord(_ text: String) -> (String?, String?) {
+        let words = text.split(separator: " ", maxSplits: 1)
+        let rest = words.count > 1 ? String(words[1]).trimmingCharacters(in: .whitespaces) : nil
+        return (words.first.map(String.init), rest?.isEmpty == true ? nil : rest)
     }
 
     /// IRC text for a CTCP ACTION.

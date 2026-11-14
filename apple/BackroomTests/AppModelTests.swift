@@ -39,6 +39,15 @@ final class FakeClient: BackroomClientProtocol, @unchecked Sendable {
     func sendMessage(network: String, target: String, text: String) throws {
         calls.append("send \(network) \(target) \(text)")
     }
+    func closeBuffer(network: String, name: String) throws { calls.append("close \(network) \(name)") }
+    func addNetwork(attributes: [String: String]) throws {
+        calls.append("add " + attributes.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: ";"))
+    }
+    func removeNetwork(network: String) throws { calls.append("remove \(network)") }
+    func changeNetwork(network: String, attributes: [String: String]) throws {
+        calls.append("change \(network) " + attributes.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: ";"))
+    }
+    func sendRaw(network: String, line: String) throws { calls.append("raw \(network) \(line)") }
 }
 
 struct FakeAuthenticator: WebAuthenticator {
@@ -53,7 +62,8 @@ func makeModel(loggedIn: Bool = true, authenticator: FakeAuthenticator = FakeAut
 {
     let client = FakeClient()
     client.loggedIn = loggedIn
-    let model = AppModel(settings: .e2e, authenticator: authenticator, makeClient: { _ in client })
+    let defaults = UserDefaults(suiteName: "backroom-tests-\(UUID().uuidString)")!
+    let model = AppModel(settings: .e2e, authenticator: authenticator, defaults: defaults, makeClient: { _ in client })
     await model.start()
     return (model, client)
 }
@@ -202,8 +212,68 @@ let net = Network(id: "1", name: "libera", upstreamState: "connected", attribute
         #expect(client.calls.last == "join 1 #rust")
         #expect(model.send("/part bye"))
         #expect(client.calls.last == "part 1 #b bye")
-        #expect(!model.send("/bogus"))
+        // Unknown commands go to the server; a bare slash is an error.
+        #expect(model.send("/bogus x"))
+        #expect(client.calls.last == "raw 1 BOGUS x")
+        #expect(!model.send("/"))
         #expect(model.notice != nil)
+    }
+
+    @Test func joiningSwitchesToTheChannel() async {
+        let (model, client) = await makeModel()
+        model.apply(.networkUpdated(network: net))
+        model.apply(.bufferAdded(network: "1", name: "*", kind: .server))
+        model.apply(.bufferAdded(network: "1", name: "#old", kind: .channel))
+        model.select(BufferID(network: "1", name: "*"))
+
+        #expect(model.send("/join #New"))
+        #expect(client.calls.last == "join 1 #New")
+        #expect(model.selection == BufferID(network: "1", name: "*"), "not until joined")
+        model.apply(.bufferAdded(network: "1", name: "#new", kind: .channel))
+        #expect(model.selection == BufferID(network: "1", name: "#new"))
+
+        // Already there: switch at once.
+        #expect(model.send("/join #old"))
+        #expect(model.selection == BufferID(network: "1", name: "#old"))
+    }
+
+    @Test func queriesRawLinesAndNetworks() async {
+        let (model, client) = await makeModel()
+        model.apply(.networkUpdated(network: net))
+        model.apply(.bufferAdded(network: "1", name: "*", kind: .server))
+        model.select(BufferID(network: "1", name: "*"))
+
+        #expect(model.send("/msg Bob hello there"))
+        #expect(client.calls.last == "send 1 Bob hello there")
+        #expect(model.selection == BufferID(network: "1", name: "bob"))
+        #expect(model.buffers[BufferID(network: "1", name: "bob")]?.kind == .query)
+
+        #expect(model.send("/whois alice"))
+        #expect(client.calls.last == "raw 1 WHOIS alice")
+
+        model.openQuery(network: "1", nick: "erin")
+        #expect(model.selection == BufferID(network: "1", name: "erin"))
+
+        model.addNetwork(NetworkFields(name: "", host: "irc.libera.chat", port: 6697, tls: true, nick: "me"))
+        #expect(client.calls.last == "add host=irc.libera.chat;nickname=me;port=6697;tls=1")
+        model.changeNetwork("1", NetworkFields(name: "Libera", host: "irc.libera.chat", port: 6667, tls: false, nick: ""))
+        #expect(client.calls.last == "change 1 host=irc.libera.chat;name=Libera;nickname=;port=6667;tls=0")
+        model.removeNetwork("1")
+        #expect(client.calls.last == "remove 1")
+    }
+
+    @Test func topics() async {
+        let (model, _) = await makeModel()
+        model.apply(.networkUpdated(network: net))
+        model.apply(.bufferAdded(network: "1", name: "#b", kind: .channel))
+        let id = BufferID(network: "1", name: "#b")
+        model.apply(.topic(network: "1", channel: "#B", topic: "Welcome"))
+        #expect(model.buffers[id]?.topic == "Welcome")
+        model.apply(.topic(network: "1", channel: "#b", topic: nil))
+        #expect(model.buffers[id]?.topic == nil)
+        // Not for channels we're not in.
+        model.apply(.topic(network: "1", channel: "#gone", topic: "x"))
+        #expect(model.buffers[BufferID(network: "1", name: "#gone")] == nil)
     }
 
     @Test func serverBufferRejectsMessages() async {
@@ -222,6 +292,71 @@ let net = Network(id: "1", name: "libera", upstreamState: "connected", attribute
         #expect(model.phase == .loggedOut)
         #expect(model.networks.isEmpty)
         #expect(model.notice?.contains("token expired") == true)
+    }
+
+    @Test func membersAndRemovedBuffers() async {
+        let (model, client) = await makeModel()
+        model.apply(.networkUpdated(network: net))
+        model.apply(.bufferAdded(network: "1", name: "#b", kind: .channel))
+        let id = BufferID(network: "1", name: "#b")
+        model.apply(.members(network: "1", channel: "#B", members: [
+            Member(nick: "op", prefix: "@"), Member(nick: "alice", prefix: ""),
+        ]))
+        #expect(model.buffers[id]?.members.map(\.nick) == ["op", "alice"])
+
+        model.select(id)
+        model.close(id)
+        #expect(client.calls.last == "close 1 #b")
+        // Gone once the core confirms.
+        model.apply(.bufferRemoved(network: "1", name: "#b"))
+        #expect(model.buffers[id] == nil)
+        #expect(model.networks[0].buffers.isEmpty)
+        #expect(model.selection == nil)
+    }
+
+        @Test func lateEventsDontResurrectAPartedChannel() async {
+        let (model, _) = await makeModel()
+        model.apply(.networkUpdated(network: net))
+        model.apply(.bufferAdded(network: "1", name: "#b", kind: .channel))
+        model.apply(.bufferRemoved(network: "1", name: "#b"))
+        model.apply(.readMarker(network: "1", buffer: "#b", time: Date()))
+        model.apply(.history(network: "1", buffer: "#b", messages: []))
+        model.apply(.members(network: "1", channel: "#b", members: []))
+        #expect(model.buffers.isEmpty)
+    }
+
+    @Test func leavingTheOpenChannelGoesBack() async {
+        let (model, _) = await makeModel()
+        model.apply(.networkUpdated(network: net))
+        for name in ["*", "#a", "#b"] {
+            model.apply(.bufferAdded(network: "1", name: name, kind: name == "*" ? .server : .channel))
+        }
+        let a = BufferID(network: "1", name: "#a"), b = BufferID(network: "1", name: "#b")
+        model.select(a)
+        model.select(b)
+        model.apply(.bufferRemoved(network: "1", name: "#b"))
+        #expect(model.selection == a)
+        model.apply(.bufferRemoved(network: "1", name: "#a"))
+        #expect(model.selection == BufferID(network: "1", name: "*"))
+    }
+
+    @Test func reopensTheLastBuffer() async {
+        let defaults = UserDefaults(suiteName: "backroom-tests-\(UUID().uuidString)")!
+        let client = FakeClient()
+        client.loggedIn = true
+        let first = AppModel(settings: .e2e, authenticator: FakeAuthenticator(), defaults: defaults, makeClient: { _ in client })
+        await first.start()
+        first.apply(.networkUpdated(network: net))
+        first.apply(.bufferAdded(network: "1", name: "#b", kind: .channel))
+        first.select(BufferID(network: "1", name: "#b"))
+
+        let second = AppModel(settings: .e2e, authenticator: FakeAuthenticator(), defaults: defaults, makeClient: { _ in client })
+        await second.start()
+        second.apply(.networkUpdated(network: net))
+        second.apply(.bufferAdded(network: "1", name: "#a", kind: .channel))
+        #expect(second.selection == nil)
+        second.apply(.bufferAdded(network: "1", name: "#B", kind: .channel))
+        #expect(second.selection == BufferID(network: "1", name: "#b"))
     }
 
     @Test func removingANetworkDropsItsBuffers() async {

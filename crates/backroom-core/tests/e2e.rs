@@ -602,6 +602,28 @@ async fn live_session_talks_loads_history_and_syncs_read_markers() {
     })
     .await;
 
+    // Leaving the channel removes its buffer.
+    session.send(Command::CloseBuffer {
+        network: dave_net.clone(),
+        name: channel.clone(),
+    });
+    let mut seen = vec![];
+    let removed = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(e) = events.recv().await {
+            let done = matches!(&e, Event::BufferRemoved { network, name }
+                if *network == dave_net && name.eq_ignore_ascii_case(&channel));
+            seen.push(e);
+            if done {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(
+        removed.is_ok(),
+        "no BufferRemoved after parting; events: {seen:#?}"
+    );
+
     session.shutdown();
     next_event(&mut events, "shutdown", |e| *e == Event::Stopped).await;
     erin.quit().await.ok();

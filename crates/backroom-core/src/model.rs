@@ -42,6 +42,14 @@ pub enum BufferKind {
     Query,
 }
 
+/// A channel member.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Member {
+    pub nick: String,
+    /// Membership prefixes, highest first (`@`, `+`, `@+`, …); empty if none.
+    pub prefix: String,
+}
+
 /// Name of the per-network server buffer.
 pub const SERVER_BUFFER: &str = "*";
 
