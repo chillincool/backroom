@@ -1,3 +1,4 @@
+import AppKit
 import BackroomCore
 import SwiftUI
 
@@ -22,6 +23,10 @@ struct ContentView: View {
         }
         .environment(\.theme, prefs.theme(dark: colorScheme == .dark))
         .onChange(of: prefs.highlightWords) { model.refreshMentions() }
+        // Unread mentions and private messages on the Dock icon.
+        .onChange(of: model.totalMentions, initial: true) { _, count in
+            NSApp?.dockTile.badgeLabel = count > 0 ? "\(count)" : nil
+        }
         .onChange(of: prefs.ignored) { model.refreshMentions() }
     }
 }

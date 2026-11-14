@@ -61,9 +61,13 @@ final class AppModel {
         case browseChannels(network: String)
         case newConversation(network: String)
         case whois(network: String, info: WhoisInfo)
+        case search(network: String)
+        case channelSettings(network: String, channel: String)
 
         var id: String {
             switch self {
+            case .search(let n): "search-\(n)"
+            case .channelSettings(let n, let c): "channel-\(n)-\(c)"
             case .joinChannel(let n): "join-\(n)"
             case .browseChannels(let n): "browse-\(n)"
             case .newConversation(let n): "query-\(n)"
@@ -71,6 +75,32 @@ final class AppModel {
             }
         }
     }
+
+    /// The latest search and its results.
+    struct SearchState {
+        var network: String
+        var text: String
+        /// Buffers whose results are still to come.
+        var pending: Set<String>
+        var hits: [SearchHit] = []
+        var errors: [String] = []
+    }
+    private(set) var search: SearchState?
+
+    /// What the channel settings sheet shows.
+    struct ChannelSettings: Equatable {
+        var network: String
+        var channel: String
+        var modes: String?
+        var params: [String] = []
+        var bans: [BanEntry]?
+    }
+    private(set) var channelSettings: ChannelSettings?
+
+    /// Called for each live message that should notify: mentions and
+    /// private messages (or any channel message, if wanted) that arrive
+    /// while their buffer isn't in view.
+    @ObservationIgnored var notify: ((BufferModel, ChatMessage) -> Void)?
 
     struct ChannelList: Equatable {
         var channels: [ChannelListing] = []
@@ -283,8 +313,13 @@ final class AppModel {
             buffers[BufferID(network: network, name: channel)]?.members = list
         case .message(let network, let name, let message):
             let id = ensureBuffer(network: network, name: name, kind: nil)
-            buffers[id]?.merge([message])
+            guard let buffer = buffers[id] else { return }
+            buffer.merge([message])
+            // A message ends its sender's typing.
+            buffer.typing[message.sender.lowercased()] = nil
+            let inView = isActive && layout.visibleBuffers.contains(id)
             if layout.visibleBuffers.contains(id) { markRead(id) }
+            if !inView, shouldNotify(buffer, message) { notify?(buffer, message) }
         // History and read markers only update buffers that still exist:
         // they can arrive after we left a channel, and mustn't bring it back.
         case .history(let network, let name, let messages):
@@ -294,6 +329,7 @@ final class AppModel {
             buffer.historyLoading = false
             if messages.count < Self.historyPage { buffer.historyExhausted = true }
             if layout.visibleBuffers.contains(id) { markRead(id) }
+            loadTowardsTarget(id)
         case .readMarker(let network, let name, let time):
             // Markers only move forward: soju's reply to the initial query
             // can arrive after this device already marked the buffer read.
@@ -306,6 +342,27 @@ final class AppModel {
             guard channelLists[network] != nil else { return }
             channelLists[network]?.channels.append(contentsOf: channels)
             if done { channelLists[network]?.loading = false }
+        case .searchResults(let network, let target, let text, let results, let error):
+            guard var state = search, state.network == network, state.text == text,
+                state.pending.remove(target.lowercased()) != nil
+            else { return }
+            state.hits.append(contentsOf: results)
+            state.hits.sort { $0.message.time > $1.message.time }
+            if let error { state.errors.append("\(target): \(error)") }
+            search = state
+        case .typing(let network, let name, let nick, let state):
+            buffers[BufferID(network: network, name: name)]?.typing[nick.lowercased()] = (nick, state, .now)
+        case .presence(let network, let nick, let online):
+            buffers[BufferID(network: network, name: nick)]?.online = online
+        case .channelModes(let network, let channel, let modes, let params):
+            if channelSettings?.network == network, channelSettings?.channel.lowercased() == channel.lowercased() {
+                channelSettings?.modes = modes
+                channelSettings?.params = params
+            }
+        case .banList(let network, let channel, let bans):
+            if channelSettings?.network == network, channelSettings?.channel.lowercased() == channel.lowercased() {
+                channelSettings?.bans = bans
+            }
         case .ownNick(let network, let nick):
             if let i = networkIndex(network) {
                 networks[i].nick = nick
@@ -510,6 +567,88 @@ final class AppModel {
     func openQuery(network: String, nick: String) {
         let id = ensureBuffer(network: network, name: nick, kind: .query)
         select(id)
+    }
+
+    // MARK: Notifications
+
+    private func shouldNotify(_ buffer: BufferModel, _ message: ChatMessage) -> Bool {
+        guard preferences.notifications, !message.own, !buffer.mentions.isIgnored(message.sender)
+        else { return false }
+        if buffer.isMention(message) { return true }
+        switch buffer.kind {
+        case .query: return message.kind.isChat
+        case .channel: return preferences.notifyAllMessages && message.kind.isChat
+        case .server: return false
+        }
+    }
+
+    /// Unread mentions and private messages everywhere, for the Dock icon.
+    var totalMentions: Int { buffers.values.reduce(0) { $0 + $1.unreadMentions } }
+
+    /// Brings a buffer into view (from a notification): in a pane of the
+    /// current tab if one shows it, else in the focused pane.
+    func reveal(_ id: BufferID) {
+        guard buffers[id] != nil else { return }
+        if let pane = layout.panes.first(where: { $0.buffer == id }) {
+            layout.focused = pane.id
+            activate(id)
+        } else {
+            select(id)
+        }
+    }
+
+    /// Shows a message from search: selects its buffer and scrolls to it,
+    /// loading older history until it's there (up to 20 pages).
+    func reveal(network: String, buffer name: String, message: ChatMessage) {
+        let id = ensureBuffer(network: network, name: name, kind: nil)
+        reveal(id)
+        guard let buffer = buffers[id] else { return }
+        buffer.scrollTarget = message.stableID
+        pagesToTarget = 20
+        loadTowardsTarget(id)
+    }
+
+    @ObservationIgnored private var pagesToTarget = 0
+
+    private func loadTowardsTarget(_ id: BufferID) {
+        guard let buffer = buffers[id], let target = buffer.scrollTarget else { return }
+        if buffer.messages.contains(where: { $0.stableID == target }) || buffer.historyExhausted { return }
+        guard pagesToTarget > 0 else {
+            notice = "That message is too far back to show here."
+            buffer.scrollTarget = nil
+            return
+        }
+        pagesToTarget -= 1
+        if buffer.historyRequested { loadOlder(id) }
+    }
+
+    // MARK: Search and channel settings
+
+    /// Searches one buffer, or every conversation on the network (nil).
+    func startSearch(network: String, in target: String?, text: String) {
+        guard let client else { return }
+        let text = text.trimmingCharacters(in: .whitespaces)
+        guard !text.isEmpty else { return }
+        let targets = target.map { [$0] } ?? networkIndex(network).map { i in
+            networks[i].buffers.compactMap { buffers[$0] }.filter { $0.kind != .server }.map(\.name)
+        } ?? []
+        search = SearchState(network: network, text: text, pending: Set(targets.map { $0.lowercased() }))
+        for t in targets {
+            run { try client.search(network: network, target: t, text: text) }
+        }
+    }
+
+    func openChannelSettings(network: String, channel: String) {
+        guard let client else { return }
+        channelSettings = ChannelSettings(network: network, channel: channel)
+        sheet = .channelSettings(network: network, channel: channel)
+        run { try client.loadChannelSettings(network: network, channel: channel) }
+    }
+
+    /// Typing state for a buffer's conversation (not the server buffer).
+    func setTyping(_ id: BufferID, _ state: TypingState) {
+        guard let client, let buffer = buffers[id], buffer.kind != .server else { return }
+        try? client.setTyping(network: id.network, target: buffer.name, state: state)
     }
 
     // MARK: Mentions and ignores

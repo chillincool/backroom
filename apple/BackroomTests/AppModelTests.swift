@@ -25,6 +25,15 @@ final class FakeClient: BackroomClientProtocol, @unchecked Sendable {
         calls.append("join \(network) \(channel)" + (key.map { " key=\($0)" } ?? ""))
     }
     func listChannels(network: String) throws { calls.append("list \(network)") }
+    func search(network: String, target: String, text: String) throws {
+        calls.append("search \(network) \(target) \(text)")
+    }
+    func setTyping(network: String, target: String, state: TypingState) throws {
+        calls.append("typing \(network) \(target) \(state)")
+    }
+    func loadChannelSettings(network: String, channel: String) throws {
+        calls.append("channel settings \(network) \(channel)")
+    }
     func loadHistory(network: String, target: String, before: Date?, limit: UInt32) throws {
         calls.append("history \(network) \(target) \(before == nil ? "latest" : "before")")
     }
@@ -549,6 +558,79 @@ let net = Network(id: "1", name: "libera", upstreamState: "connected", attribute
         #expect(model.tabs.count == 1)
         #expect(model.currentTab == first)
         #expect(!model.canClosePane)
+    }
+
+    @Test func searchCollectsResultsFromEveryConversation() async {
+        let (model, client) = await makeModel()
+        model.apply(.networkUpdated(network: net))
+        model.apply(.bufferAdded(network: "1", name: "*", kind: .server))
+        model.apply(.bufferAdded(network: "1", name: "#a", kind: .channel))
+        model.apply(.bufferAdded(network: "1", name: "bob", kind: .query))
+        model.startSearch(network: "1", in: nil, text: "pier")
+        #expect(client.calls.contains("search 1 #a pier"))
+        #expect(client.calls.contains("search 1 bob pier"))
+        #expect(!client.calls.contains { $0.hasPrefix("search 1 *") }, "not the server buffer")
+        let hit = SearchHit(buffer: "#a", message: msg("a pier", at: 5, id: "m1"))
+        model.apply(.searchResults(network: "1", target: "#a", text: "pier", results: [hit], error: nil))
+        #expect(model.search?.pending == ["bob"])
+        model.apply(.searchResults(network: "1", target: "bob", text: "pier", results: [], error: "nope"))
+        #expect(model.search?.pending.isEmpty == true)
+        #expect(model.search?.hits == [hit])
+        #expect(model.search?.errors == ["bob: nope"])
+        // Stale results (an earlier search) are dropped.
+        model.apply(.searchResults(network: "1", target: "#a", text: "old", results: [hit], error: nil))
+        #expect(model.search?.hits.count == 1)
+
+        // Going to a result that isn't loaded pages back through history.
+        model.reveal(network: "1", buffer: "#a", message: hit.message)
+        #expect(model.selection == BufferID(network: "1", name: "#a"))
+        #expect(model.buffers[BufferID(network: "1", name: "#a")]?.scrollTarget == "m1")
+    }
+
+    @Test func typingPresenceAndNotifications() async {
+        let (model, _) = await makeModel()
+        var notified: [String] = []
+        model.notify = { _, message in notified.append(message.text) }
+        model.apply(.networkUpdated(network: net))
+        model.apply(.ownNick(network: "1", nick: "me"))
+        model.apply(.bufferAdded(network: "1", name: "#a", kind: .channel))
+        model.apply(.bufferAdded(network: "1", name: "#b", kind: .channel))
+        model.select(BufferID(network: "1", name: "#a"))
+
+        model.apply(.typing(network: "1", buffer: "#b", nick: "Bob", state: .active))
+        let b = model.buffers[BufferID(network: "1", name: "#b")]!
+        #expect(b.typingNow() == ["Bob"])
+        #expect(b.typingNow(at: .now.addingTimeInterval(7)).isEmpty, "active expires after 6 s")
+        model.apply(.message(network: "1", buffer: "#b", message: msg("hello me", at: 1, from: "Bob")))
+        #expect(b.typingNow().isEmpty, "a message ends typing")
+
+        // Mentions and private messages notify, unless they're on screen.
+        model.apply(.message(network: "1", buffer: "#b", message: msg("plain", at: 2, from: "Bob")))
+        model.apply(.message(network: "1", buffer: "#a", message: msg("me: in view", at: 3)))
+        model.apply(.message(network: "1", buffer: "carol", message: msg("psst", at: 4, from: "carol")))
+        #expect(notified == ["hello me", "psst"])
+
+        model.apply(.presence(network: "1", nick: "Carol", online: true))
+        #expect(model.buffers[BufferID(network: "1", name: "carol")]?.online == true)
+        #expect(model.totalMentions == 2)
+    }
+
+    @Test func channelSettingsCollectModesAndBans() async {
+        let (model, client) = await makeModel()
+        model.apply(.networkUpdated(network: net))
+        model.openChannelSettings(network: "1", channel: "#c")
+        #expect(client.calls.last == "channel settings 1 #c")
+        #expect(model.sheet == .channelSettings(network: "1", channel: "#c"))
+        model.apply(.channelModes(network: "1", channel: "#C", modes: "+ntk", params: ["key"]))
+        model.apply(.banList(network: "1", channel: "#c", bans: []))
+        #expect(model.channelSettings?.modes == "+ntk")
+        #expect(model.channelSettings?.bans == [])
+
+        let old = ChannelSettingsView.parse("+ntkl", ["old", "10"])
+        #expect(old.flags == ["n", "t"] && old.key == "old" && old.limit == "10")
+        #expect(ChannelSettingsView.modeChange(channel: "#c", from: old, to: (["n", "t"], "old", "10")) == nil)
+        #expect(ChannelSettingsView.modeChange(channel: "#c", from: old, to: (["n", "i"], "", "")) == "MODE #c -tkl+i old")
+        #expect(ChannelSettingsView.modeChange(channel: "#c", from: old, to: (["n", "t"], "new", "10")) == "MODE #c -k+k old new")
     }
 
     @Test func layoutTreeOperations() {

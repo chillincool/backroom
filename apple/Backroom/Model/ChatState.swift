@@ -43,6 +43,12 @@ final class BufferModel: Identifiable {
     private(set) var prefixByNick: [String: String] = [:]
     /// Finds mentions of our nick and highlight words; set by `AppModel`.
     var mentions = MentionMatcher()
+    /// Who's typing here, and since when (their latest notification).
+    var typing: [String: (nick: String, state: TypingState, since: Date)] = [:]
+    /// A private conversation's partner is online (MONITOR); nil if unknown.
+    var online: Bool?
+    /// A message to scroll to (its `stableID`), e.g. from search.
+    var scrollTarget: String?
     /// Lines sent from this buffer's composer, oldest first, for ↑/↓.
     @ObservationIgnored var sentHistory: [String] = []
 
@@ -85,6 +91,14 @@ final class BufferModel: Identifiable {
         case .invite: return kind == .server
         default: return false
         }
+    }
+
+    /// Nicks typing right now: active within 6 s, paused within 30 s (as
+    /// the typing spec says to expire them).
+    func typingNow(at now: Date = .now) -> [String] {
+        typing.values.filter { t in
+            now.timeIntervalSince(t.since) < (t.state == .active ? 6 : 30) && t.state != .done
+        }.map(\.nick).sorted()
     }
 
     /// Forgets the messages shown so far, on this device only.
