@@ -119,6 +119,7 @@ struct MemberRow: View {
         Text(NickColor.label(member.nick, prefix: member.prefix))
             .foregroundStyle(color)
             .lineLimit(1)
+            .help(member.nick)
             .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
             .onTapGesture(count: 2, perform: message)

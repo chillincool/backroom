@@ -1,24 +1,30 @@
+import AppKit
 import BackroomCore
 import SwiftUI
 
 /// Sidebar, conversation and member list side by side under one full-width
-/// title bar. A plain split rather than `NavigationSplitView`, whose
-/// sidebar macOS 26 draws as a floating panel around the window buttons.
+/// title bar. Not `NavigationSplitView` (macOS 26 floats its sidebar around
+/// the window buttons) nor `HSplitView` (it re-measures the side panels
+/// whenever their content changes): the side panels keep the width the user
+/// dragged them to.
 struct MainView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.theme) private var theme
     @AppStorage("showMembers") private var showMembers = true
     @AppStorage("showSidebar") private var showSidebar = true
+    @AppStorage("sidebarWidth") private var sidebarWidth = 220.0
+    @AppStorage("membersWidth") private var membersWidth = 180.0
 
     var body: some View {
         @Bindable var model = model
         // Only channels have members; elsewhere the panel stays shut
         // without forgetting that it's wanted.
         let membersShown = showMembers && model.selectedBuffer?.kind == .channel
-        HSplitView {
+        HStack(spacing: 0) {
             if showSidebar {
                 SidebarView()
-                    .frame(minWidth: 170, idealWidth: 220, maxWidth: 360)
+                    .frame(width: sidebarWidth)
+                SplitDivider(width: $sidebarWidth, range: 150...420, edge: .leading)
             }
             Group {
                 if let id = model.selection, model.buffers[id] != nil {
@@ -30,10 +36,11 @@ struct MainView: View {
                         .background(theme.backgroundColor)
                 }
             }
-            .frame(minWidth: 360, maxWidth: .infinity, maxHeight: .infinity)
+            .frame(minWidth: 320, maxWidth: .infinity, maxHeight: .infinity)
             if membersShown, let buffer = model.selectedBuffer {
+                SplitDivider(width: $membersWidth, range: 120...360, edge: .trailing)
                 MemberList(buffer: buffer)
-                    .frame(minWidth: 130, idealWidth: 180, maxWidth: 300)
+                    .frame(width: membersWidth)
             }
         }
         .sheet(item: $model.sheet) { SheetContent(sheet: $0) }
@@ -251,6 +258,7 @@ struct BufferRow: View {
             Text(buffer.name)
                 .fontWeight(unread > 0 ? .semibold : .regular)
                 .lineLimit(1)
+                .help(buffer.name)
             Spacer()
             UnreadBadge(count: unread)
         }
@@ -269,5 +277,40 @@ struct UnreadBadge: View {
                 .background(Capsule().fill(.tint))
                 .foregroundStyle(.white)
         }
+    }
+}
+
+/// A draggable line that sets the width of the panel on its `edge` side.
+struct SplitDivider: View {
+    @Binding var width: Double
+    let range: ClosedRange<Double>
+    /// Which side the panel is on: dragging towards it narrows it.
+    let edge: HorizontalEdge
+    @State private var start: Double?
+
+    var body: some View {
+        Rectangle()
+            .fill(Color(nsColor: .separatorColor))
+            .frame(width: 1)
+            // A wider grab area than the visible line.
+            .overlay {
+                Color.clear
+                    .frame(width: 9)
+                    .contentShape(Rectangle())
+                    .onHover { inside in
+                        if inside { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
+                    }
+                    .gesture(
+                        DragGesture(minimumDistance: 1, coordinateSpace: .global)
+                            .onChanged { drag in
+                                let base = start ?? width
+                                start = base
+                                let delta = edge == .leading ? drag.translation.width : -drag.translation.width
+                                width = min(max(base + delta, range.lowerBound), range.upperBound)
+                            }
+                            .onEnded { _ in start = nil }
+                    )
+            }
+            .zIndex(1)
     }
 }
