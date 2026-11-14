@@ -29,6 +29,7 @@ struct BackroomApp: App {
             let notifier = Self.notifier
             UNUserNotificationCenter.current().delegate = notifier
             notifier.open = { [weak model] id in model?.reveal(id) }
+            if prefs.notifications { Task { await notifier.requestPermission() } }
             model.notify = { [weak prefs] buffer, message in
                 notifier.post(
                     message, in: buffer, network: model.networkName(buffer.id.network),

@@ -3,12 +3,13 @@ import BackroomCore
 import UserNotifications
 
 /// Posts macOS notifications for messages and opens their buffer when one
-/// is clicked. Asks for permission the first time it's needed.
+/// is clicked. Permission is asked for at launch: asking only when the
+/// first message arrives loses that message (macOS shows the request as a
+/// notification of its own, which leads to System Settings).
 @MainActor
 final class Notifier: NSObject, @preconcurrency UNUserNotificationCenterDelegate {
     /// Shows a buffer; set by the app.
     var open: ((BufferID) -> Void)?
-    private var asked = false
 
     private var center: UNUserNotificationCenter { .current() }
 
@@ -28,13 +29,12 @@ final class Notifier: NSObject, @preconcurrency UNUserNotificationCenterDelegate
         content.userInfo = ["network": buffer.id.network, "buffer": buffer.name]
         if sound { content.sound = .default }
         let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-        Task {
-            if !asked {
-                asked = true
-                _ = try? await center.requestAuthorization(options: [.alert, .sound, .badge])
-            }
-            try? await center.add(request)
-        }
+        Task { try? await center.add(request) }
+    }
+
+    /// Asks macOS for permission, if it hasn't been asked yet.
+    func requestPermission() async {
+        _ = try? await center.requestAuthorization(options: [.alert, .sound, .badge])
     }
 
     // Shown even while Backroom is frontmost: we only post for buffers

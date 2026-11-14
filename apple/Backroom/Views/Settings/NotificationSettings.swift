@@ -20,19 +20,46 @@ struct NotificationSettings: View {
                 Text("Only for conversations that aren't on screen. Highlight words count as mentions (Settings › Highlights). The Dock icon counts unread mentions and private messages.")
                     .foregroundStyle(.secondary)
             }
-            if status == .denied {
-                Section {
-                    LabeledContent("macOS is blocking Backroom's notifications.") {
-                        Button("Open System Settings") {
-                            NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension")!)
+            Section {
+                LabeledContent("Permission") {
+                    HStack {
+                        Text(statusText).foregroundStyle(.secondary)
+                        if status == .notDetermined {
+                            Button("Ask Now") {
+                                Task {
+                                    _ = try? await UNUserNotificationCenter.current()
+                                        .requestAuthorization(options: [.alert, .sound, .badge])
+                                    await refresh()
+                                }
+                            }
+                        } else {
+                            Button("Open System Settings") {
+                                NSWorkspace.shared.open(
+                                    URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension")!)
+                            }
                         }
                     }
                 }
+            } footer: {
+                Text("The Dock badge also needs \"Badge application icon\" allowed there.")
+                    .foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
-        .task {
-            status = await UNUserNotificationCenter.current().notificationSettings().authorizationStatus
+        .task { await refresh() }
+    }
+
+    private func refresh() async {
+        status = await UNUserNotificationCenter.current().notificationSettings().authorizationStatus
+    }
+
+    private var statusText: String {
+        switch status {
+        case .authorized, .provisional, .ephemeral: "Allowed"
+        case .denied: "Blocked in System Settings"
+        case .notDetermined: "Not asked yet"
+        case nil: "…"
+        @unknown default: "Unknown"
         }
     }
 }
