@@ -53,7 +53,9 @@ services. Owner: chillincool. Public repo: github.com/chillincool/backroom.
   events; `Preferences` (`@Observable`, UserDefaults) and `Theme` reach
   views through the environment (`\.theme`). `Model/`: `AppModel`,
   `ChatState` (`BufferModel` per buffer), `Composer` (slash commands, Tab
-  `Completion`), `Timeline` (folding, day separators, New line), `Panes`
+  `Completion`), `ServerSettings` (`ServerList`: saved servers, one in use;
+  each a password or single sign-on login with its own Keychain item),
+  `Timeline` (folding, day separators, New line), `Panes`
   (`PaneLayout` split tree, `WorkspaceTab`), `Mentions`, `Notifier`,
   `Preferences`, `Theme`. `Views/`: `MainView` (sidebar | panes | members,
   fixed widths via `SplitDivider`), `PaneViews`, `BufferView` (rows,
@@ -84,8 +86,8 @@ mise run apple:app  # generate apple/Backroom.xcodeproj (XcodeGen), build, unit 
 
 Run the app: `open apple/build/Build/Products/Debug/Backroom.app`. Against the
 e2e stack, log in as alice/alice (single sign-on), or with a password as
-dave/dave-secret on soju-internal (`ws://127.0.0.1:28081/`; Settings →
-Account → Use Local Test Stack); give her a network with
+dave/dave-secret on soju-internal (`ws://127.0.0.1:28081/`); Settings →
+Account → Add Test Servers (debug builds) adds both; give her a network with
 `docker compose -p backroom-e2e exec -T soju-oauth2 sojuctl -config /soju-config user run alice network create -addr irc+insecure://ergo:6667 -name ergo-test`
 (after her first login).
 
@@ -188,13 +190,19 @@ and stops after a rejected login (`ConnectionState::AuthFailed`).
 ## Pick up here (2026-11-14)
 
 - PRs #12–#14 merged (the owner's first four asks). Roadmap agreed with the
-  owner: **PR A** soju password login (branch `feat/password-login`), then
+  owner: **PR A** soju password login + saved servers (branch
+  `feat/password-login`, PR open), then
   **standalone mode** (no bouncer: networks stored locally, direct
   connections, SASL/NickServ, rejoin; local history in SQLite via
   `rusqlite` bundled, plus an optional "also write plain-text logs" setting,
   per channel per day), then ZNC (low priority). One account per client:
   the owner sees no use for several accounts at once. A soju installer was
   rejected (standalone mode lowers the entry bar more cheaply).
+- A soju uses one login method (`auth internal`: `sasl=PLAIN`; `auth
+  oauth2`: `sasl=PLAIN,OAUTHBEARER`, PLAIN taking a token). The method and
+  issuer are set per saved server; no detection. Login screen: server menu,
+  then that server's form; "Add Server…" opens Settings → Account. Standalone
+  mode will be another entry in that menu with a Connect button.
 - Dev setup: e2e stack up (`mise run e2e:up`); soju-oauth2 data lives on
   volume `soju-oauth2-data` (survives recreation; `e2e.sh down` deletes it,
   so warn first). alice has networks libera (nick backroom-dev),
