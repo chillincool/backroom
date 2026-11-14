@@ -9,12 +9,15 @@ enum TimelineItem: Identifiable, Equatable {
     case message(ChatMessage, continued: Bool)
     case presence([ChatMessage])
     case day(Date)
+    /// Above the first unread message.
+    case unreadLine
 
     var id: String {
         switch self {
         case .message(let m, _): m.stableID
         case .presence(let run): "presence-" + (run.first?.stableID ?? "")
         case .day(let date): "day-\(date.timeIntervalSince1970)"
+        case .unreadLine: "unread-line"
         }
     }
 
@@ -22,8 +25,10 @@ enum TimelineItem: Identifiable, Equatable {
     static let runGap: TimeInterval = 30 * 60
 
     static func build(
-        _ messages: [ChatMessage], presence: PresenceStyle = .fold, calendar: Calendar = .current
+        _ messages: [ChatMessage], presence: PresenceStyle = .fold, unreadAfter: Date? = nil,
+        calendar: Calendar = .current
     ) -> [TimelineItem] {
+        var lineDue = unreadAfter != nil
         var items: [TimelineItem] = []
         var run: [ChatMessage] = []
         var day: Date?
@@ -42,6 +47,12 @@ enum TimelineItem: Identifiable, Equatable {
                 // No separator above the first day: the header says where history starts.
                 if day != nil { items.append(.day(start)) }
                 day = start
+                previous = nil
+            }
+            if lineDue, let after = unreadAfter, message.time > after, !message.own, message.kind.isChat {
+                flush()
+                items.append(.unreadLine)
+                lineDue = false
                 previous = nil
             }
             if message.kind == .join || message.kind == .part {

@@ -156,6 +156,23 @@ let net = Network(id: "1", name: "libera", upstreamState: "connected", attribute
         #expect(client.calls.last == "read 1 #b 30")
     }
 
+    @Test func selectingRemembersWhereUnreadStarts() async {
+        let (model, _) = await makeModel()
+        model.apply(.networkUpdated(network: net))
+        let id = BufferID(network: "1", name: "#b")
+        model.apply(.message(network: "1", buffer: "#b", message: msg("old", at: 10)))
+        model.apply(.readMarker(network: "1", buffer: "#b", time: Date(timeIntervalSince1970: 10)))
+        model.apply(.message(network: "1", buffer: "#b", message: msg("new", at: 20)))
+
+        model.select(id)
+        #expect(model.buffers[id]?.unreadLine == Date(timeIntervalSince1970: 10))
+        #expect(model.buffers[id]?.readMarker == Date(timeIntervalSince1970: 20))
+        // Coming back with nothing new: no line.
+        model.select(nil)
+        model.select(id)
+        #expect(model.buffers[id]?.unreadLine == Date(timeIntervalSince1970: 20))
+    }
+
     @Test func staleReadMarkersDontBringUnreadBack() async {
         let (model, _) = await makeModel()
         model.apply(.networkUpdated(network: net))

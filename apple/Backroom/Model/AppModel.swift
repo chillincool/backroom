@@ -73,7 +73,12 @@ final class AppModel {
     @ObservationIgnored private let authenticator: any WebAuthenticator
     /// Whether the app is frontmost; buffers are only marked read then.
     @ObservationIgnored var isActive = true {
-        didSet { if isActive, let selection { markRead(selection) } }
+        didSet {
+            guard isActive, let selection else { return }
+            // Coming back to the app: mark where the unseen messages start.
+            if let buffer = buffers[selection], buffer.unread > 0 { buffer.unreadLine = buffer.readMarker }
+            markRead(selection)
+        }
     }
 
     init(settings: ServerSettings, authenticator: any WebAuthenticator,
@@ -297,6 +302,8 @@ final class AppModel {
         recent.removeAll { $0 == id }
         recent.insert(id, at: 0)
         defaults.set([id.network, id.key], forKey: Self.lastBufferKey)
+        // Before marking read: the line shows where this visit's news starts.
+        buffer.unreadLine = buffer.readMarker
         if !buffer.historyRequested {
             buffers[id]?.historyRequested = true
             buffers[id]?.historyLoading = true

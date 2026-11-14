@@ -24,6 +24,9 @@ final class BufferModel: Identifiable {
     private(set) var messages: [ChatMessage] = []
     /// Everything up to here has been read (on any device).
     var readMarker: Date?
+    /// Where the read marker was when the user last came to this buffer:
+    /// the "New" line goes above the first message after it.
+    var unreadLine: Date?
     var historyRequested = false
     var historyLoading = false
     /// The server has no older messages.

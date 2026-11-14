@@ -22,7 +22,9 @@ struct BufferView: View {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     HistoryHeader(buffer: buffer) { model.loadOlder(id) }
                     if let buffer {
-                        ForEach(TimelineItem.build(buffer.messages, presence: prefs.presence)) { item in
+                        ForEach(TimelineItem.build(
+                            buffer.messages, presence: prefs.presence, unreadAfter: buffer.unreadLine
+                        )) { item in
                             switch item {
                             case .message(let message, let continued):
                                 MessageRow(message: message, continued: continued, buffer: buffer, style: style)
@@ -30,6 +32,8 @@ struct BufferView: View {
                                 PresenceRow(run: run, style: style)
                             case .day(let date):
                                 DaySeparator(date: date, style: style)
+                            case .unreadLine:
+                                UnreadLine()
                             }
                         }
                     }
@@ -331,6 +335,23 @@ struct PresenceRow: View {
         .foregroundStyle(style.theme.mutedColor)
         .textSelection(.enabled)
         .padding(.vertical, style.padding)
+    }
+}
+
+/// Above the first message that arrived since you last looked.
+struct UnreadLine: View {
+    var body: some View {
+        HStack(spacing: 6) {
+            Rectangle().fill(Color.red).frame(height: 1)
+            Text("New")
+                .font(.caption2.bold())
+                .foregroundStyle(.white)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 1)
+                .background(Capsule().fill(Color.red))
+        }
+        .padding(.vertical, 4)
+        .accessibilityLabel("New messages below")
     }
 }
 

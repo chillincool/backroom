@@ -68,4 +68,18 @@ import Testing
         #expect(date == Date(timeIntervalSince1970: day))
         #expect(!continued, "a new day starts a new run")
     }
+
+    @Test func unreadLineGoesAboveTheFirstMessageFromOthers() {
+        var own = m("me", .privmsg, at: 3)
+        own.own = true
+        let items = TimelineItem.build(
+            [m("a", .privmsg, at: 1), m("b", .join, at: 3), own, m("a", .privmsg, at: 4), m("a", .privmsg, at: 5)],
+            presence: .show, unreadAfter: Date(timeIntervalSince1970: 2))
+        #expect(items.map(\.id) == ["a1.0", "b3.0", "me3.0", "unread-line", "a4.0", "a5.0"])
+        // The line starts a new run.
+        guard case .message(_, let continued) = items[4] else { Issue.record("\(items)"); return }
+        #expect(!continued)
+        #expect(!TimelineItem.build([m("a", .privmsg, at: 1)], unreadAfter: Date(timeIntervalSince1970: 1))
+            .contains(.unreadLine))
+    }
 }
