@@ -26,7 +26,9 @@ final class AppModel {
     /// The control connection's state.
     private(set) var control: ConnectionState?
     private(set) var networks: [NetworkState] = []
-    private(set) var buffers: [BufferID: BufferState] = [:]
+    /// Changes only when buffers come and go; each buffer is observed on
+    /// its own.
+    private(set) var buffers: [BufferID: BufferModel] = [:]
     private(set) var selection: BufferID?
     /// The latest error worth showing; the view clears it.
     var notice: String?
@@ -34,6 +36,13 @@ final class AppModel {
     static let historyPage: UInt32 = 100
 
     typealias ClientFactory = @MainActor (ServerSettings) throws -> any BackroomClientProtocol
+
+    /// Most recently viewed first; where to go when the open buffer goes.
+    @ObservationIgnored private var recent: [BufferID] = []
+    /// A channel the user just /joined; selected once it exists.
+    @ObservationIgnored private var pendingSelection: BufferID?
+    @ObservationIgnored private let defaults: UserDefaults
+    private static let lastBufferKey = "lastBuffer"
 
     @ObservationIgnored private var client: (any BackroomClientProtocol)?
     @ObservationIgnored private var eventTask: Task<Void, Never>?
@@ -44,8 +53,10 @@ final class AppModel {
         didSet { if isActive, let selection { markRead(selection) } }
     }
 
-    init(settings: ServerSettings, authenticator: any WebAuthenticator, makeClient: @escaping ClientFactory) {
+    init(settings: ServerSettings, authenticator: any WebAuthenticator,
+         defaults: UserDefaults = .standard, makeClient: @escaping ClientFactory) {
         self.settings = settings
+        self.defaults = defaults
         self.authenticator = authenticator
         self.makeClient = makeClient
     }
@@ -138,6 +149,7 @@ final class AppModel {
         networks = []
         buffers = [:]
         selection = nil
+        recent = []
     }
 
     // MARK: Events
@@ -163,25 +175,46 @@ final class AppModel {
         case .networkRemoved(let id):
             networks.removeAll { $0.id == id }
             buffers = buffers.filter { $0.key.network != id }
+            recent.removeAll { $0.network == id }
             if selection?.network == id { selection = nil }
         case .bufferAdded(let network, let name, let kind):
             ensureBuffer(network: network, name: name, kind: kind)
+        case .bufferRemoved(let network, let name):
+            let id = BufferID(network: network, name: name)
+            buffers[id] = nil
+            recent.removeAll { $0 == id }
+            if let i = networkIndex(network) { networks[i].buffers.removeAll { $0 == id } }
+            if selection == id {
+                // Back to the previous conversation, else the network's server buffer.
+                let fallback = recent.first { buffers[$0] != nil }
+                    ?? networkIndex(network).flatMap { i in
+                        networks[i].buffers.first { buffers[$0]?.kind == .server }
+                    }
+                select(fallback)
+            }
+        case .topic(let network, let channel, let topic):
+            buffers[BufferID(network: network, name: channel)]?.topic = topic
+        case .members(let network, let channel, let list):
+            buffers[BufferID(network: network, name: channel)]?.members = list
         case .message(let network, let name, let message):
             let id = ensureBuffer(network: network, name: name, kind: nil)
             buffers[id]?.merge([message])
             if id == selection { markRead(id) }
+        // History and read markers only update buffers that still exist:
+        // they can arrive after we left a channel, and mustn't bring it back.
         case .history(let network, let name, let messages):
-            let id = ensureBuffer(network: network, name: name, kind: nil)
-            buffers[id]?.merge(messages)
-            buffers[id]?.historyLoading = false
-            if messages.count < Self.historyPage { buffers[id]?.historyExhausted = true }
+            let id = BufferID(network: network, name: name)
+            guard let buffer = buffers[id] else { return }
+            buffer.merge(messages)
+            buffer.historyLoading = false
+            if messages.count < Self.historyPage { buffer.historyExhausted = true }
             if id == selection { markRead(id) }
         case .readMarker(let network, let name, let time):
             // Markers only move forward: soju's reply to the initial query
             // can arrive after this device already marked the buffer read.
-            let id = ensureBuffer(network: network, name: name, kind: nil)
-            if let time, buffers[id]?.readMarker.map({ time > $0 }) ?? true {
-                buffers[id]?.readMarker = time
+            guard let buffer = buffers[BufferID(network: network, name: name)] else { return }
+            if let time, buffer.readMarker.map({ time > $0 }) ?? true {
+                buffer.readMarker = time
             }
         case .error(_, let message):
             notice = message
@@ -195,7 +228,7 @@ final class AppModel {
         let id = BufferID(network: network, name: name)
         if buffers[id] == nil {
             let kind = kind ?? Self.guessKind(name)
-            buffers[id] = BufferState(id: id, name: name, kind: kind)
+            buffers[id] = BufferModel(id: id, name: name, kind: kind)
             if let i = networkIndex(network) {
                 // The server buffer goes first.
                 if kind == .server {
@@ -203,6 +236,13 @@ final class AppModel {
                 } else {
                     networks[i].buffers.append(id)
                 }
+            }
+            if id == pendingSelection {
+                pendingSelection = nil
+                select(id)
+            } else if selection == nil, id == savedSelection {
+                // Reopen what was open last time, once it exists again.
+                select(id)
             }
         } else if let kind {
             buffers[id]?.kind = kind
@@ -224,12 +264,53 @@ final class AppModel {
     func select(_ id: BufferID?) {
         selection = id
         guard let id, let buffer = buffers[id], let client else { return }
+        recent.removeAll { $0 == id }
+        recent.insert(id, at: 0)
+        defaults.set([id.network, id.key], forKey: Self.lastBufferKey)
         if !buffer.historyRequested {
             buffers[id]?.historyRequested = true
             buffers[id]?.historyLoading = true
             run { try client.loadHistory(network: id.network, target: buffer.name, before: nil, limit: Self.historyPage) }
         }
         markRead(id)
+    }
+
+    private var savedSelection: BufferID? {
+        guard let saved = defaults.stringArray(forKey: Self.lastBufferKey), saved.count == 2 else { return nil }
+        return BufferID(network: saved[0], name: saved[1])
+    }
+
+    var selectedBuffer: BufferModel? { selection.flatMap { buffers[$0] } }
+
+    /// Opens (or switches to) a private conversation with `nick`.
+    func openQuery(network: String, nick: String) {
+        let id = ensureBuffer(network: network, name: nick, kind: .query)
+        select(id)
+    }
+
+    /// Asks soju to add a network; it appears once soju has it.
+    func addNetwork(_ fields: NetworkFields) {
+        guard let client else { return }
+        run { try client.addNetwork(attributes: fields.attributes(keepEmpty: false)) }
+    }
+
+    /// Changes a network's settings; soju reconnects to it.
+    func changeNetwork(_ id: String, _ fields: NetworkFields) {
+        guard let client else { return }
+        // Empty values clear attributes, e.g. a removed nick.
+        run { try client.changeNetwork(network: id, attributes: fields.attributes(keepEmpty: true)) }
+    }
+
+    /// Deletes a network from soju, with its channels and history.
+    func removeNetwork(_ id: String) {
+        guard let client else { return }
+        run { try client.removeNetwork(network: id) }
+    }
+
+    /// Leaves a channel or closes a private conversation.
+    func close(_ id: BufferID) {
+        guard let buffer = buffers[id], let client else { return }
+        run { try client.closeBuffer(network: id.network, name: buffer.name) }
     }
 
     /// Asks for the page before the oldest loaded message.
@@ -267,9 +348,22 @@ final class AppModel {
             let line = if case .action = action { Composer.actionText(text) } else { text }
             return run { try client.sendMessage(network: id.network, target: buffer.name, text: line) }
         case .join(let channel):
+            // Switch to it: now if we're already there, else once joined.
+            let target = BufferID(network: id.network, name: String(channel.split(separator: ",").first ?? ""))
+            if buffers[target] != nil {
+                select(target)
+            } else {
+                pendingSelection = target
+            }
             return run { try client.join(network: id.network, channel: channel) }
         case .part(let channel, let reason):
             return run { try client.part(network: id.network, channel: channel, reason: reason) }
+        case .query(let nick, let text):
+            openQuery(network: id.network, nick: nick)
+            guard let text else { return true }
+            return run { try client.sendMessage(network: id.network, target: nick, text: text) }
+        case .raw(let line):
+            return run { try client.sendRaw(network: id.network, line: line) }
         case .invalid(let message):
             notice = message
             return false

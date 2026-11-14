@@ -1,21 +1,23 @@
 //! Owns the session state and routes between the front end and connections.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use tokio::sync::mpsc;
 
 use super::connection::{self, ConnId, FromConn, FromConnTx, ToConn};
+use super::members::Members;
 use super::{Command, ConnectionState, Event, SessionConfig};
 use crate::batch::Batch;
 use crate::bouncer::{NetworkUpdate, parse_network_message};
 use crate::client::Incoming;
 use crate::model::{
-    BufferKind, ChatMessage, NetworkId, NetworkInfo, RouteContext, SERVER_BUFFER, buffer_key,
-    irc_timestamp, route,
+    BufferKind, ChatMessage, MessageKind, NetworkId, NetworkInfo, RouteContext, SERVER_BUFFER,
+    buffer_key, irc_timestamp, route,
 };
 use crate::proto::Message;
+use crate::proto::message::escape_tag_value;
 use crate::session::Registered;
 
 /// Starts a connection task; replaced in tests.
@@ -52,9 +54,29 @@ struct Network {
     history_max: Option<usize>,
     /// Keyed by [`buffer_key`].
     buffers: HashMap<String, BufferKind>,
+    /// Channels the user asked to join ([`buffer_key`]s). Only their JOIN
+    /// echoes are shown: soju replays a JOIN for every channel on each new
+    /// connection, and those aren't news.
+    requested_joins: HashSet<String>,
+    members: Members,
 }
 
 impl Network {
+    /// Applies one ISUPPORT token (`None`: removed), at registration or
+    /// later: soju re-sends them once it reaches the upstream network.
+    fn set_isupport(&mut self, key: &str, value: Option<&str>) {
+        match key {
+            "CHANTYPES" => {
+                self.chantypes = value.filter(|c| !c.is_empty()).unwrap_or("#&").to_owned();
+            }
+            "CHATHISTORY" => {
+                self.history_max = value.and_then(|v| v.parse().ok()).filter(|&n| n > 0);
+            }
+            "PREFIX" | "CHANMODES" => self.members.set_isupport(key, value),
+            _ => {}
+        }
+    }
+
     fn ctx(&self) -> RouteContext<'_> {
         RouteContext {
             own_nick: &self.nick,
@@ -132,6 +154,10 @@ impl Coordinator {
                 }
             }
             Command::Join { network, channel } => {
+                if let Some(net) = self.networks.get_mut(&network) {
+                    net.requested_joins
+                        .extend(channel.split(',').map(buffer_key));
+                }
                 self.send_to(&network, Message::new("JOIN", [channel]));
             }
             Command::Part {
@@ -192,6 +218,49 @@ impl Coordinator {
                     ),
                 );
             }
+            Command::AddNetwork { attributes } => {
+                let attrs = attributes
+                    .iter()
+                    .map(|(k, v)| format!("{k}={}", escape_tag_value(v)))
+                    .collect::<Vec<_>>()
+                    .join(";");
+                let msg = Message::new("BOUNCER", ["ADDNETWORK".to_owned(), attrs]);
+                let _ = self.control.send(ToConn::Send(msg));
+            }
+            Command::ChangeNetwork {
+                network,
+                attributes,
+            } => {
+                let attrs = attributes
+                    .iter()
+                    .map(|(k, v)| format!("{k}={}", escape_tag_value(v)))
+                    .collect::<Vec<_>>()
+                    .join(";");
+                let msg = Message::new("BOUNCER", ["CHANGENETWORK".to_owned(), network, attrs]);
+                let _ = self.control.send(ToConn::Send(msg));
+            }
+            Command::RemoveNetwork { network } => {
+                let msg = Message::new("BOUNCER", ["DELNETWORK".to_owned(), network]);
+                let _ = self.control.send(ToConn::Send(msg));
+            }
+            Command::SendRaw { network, line } => match Message::parse(line.trim()) {
+                Ok(msg) => {
+                    self.send_to(&network, msg);
+                }
+                Err(_) => self.error(Some(&network), format!("not a valid IRC line: {line}")),
+            },
+            Command::CloseBuffer { network, name } => {
+                let is_channel = self
+                    .networks
+                    .get(&network)
+                    .is_some_and(|net| net.ctx().is_channel(&name));
+                if is_channel {
+                    // Removed when the server confirms the PART.
+                    self.send_to(&network, Message::new("PART", [name]));
+                } else {
+                    self.remove_buffer(&network, &name);
+                }
+            }
             Command::Shutdown => {}
         }
     }
@@ -230,6 +299,15 @@ impl Coordinator {
                 for msg in &batch.messages {
                     self.network_update(msg);
                 }
+            }
+            (None, FromConn::Incoming(Incoming::Message(msg))) if msg.command == "FAIL" => {
+                // e.g. FAIL BOUNCER INVALID_ATTRIBUTE … :description
+                let text = msg
+                    .params
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| msg.to_string());
+                self.error(None, text);
             }
             (None, FromConn::Incoming(Incoming::Message(msg))) => self.network_update(&msg),
 
@@ -283,6 +361,8 @@ impl Coordinator {
                                 caps: BTreeSet::new(),
                                 history_max: None,
                                 buffers: HashMap::new(),
+                                requested_joins: HashSet::new(),
+                                members: Members::new(&BTreeMap::new()),
                             },
                         );
                         info
@@ -306,14 +386,10 @@ impl Coordinator {
         };
         net.nick = reg.nick;
         net.caps = reg.enabled_caps;
-        if let Some(chantypes) = reg.isupport.get("CHANTYPES").filter(|c| !c.is_empty()) {
-            net.chantypes = chantypes.clone();
+        net.members = Members::new(&reg.isupport);
+        for (key, value) in &reg.isupport {
+            net.set_isupport(key, Some(value));
         }
-        net.history_max = reg
-            .isupport
-            .get("CHATHISTORY")
-            .and_then(|v| v.parse().ok())
-            .filter(|&n| n > 0);
         if net.caps.contains("draft/chathistory") {
             // Every conversation with history, so queries show up too.
             let msg = Message::new(
@@ -337,15 +413,17 @@ impl Coordinator {
             "draft/chathistory-targets" => {
                 for msg in &batch.messages {
                     // CHATHISTORY TARGETS <target> <latest timestamp>
+                    // Only private conversations: channel buffers come from
+                    // JOINs, so channels we've left don't come back.
                     if msg.command == "CHATHISTORY"
                         && msg.param(0) == Some("TARGETS")
                         && let Some(target) = msg.param(1)
+                        && self
+                            .networks
+                            .get(id)
+                            .is_some_and(|net| !net.ctx().is_channel(target))
                     {
-                        let kind = match self.networks.get(id) {
-                            Some(net) if net.ctx().is_channel(target) => BufferKind::Channel,
-                            _ => BufferKind::Query,
-                        };
-                        self.ensure_buffer(id, target, kind);
+                        self.ensure_buffer(id, target, BufferKind::Query);
                     }
                 }
             }
@@ -385,6 +463,29 @@ impl Coordinator {
     }
 
     fn message(&mut self, id: &str, msg: &Message) {
+        let Some(net) = self.networks.get_mut(id) else {
+            return;
+        };
+        let changed = net.members.apply(msg, &net.nick);
+        let left = left_channel(msg, &net.nick);
+        self.dispatch(id, msg);
+        for channel in changed {
+            let members = match self.networks.get(id) {
+                Some(net) => net.members.list(&channel),
+                None => continue,
+            };
+            self.emit(Event::Members {
+                network: id.to_owned(),
+                channel,
+                members,
+            });
+        }
+        if let Some(channel) = left {
+            self.remove_buffer(id, &channel);
+        }
+    }
+
+    fn dispatch(&mut self, id: &str, msg: &Message) {
         match msg.command.as_str() {
             "NICK" => {
                 if let Some(net) = self.networks.get_mut(id)
@@ -411,6 +512,42 @@ impl Coordinator {
                 });
             }
             "FAIL" => self.error(Some(id), msg.to_string()),
+            // RPL_TOPIC <me> <channel> :<topic>, RPL_NOTOPIC <me> <channel> :…
+            "332" | "331" => {
+                if let Some(channel) = msg.param(1) {
+                    let topic = if msg.command == "332" {
+                        msg.param(2)
+                    } else {
+                        None
+                    };
+                    self.topic(id, channel, topic);
+                }
+            }
+            "TOPIC" => {
+                if let Some(channel) = msg.param(0) {
+                    self.topic(id, channel, msg.param(1));
+                }
+                self.live(id, msg);
+            }
+            // RPL_ISUPPORT <me> <token>… :are supported by this server
+            "005" => {
+                if let Some(net) = self.networks.get_mut(id) {
+                    let tokens = msg
+                        .params
+                        .iter()
+                        .skip(1)
+                        .take(msg.params.len().saturating_sub(2));
+                    for token in tokens {
+                        match token.strip_prefix('-') {
+                            Some(key) => net.set_isupport(key, None),
+                            None => {
+                                let (key, value) = token.split_once('=').unwrap_or((token, ""));
+                                net.set_isupport(key, Some(value));
+                            }
+                        }
+                    }
+                }
+            }
             _ => self.live(id, msg),
         }
     }
@@ -423,12 +560,41 @@ impl Coordinator {
         let Some((buffer, kind, message)) = route(msg, &net.ctx()) else {
             return;
         };
+        let replayed_join = message.own
+            && message.kind == MessageKind::Join
+            && !self
+                .networks
+                .get_mut(id)
+                .is_some_and(|net| net.requested_joins.remove(&buffer_key(&buffer)));
         self.ensure_buffer(id, &buffer, kind);
+        if replayed_join {
+            return;
+        }
         self.emit(Event::Message {
             network: id.to_owned(),
             buffer,
             message,
         });
+    }
+
+    fn topic(&mut self, id: &str, channel: &str, topic: Option<&str>) {
+        self.emit(Event::Topic {
+            network: id.to_owned(),
+            channel: channel.to_owned(),
+            topic: topic.filter(|t| !t.is_empty()).map(str::to_owned),
+        });
+    }
+
+    fn remove_buffer(&mut self, id: &str, name: &str) {
+        let Some(net) = self.networks.get_mut(id) else {
+            return;
+        };
+        if net.buffers.remove(&buffer_key(name)).is_some() {
+            self.emit(Event::BufferRemoved {
+                network: id.to_owned(),
+                name: name.to_owned(),
+            });
+        }
     }
 
     fn ensure_buffer(&mut self, id: &str, name: &str, kind: BufferKind) {
@@ -452,11 +618,22 @@ impl Coordinator {
     }
 }
 
+/// The channel `msg` says we left (our PART, or a KICK of us).
+fn left_channel(msg: &Message, own_nick: &str) -> Option<String> {
+    let own = |nick: &str| nick.eq_ignore_ascii_case(own_nick);
+    match msg.command.as_str() {
+        "PART" if msg.source_nick().is_some_and(own) => msg.param(0).map(str::to_owned),
+        "KICK" if msg.param(1).is_some_and(own) => msg.param(0).map(str::to_owned),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::model::Member;
 
     type Spawned = Arc<Mutex<Vec<(ConnId, mpsc::UnboundedReceiver<ToConn>)>>>;
 
@@ -590,17 +767,17 @@ mod tests {
             FromConn::Incoming(Incoming::Batch(batch.clone())),
         );
         let ev = h.events();
-        assert!(ev.contains(&Event::BufferAdded {
-            network: "1".into(),
-            name: "#rust".into(),
-            kind: BufferKind::Channel
-        }));
+        // Channels come from JOINs, so ones we've left don't come back.
+        assert!(
+            !ev.iter()
+                .any(|e| matches!(e, Event::BufferAdded { name, .. } if name == "#rust"))
+        );
         assert!(ev.contains(&Event::BufferAdded {
             network: "1".into(),
             name: "alice".into(),
             kind: BufferKind::Query
         }));
-        assert_eq!(h.sent(Some("1")), ["MARKREAD #rust", "MARKREAD alice"]);
+        assert_eq!(h.sent(Some("1")), ["MARKREAD alice"]);
 
         // Known buffers aren't announced twice.
         batch.messages.truncate(1);
@@ -637,6 +814,210 @@ mod tests {
         };
         assert_eq!(irc_timestamp(*t), "2026-10-24T10:00:00.000Z");
         assert!(matches!(&ev[3], Event::ReadMarker { time: None, .. }));
+    }
+
+    #[test]
+    fn members_and_leaving() {
+        let mut h = Harness::new();
+        h.connected_network(&[]);
+        h.line(Some("1"), ":me!u@h JOIN #rust");
+        h.line(Some("1"), ":srv 353 me = #rust :@op me");
+        h.line(Some("1"), ":srv 366 me #rust :End");
+        let ev = h.events();
+        assert!(
+            ev.contains(&Event::Members {
+                network: "1".into(),
+                channel: "#rust".into(),
+                members: vec![
+                    Member {
+                        nick: "op".into(),
+                        prefix: "@".into()
+                    },
+                    Member {
+                        nick: "me".into(),
+                        prefix: String::new()
+                    },
+                ],
+            }),
+            "{ev:?}"
+        );
+
+        // Closing a channel parts it; the buffer goes when the server agrees.
+        h.c.command(Command::CloseBuffer {
+            network: "1".into(),
+            name: "#rust".into(),
+        });
+        assert_eq!(h.sent(Some("1")), ["PART #rust"]);
+        assert!(h.events().is_empty());
+        h.line(Some("1"), ":me!u@h PART #rust");
+        assert!(h.events().contains(&Event::BufferRemoved {
+            network: "1".into(),
+            name: "#rust".into()
+        }));
+
+        // Being kicked removes it too.
+        h.line(Some("1"), ":me!u@h JOIN #go");
+        h.line(Some("1"), ":op!o@h KICK #go me :bye");
+        assert!(h.events().contains(&Event::BufferRemoved {
+            network: "1".into(),
+            name: "#go".into()
+        }));
+
+        // Closing a private conversation just forgets it.
+        h.line(Some("1"), ":erin!e@h PRIVMSG me :hi");
+        h.events();
+        h.c.command(Command::CloseBuffer {
+            network: "1".into(),
+            name: "erin".into(),
+        });
+        assert!(h.sent(Some("1")).is_empty());
+        assert_eq!(
+            h.events(),
+            [Event::BufferRemoved {
+                network: "1".into(),
+                name: "erin".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn topics() {
+        let mut h = Harness::new();
+        h.connected_network(&[]);
+        h.line(Some("1"), ":srv 332 me #rust :Rust talk");
+        h.line(Some("1"), ":srv 331 me #empty :No topic is set");
+        let topic = |channel: &str, topic: Option<&str>| Event::Topic {
+            network: "1".into(),
+            channel: channel.into(),
+            topic: topic.map(Into::into),
+        };
+        assert_eq!(
+            h.events(),
+            [topic("#rust", Some("Rust talk")), topic("#empty", None)]
+        );
+        // A change is both a topic and a line in the channel.
+        h.line(Some("1"), ":op!o@h TOPIC #rust :New topic");
+        let ev = h.events();
+        assert!(ev.contains(&topic("#rust", Some("New topic"))), "{ev:?}");
+        assert!(ev.iter().any(
+            |e| matches!(e, Event::Message { message, .. } if message.kind == MessageKind::Topic)
+        ));
+        // Clearing it.
+        h.line(Some("1"), ":op!o@h TOPIC #rust :");
+        assert!(h.events().contains(&topic("#rust", None)));
+    }
+
+    #[test]
+    fn replayed_own_joins_are_not_messages() {
+        let mut h = Harness::new();
+        h.connected_network(&["echo-message"]);
+
+        // soju replays our channels on connect: buffer yes, message no.
+        h.line(Some("1"), ":me!u@h JOIN #rust");
+        assert_eq!(
+            h.events(),
+            [Event::BufferAdded {
+                network: "1".into(),
+                name: "#rust".into(),
+                kind: BufferKind::Channel
+            }]
+        );
+
+        // A join the user asked for is shown, once.
+        h.c.command(Command::Join {
+            network: "1".into(),
+            channel: "#New,#other".into(),
+        });
+        h.line(Some("1"), ":me!u@h JOIN #new");
+        let ev = h.events();
+        assert!(
+            ev.iter()
+                .any(|e| matches!(e, Event::Message { buffer, message, .. }
+                if buffer == "#new" && message.kind == MessageKind::Join)),
+            "{ev:?}"
+        );
+        h.line(Some("1"), ":me!u@h JOIN #new");
+        assert!(h.events().is_empty(), "a second replay is quiet");
+
+        // Other people's joins are always shown.
+        h.line(Some("1"), ":erin!u@h JOIN #rust");
+        assert!(
+            h.events()
+                .iter()
+                .any(|e| matches!(e, Event::Message { .. }))
+        );
+    }
+
+    #[test]
+    fn network_management_and_raw_lines() {
+        let mut h = Harness::new();
+        h.connected_network(&[]);
+        h.c.command(Command::AddNetwork {
+            attributes: [
+                ("name".to_owned(), "Libera Chat".to_owned()),
+                ("host".to_owned(), "irc.libera.chat".to_owned()),
+                ("tls".to_owned(), "1".to_owned()),
+            ]
+            .into(),
+        });
+        h.c.command(Command::ChangeNetwork {
+            network: "1".into(),
+            attributes: [
+                ("port".to_owned(), "6667".to_owned()),
+                ("nickname".to_owned(), String::new()),
+            ]
+            .into(),
+        });
+        h.c.command(Command::RemoveNetwork {
+            network: "1".into(),
+        });
+        assert_eq!(
+            h.sent(None),
+            [
+                "BOUNCER ADDNETWORK host=irc.libera.chat;name=Libera\\sChat;tls=1",
+                // An empty value removes the attribute.
+                "BOUNCER CHANGENETWORK 1 nickname=;port=6667",
+                "BOUNCER DELNETWORK 1",
+            ]
+        );
+
+        // ISUPPORT arriving after registration still counts.
+        h.line(
+            Some("1"),
+            ":srv 005 me PREFIX=(Yo)!@ CHANTYPES=#& :are supported",
+        );
+        h.line(Some("1"), ":me!u@h JOIN #x");
+        h.line(Some("1"), ":srv 353 me = #x :!boss @op me");
+        h.line(Some("1"), ":srv 366 me #x :End");
+        let members = h.events().into_iter().find_map(|e| match e {
+            Event::Members { members, .. } => Some(members),
+            _ => None,
+        });
+        let nicks: Vec<String> = members
+            .unwrap()
+            .into_iter()
+            .map(|m| m.prefix + &m.nick)
+            .collect();
+        assert_eq!(nicks, ["!boss", "@op", "me"]);
+
+        h.c.command(Command::SendRaw {
+            network: "1".into(),
+            line: "WHOIS alice".into(),
+        });
+        assert_eq!(h.sent(Some("1")), ["WHOIS alice"]);
+
+        // A rejection from soju reaches the front end.
+        h.line(
+            None,
+            "FAIL BOUNCER INVALID_ATTRIBUTE ADDNETWORK host :Invalid host",
+        );
+        assert_eq!(
+            h.events(),
+            [Event::Error {
+                network: None,
+                message: "Invalid host".into()
+            }]
+        );
     }
 
     #[test]

@@ -17,7 +17,9 @@
 
 mod connection;
 mod coordinator;
+mod members;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,7 +27,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::mpsc;
 
 use crate::auth::CredentialProvider;
-use crate::model::{BufferKind, ChatMessage, NetworkId, NetworkInfo};
+use crate::model::{BufferKind, ChatMessage, Member, NetworkId, NetworkInfo};
 use crate::transport::Connector;
 
 #[derive(Clone)]
@@ -111,6 +113,24 @@ pub enum Event {
         name: String,
         kind: BufferKind,
     },
+    /// The buffer is gone: we left the channel, or the front end closed it.
+    BufferRemoved {
+        network: NetworkId,
+        name: String,
+    },
+    /// A channel's full member list, after NAMES and after every change.
+    Members {
+        network: NetworkId,
+        channel: String,
+        members: Vec<Member>,
+    },
+    /// A channel's topic: when joining, and whenever it changes. `None`:
+    /// no topic set.
+    Topic {
+        network: NetworkId,
+        channel: String,
+        topic: Option<String>,
+    },
     /// A live message.
     Message {
         network: NetworkId,
@@ -163,6 +183,33 @@ pub enum Command {
         target: String,
         before: Option<DateTime<Utc>>,
         limit: usize,
+    },
+    /// Adds a network to soju (`BOUNCER ADDNETWORK`): attributes such as
+    /// `name`, `host`, `port`, `tls` (`1`/`0`) and `nickname`. It appears as
+    /// [`Event::NetworkUpdated`]; a rejection arrives as [`Event::Error`].
+    AddNetwork {
+        attributes: BTreeMap<String, String>,
+    },
+    /// Changes a network's attributes (`BOUNCER CHANGENETWORK`); an empty
+    /// value removes the attribute.
+    ChangeNetwork {
+        network: NetworkId,
+        attributes: BTreeMap<String, String>,
+    },
+    /// Deletes a network from soju (`BOUNCER DELNETWORK`).
+    RemoveNetwork {
+        network: NetworkId,
+    },
+    /// Sends a raw IRC line on a network, e.g. `WHOIS alice`.
+    SendRaw {
+        network: NetworkId,
+        line: String,
+    },
+    /// Closes a buffer: parts a channel (removed when the server confirms)
+    /// or forgets a private conversation until its history lists it again.
+    CloseBuffer {
+        network: NetworkId,
+        name: String,
     },
     /// Mark everything up to `time` as read, on every device.
     MarkRead {

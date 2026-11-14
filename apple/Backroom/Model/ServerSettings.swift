@@ -10,6 +10,11 @@ struct ServerSettings: Codable, Equatable, Sendable {
     static let clientID = "backroom"
     static let redirectURI = "backroom://oauth/callback"
     static let callbackScheme = "backroom"
+    /// `soju_roles` puts soju in the token's audience. `offline_access` gets a
+    /// refresh token that outlives Keycloak's 30-minute idle browser session,
+    /// so reconnecting after a while (sleep, network blip, soju restart)
+    /// doesn't log you out.
+    static let scopes = ["soju_roles", "offline_access"]
 
     /// The local e2e stack (`mise run e2e:up`), log in as alice / alice.
     static let e2e = ServerSettings(
@@ -20,7 +25,7 @@ struct ServerSettings: Codable, Equatable, Sendable {
     var clientConfig: ClientConfig {
         ClientConfig(
             serverUrl: serverURL, issuer: issuer, clientId: Self.clientID,
-            scopes: ["soju_roles"], redirectUri: Self.redirectURI, nick: nick)
+            scopes: Self.scopes, redirectUri: Self.redirectURI, nick: nick)
     }
 
     /// Keychain account for this login: tokens belong to one issuer and server.
@@ -39,5 +44,22 @@ struct ServerSettings: Codable, Equatable, Sendable {
         if let data = try? JSONEncoder().encode(self) {
             defaults.set(data, forKey: Self.key)
         }
+    }
+}
+
+/// What the network form edits, as soju network attributes.
+struct NetworkFields: Equatable {
+    var name: String
+    var host: String
+    var port: Int
+    var tls: Bool
+    var nick: String
+
+    func attributes(keepEmpty: Bool) -> [String: String] {
+        var attributes = ["host": host, "port": String(port), "tls": tls ? "1" : "0"]
+        for (key, value) in [("name", name), ("nickname", nick)] where keepEmpty || !value.isEmpty {
+            attributes[key] = value
+        }
+        return attributes
     }
 }

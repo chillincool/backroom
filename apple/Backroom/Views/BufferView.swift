@@ -10,11 +10,22 @@ struct BufferView: View {
     var body: some View {
         let buffer = model.buffers[id]
         VStack(spacing: 0) {
+            if let buffer, let topic = buffer.topic, topic != buffer.dismissedTopic {
+                TopicBanner(topic: topic) { buffer.dismissedTopic = topic }
+                Divider()
+            }
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 2) {
                     HistoryHeader(buffer: buffer) { model.loadOlder(id) }
-                    ForEach(buffer?.messages ?? [], id: \.self) { message in
-                        MessageRow(message: message)
+                    if let buffer {
+                        ForEach(TimelineItem.build(buffer.messages)) { item in
+                            switch item {
+                            case .message(let message):
+                                MessageRow(message: message, buffer: buffer)
+                            case .presence(let run):
+                                PresenceRow(run: run)
+                            }
+                        }
                     }
                 }
                 .padding(.horizontal, 12)
@@ -37,13 +48,13 @@ struct BufferView: View {
         .onAppear { composerFocused = true }
     }
 
-    private func title(_ buffer: BufferState?) -> String {
+    private func title(_ buffer: BufferModel?) -> String {
         guard let buffer else { return "" }
         guard buffer.kind == .server else { return buffer.name }
         return model.networks.first { $0.id == id.network }?.network.name ?? "Server"
     }
 
-    private func placeholder(_ buffer: BufferState?) -> String {
+    private func placeholder(_ buffer: BufferModel?) -> String {
         guard let buffer else { return "" }
         return buffer.kind == .server ? "Commands, e.g. /join #channel" : "Message \(buffer.name)"
     }
@@ -51,7 +62,7 @@ struct BufferView: View {
 
 /// Top of the message list: loads older history when it scrolls into view.
 struct HistoryHeader: View {
-    let buffer: BufferState?
+    let buffer: BufferModel?
     let loadOlder: () -> Void
 
     var body: some View {
@@ -74,6 +85,8 @@ struct HistoryHeader: View {
 
 struct MessageRow: View {
     let message: ChatMessage
+    /// Read here, not by the list, so member changes only redraw visible rows.
+    let buffer: BufferModel
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -89,7 +102,9 @@ struct MessageRow: View {
 
     @ViewBuilder private var line: some View {
         let text = stripFormatting(text: message.text)
-        let sender = Text(message.sender).bold().foregroundColor(message.own ? .accentColor : .primary)
+        let prefix = buffer.prefixByNick[message.sender.lowercased()]
+        let color = message.own ? Color.accentColor : NickColor.color(prefix: prefix)
+        let sender = Text(NickColor.label(message.sender, prefix: prefix)).bold().foregroundColor(color)
         switch message.kind {
         case .privmsg:
             Text("\(sender)  \(text)")
@@ -106,5 +121,50 @@ struct MessageRow: View {
         case .topic:
             Text("\(message.sender) set the topic: \(text)").foregroundStyle(.secondary)
         }
+    }
+}
+
+/// The channel topic, closable; it comes back when the topic changes.
+struct TopicBanner: View {
+    let topic: String
+    let close: () -> Void
+
+    var body: some View {
+        let text = stripFormatting(text: topic)
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "text.quote").foregroundStyle(.secondary)
+            Text(text)
+                .lineLimit(2)
+                .textSelection(.enabled)
+                .help(text)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Button(action: close) {
+                Image(systemName: "xmark")
+            }
+            .buttonStyle(.borderless)
+            .help("Hide the topic until it changes")
+        }
+        .font(.callout)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(.bar)
+    }
+}
+
+/// A run of joins and parts on one line.
+struct PresenceRow: View {
+    let run: [ChatMessage]
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(run.last?.time ?? .now, format: .dateTime.hour().minute())
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.tertiary)
+            Text(TimelineItem.summary(run))
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.vertical, 1)
     }
 }

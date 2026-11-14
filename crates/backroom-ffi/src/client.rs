@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::SystemTime;
 
@@ -209,6 +210,43 @@ impl BackroomClient {
             channel,
             reason,
         })
+    }
+
+    /// Adds a network to soju. Attributes: `name`, `host`, `port`, `tls`
+    /// (`1`/`0`), `nickname`, … It shows up as `NetworkUpdated`; a
+    /// rejection arrives as an `Error` event.
+    pub fn add_network(&self, attributes: HashMap<String, String>) -> Result<(), BackroomError> {
+        self.command(Command::AddNetwork {
+            attributes: attributes.into_iter().collect(),
+        })
+    }
+
+    /// Changes a network's attributes; an empty value removes one.
+    pub fn change_network(
+        &self,
+        network: String,
+        attributes: HashMap<String, String>,
+    ) -> Result<(), BackroomError> {
+        self.command(Command::ChangeNetwork {
+            network,
+            attributes: attributes.into_iter().collect(),
+        })
+    }
+
+    /// Deletes a network from soju, with its channels and history.
+    pub fn remove_network(&self, network: String) -> Result<(), BackroomError> {
+        self.command(Command::RemoveNetwork { network })
+    }
+
+    /// Sends a raw IRC line on a network, e.g. `WHOIS alice`.
+    pub fn send_raw(&self, network: String, line: String) -> Result<(), BackroomError> {
+        self.command(Command::SendRaw { network, line })
+    }
+
+    /// Leaves a channel (its buffer goes once the server confirms) or
+    /// closes a private conversation.
+    pub fn close_buffer(&self, network: String, name: String) -> Result<(), BackroomError> {
+        self.command(Command::CloseBuffer { network, name })
     }
 
     /// Asks for up to `limit` messages before `before` (or the latest);

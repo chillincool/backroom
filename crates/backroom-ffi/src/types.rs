@@ -79,6 +79,22 @@ impl From<model::ChatMessage> for ChatMessage {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, uniffi::Record)]
+pub struct Member {
+    pub nick: String,
+    /// Membership prefixes, highest first (`@`, `+`, `@+`, …); empty if none.
+    pub prefix: String,
+}
+
+impl From<model::Member> for Member {
+    fn from(m: model::Member) -> Self {
+        Member {
+            nick: m.nick,
+            prefix: m.prefix,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct Network {
     /// soju network ID; pass it back in commands.
@@ -149,6 +165,23 @@ pub enum SessionEvent {
         name: String,
         kind: BufferKind,
     },
+    /// We left the channel, or the conversation was closed.
+    BufferRemoved {
+        network: String,
+        name: String,
+    },
+    /// A channel's full member list, highest rank first.
+    Members {
+        network: String,
+        channel: String,
+        members: Vec<Member>,
+    },
+    /// A channel's topic, when joining and on changes; nil if none is set.
+    Topic {
+        network: String,
+        channel: String,
+        topic: Option<String>,
+    },
     /// A live message.
     Message {
         network: String,
@@ -196,6 +229,25 @@ impl From<live::Event> for SessionEvent {
                 network,
                 name,
                 kind: kind.into(),
+            },
+            E::BufferRemoved { network, name } => SessionEvent::BufferRemoved { network, name },
+            E::Members {
+                network,
+                channel,
+                members,
+            } => SessionEvent::Members {
+                network,
+                channel,
+                members: members.into_iter().map(Into::into).collect(),
+            },
+            E::Topic {
+                network,
+                channel,
+                topic,
+            } => SessionEvent::Topic {
+                network,
+                channel,
+                topic,
             },
             E::Message {
                 network,

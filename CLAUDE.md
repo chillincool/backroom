@@ -109,17 +109,58 @@ with `MockConnector::concurrent`.
 
 ## Status (2026-11-14)
 
-- Merged: Phase 1 (`cece7a5`), `live` session (`4d40543`, #8), `backroom-ffi`
-  + `apple/BackroomCore` (`496f34a`, #9).
-- Phase 2 steps 3–4 on branch `feat/macos-app`: the macOS app works against
-  the e2e stack (login, live networks, buffers, history, unread, read
-  markers, send, `/me`, `/join`, `/part`) and a `macos` CI job. After it
-  merges, add `macos` to the `main` ruleset's required checks.
+- Merged: Phase 1 (`cece7a5`), `live` session (#8), `backroom-ffi` +
+  `apple/BackroomCore` (#9), macOS app + `macos` CI job (#10).
+- Branch `feat/app-polish` (committed, not pushed): member lists (NAMES,
+  ranks from ISUPPORT PREFIX, live updates), topics, add/edit/remove
+  networks (`BOUNCER ADD/CHANGE/DELNETWORK`), raw commands, buffer removal
+  on PART/KICK, replayed own JOINs hidden, channel buffers only from JOINs
+  (TARGETS adds queries only); app: rank-coloured nicks with symbols,
+  collapsible member groups, topic banner, join/part runs folded, PMs from
+  the member list, `/j` `/p` `/m` `/q` `/t` `/quote` (other commands go raw),
+  reopen last conversation, `/join` switches.
+- `macos` is deliberately **not** a required check yet (owner: wait until the
+  app is further along; it adds ~6 min per PR).
+- Dev testing uses the e2e stack's soju with real networks (Libera,
+  P2P-Network) added for alice; production Keycloak still lacks the
+  `backroom://oauth/callback` redirect.
 - CodeQL flags e2e test passwords (`rust/hard-coded-cryptographic-value`) and
   the ruleset blocks merges on them: dismiss as "used in tests".
 - Codeberg can rebuild a soju tag, deleting the pinned digest ("manifest
   unknown" in e2e); Renovate doesn't notice. Re-pin from
   `docker buildx imagetools inspect`.
+- P2P-Network's servers partly offer only TLS 1.2 RSA key exchange, which
+  Go (soju) refuses. Production pins `irc.p2p-network.net` to working
+  servers via hostAliases; the e2e soju-oauth2 does the same (`extra_hosts`).
+- SwiftUI performance: each buffer is its own `@Observable` (`BufferModel`)
+  and the member list is a `LazyVStack`; a sectioned `List` with ~1,600 rows
+  made channel switching take seconds.
+
+## Pick up here (2026-11-14)
+
+- Branch `feat/app-polish`, 3+ commits ahead of `main`, **not pushed**. When
+  ready: `git push -u origin feat/app-polish`, `gh pr create`, then
+  `gh pr merge --squash --auto` (dismiss CodeQL test-password alerts if any).
+- Just changed: the app requests `offline_access` so its refresh token
+  outlives Keycloak's 30-min idle session (`ssoSessionIdleTimeout`); before,
+  any reconnect after 30 min connected logged the user out
+  (`REFRESH_TOKEN_ERROR … Token is not active`). **Verify** after the owner
+  logs out/in: alice should have an offline session for `backroom`
+  (Keycloak admin API: `GET /admin/realms/e2e/users/<id>/offline-sessions/<client-uuid>`).
+  Production: confirm the `backroom` client has `offline_access` as an
+  optional client scope before relying on it.
+- Owner still has to rejoin channels in the test stack (`/j libera,linux,backroom-dev`
+  on libera, `/j backroom` on ergo-test, `/j 420` on P2P-Network).
+- Dev setup running: e2e stack up (`mise run e2e:up`), soju-oauth2 data on
+  volume `soju-oauth2-data` (survives recreation; `e2e.sh down` deletes it),
+  alice has networks ergo-test, libera (nick backroom-dev), P2P-Network
+  (nick chillin-dev). Rex backroom tab panes: nvim, lazygit, bacon
+  (`clippy-all`), Claude, shell, plus soju log, CI watcher and the bob test
+  bot (scratchpad script; gone after this session).
+- Not done / ideas: production use (add `backroom://oauth/callback` to
+  production Keycloak's `backroom` client), notifications, search, nick
+  completion, multiple accounts, mIRC colours, offline start without
+  Keycloak reachable, `macos` as a required check (deferred by owner).
 
 ## Decisions
 

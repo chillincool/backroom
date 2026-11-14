@@ -40,9 +40,20 @@ services:
   soju-oauth2:
     <<: *soju
     ports: ["127.0.0.1:18081:8080", "127.0.0.1:16667:6667", "127.0.0.1:16697:6697"]
+    # On a volume, not tmpfs, so recreating the container (e.g. after a
+    # compose change) keeps the dev account's networks, channels and
+    # history; `e2e.sh down` deletes it.
+    tmpfs: [/run/soju]
     volumes:
       - ./soju/oauth2.conf:/soju-config:ro
       - ../../.e2e/certs:/certs:ro
+      - soju-oauth2-data:/data
+    # Like production (chillincool-infra soju helmrelease): two of
+    # P2P-Network's servers only offer TLS that soju's Go runtime refuses,
+    # so pin the name to one that works. (Compose keeps one entry per name;
+    # production lists all five working servers.)
+    extra_hosts:
+      - "irc.p2p-network.net:159.65.204.61"
 
   soju-internal:
     <<: *soju
@@ -57,3 +68,6 @@ services:
     volumes:
       - ./soju/http.conf:/soju-config:ro
       - ../../.e2e/certs:/certs:ro
+
+volumes:
+  soju-oauth2-data:
