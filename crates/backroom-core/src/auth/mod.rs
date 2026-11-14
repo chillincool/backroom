@@ -46,7 +46,67 @@ impl fmt::Debug for TokenSet {
     }
 }
 
+/// Serialized form of a [`TokenSet`], for stores that keep one opaque
+/// secret (the CLI's dev file, a Keychain item).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredTokens {
+    access_token: String,
+    refresh_token: Option<String>,
+    /// Unix seconds.
+    expires_at: Option<i64>,
+    scope: Option<String>,
+}
+
+impl Drop for StoredTokens {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.access_token.zeroize();
+        if let Some(t) = &mut self.refresh_token {
+            t.zeroize();
+        }
+    }
+}
+
 impl TokenSet {
+    /// Serializes the tokens as JSON for a [`TokenStore`] that keeps one
+    /// opaque secret.
+    pub fn to_json(&self) -> SecretString {
+        use secrecy::ExposeSecret;
+        let stored = StoredTokens {
+            access_token: self.access_token.expose_secret().to_owned(),
+            refresh_token: self
+                .refresh_token
+                .as_ref()
+                .map(|t| t.expose_secret().to_owned()),
+            expires_at: self.expires_at.map(|t| t.timestamp()),
+            scope: self.scope.clone(),
+        };
+        // Serializing strings and integers cannot fail.
+        let json = serde_json::to_string_pretty(&stored).unwrap_or_default();
+        SecretString::from(json)
+    }
+
+    /// Parses what [`to_json`](Self::to_json) produced. Errors never quote
+    /// the input, since it holds secrets.
+    pub fn from_json(json: &str) -> Result<Self, StoreError> {
+        let stored: StoredTokens = serde_json::from_str(json).map_err(|e| {
+            StoreError(format!(
+                "stored tokens are not valid ({:?} error at line {}, column {})",
+                e.classify(),
+                e.line(),
+                e.column()
+            ))
+        })?;
+        Ok(TokenSet {
+            access_token: SecretString::from(stored.access_token.clone()),
+            refresh_token: stored.refresh_token.clone().map(SecretString::from),
+            expires_at: stored
+                .expires_at
+                .and_then(|t| DateTime::from_timestamp(t, 0)),
+            scope: stored.scope.clone(),
+        })
+    }
+
     /// True if the access token is expired or expires within `margin`.
     /// Tokens without a known expiry are treated as valid.
     pub fn expires_within(&self, margin: TimeDelta) -> bool {
@@ -182,6 +242,35 @@ mod tests {
         assert!(tokens(Some(-5)).expires_within(REFRESH_MARGIN));
         assert!(!tokens(Some(300)).expires_within(REFRESH_MARGIN));
         assert!(!tokens(None).expires_within(REFRESH_MARGIN));
+    }
+
+    #[test]
+    fn json_round_trip() {
+        use secrecy::ExposeSecret;
+        let original = tokens(Some(300));
+        let parsed = TokenSet::from_json(original.to_json().expose_secret()).unwrap();
+        assert_eq!(parsed.access_token.expose_secret(), "access-secret");
+        assert_eq!(
+            parsed.refresh_token.unwrap().expose_secret(),
+            "refresh-secret"
+        );
+        assert_eq!(
+            parsed.expires_at.map(|t| t.timestamp()),
+            original.expires_at.map(|t| t.timestamp())
+        );
+        assert_eq!(parsed.scope.as_deref(), Some("openid soju_roles"));
+    }
+
+    #[test]
+    fn json_errors_do_not_quote_secrets() {
+        let err = TokenSet::from_json(r#"{"access_token": 1, "refresh_token": "refresh-secret"}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("refresh-secret"), "{err}");
+        let err = TokenSet::from_json(r#"{"access_token": "access-secret"#)
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("access-secret"), "{err}");
     }
 
     #[test]

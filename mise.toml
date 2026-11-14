@@ -46,3 +46,7 @@ run = "scripts/e2e.sh down"
 [tasks."e2e:realm"]
 description = "Regenerate test/e2e/keycloak/realm.json from build-realm.sh (slow)"
 run = "scripts/e2e.sh realm"
+
+[tasks."apple:core"]
+description = "Build backroom-ffi and regenerate apple/BackroomCore (needs Xcode)"
+run = "scripts/build-apple.sh"
