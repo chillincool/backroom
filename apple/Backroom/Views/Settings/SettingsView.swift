@@ -7,7 +7,7 @@ struct SettingsView: View {
     @AppStorage("settingsTab") private var tab = Tab.account
 
     enum Tab: String {
-        case account, networks, appearance, messages, highlights
+        case account, networks, appearance, messages, highlights, notifications
     }
 
     var body: some View {
@@ -27,6 +27,9 @@ struct SettingsView: View {
             HighlightSettings()
                 .tabItem { Label("Highlights", systemImage: "bell.badge") }
                 .tag(Tab.highlights)
+            NotificationSettings()
+                .tabItem { Label("Notifications", systemImage: "bell") }
+                .tag(Tab.notifications)
         }
         .frame(width: 640)
         .environment(\.theme, prefs.theme(dark: colorScheme == .dark))

@@ -27,6 +27,7 @@ pub const WANTED_CAPS: &[&str] = &[
     "draft/chathistory",
     "draft/read-marker",
     "soju.im/bouncer-networks",
+    "soju.im/search",
 ];
 
 /// Capabilities advertised by the server, name → value (empty if none).

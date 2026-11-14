@@ -25,7 +25,15 @@ struct ServerSettings: Codable, Equatable, Sendable {
     var clientConfig: ClientConfig {
         ClientConfig(
             serverUrl: serverURL, issuer: issuer, clientId: Self.clientID,
-            scopes: Self.scopes, redirectUri: Self.redirectURI, nick: nick)
+            scopes: Self.scopes, redirectUri: Self.redirectURI, nick: nick,
+            clientVersion: Self.clientVersion)
+    }
+
+    /// Our CTCP VERSION reply: "Backroom 0.1.0 (macOS 26.3)".
+    static var clientVersion: String {
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
+        let os = ProcessInfo.processInfo.operatingSystemVersion
+        return "Backroom \(version) (macOS \(os.majorVersion).\(os.minorVersion))"
     }
 
     /// Keychain account for this login: tokens belong to one issuer and server.

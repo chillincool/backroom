@@ -13,6 +13,8 @@ struct SheetContent: View {
             case .browseChannels(let network): ChannelBrowser(network: network)
             case .newConversation(let network): NewConversationSheet(network: network)
             case .whois(let network, let info): WhoisView(network: network, info: info)
+            case .search(let network): SearchView(network: network)
+            case .channelSettings(let network, let channel): ChannelSettingsView(network: network, channel: channel)
             }
         }
     }

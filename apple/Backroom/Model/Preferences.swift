@@ -117,6 +117,13 @@ final class Preferences {
     var highlightWords: [String] { didSet { set(highlightWords, "highlightWords") } }
     /// Nicks whose messages are hidden.
     var ignored: [String] { didSet { set(ignored, "ignored") } }
+    /// macOS notifications for mentions and private messages.
+    var notifications: Bool { didSet { set(notifications, "notifications") } }
+    var notificationSound: Bool { didSet { set(notificationSound, "notificationSound") } }
+    /// Also notify for every channel message, not only mentions.
+    var notifyAllMessages: Bool { didSet { set(notifyAllMessages, "notifyAllMessages") } }
+    /// Let others see when we're typing.
+    var sendTyping: Bool { didSet { set(sendTyping, "sendTyping") } }
 
     static let monospaced = "monospaced"
     static let fontSizes: ClosedRange<Double> = 10...24
@@ -150,6 +157,10 @@ final class Preferences {
         showFormatting = defaults.object(forKey: Self.prefix + "showFormatting") as? Bool ?? true
         highlightWords = defaults.stringArray(forKey: Self.prefix + "highlightWords") ?? []
         ignored = defaults.stringArray(forKey: Self.prefix + "ignored") ?? []
+        notifications = defaults.object(forKey: Self.prefix + "notifications") as? Bool ?? true
+        notificationSound = defaults.object(forKey: Self.prefix + "notificationSound") as? Bool ?? true
+        notifyAllMessages = defaults.bool(forKey: Self.prefix + "notifyAllMessages")
+        sendTyping = defaults.object(forKey: Self.prefix + "sendTyping") as? Bool ?? true
     }
 
     private nonisolated static func read(_ defaults: UserDefaults, _ key: String) -> String? {

@@ -12,7 +12,7 @@ services. Owner: chillincool. Public repo: github.com/chillincool/backroom.
   instead of relying on memory.
 - **Never log, print or store tokens or passwords.** Secrets are
   `secrecy::SecretString`; `Debug` must not reveal them; raw IRC tracing
-  redacts `AUTHENTICATE`.
+  redacts `AUTHENTICATE` and JOIN keys.
 - **`backroom-core` has no platform code.** Browser login and token storage go
   behind traits the front end implements (`TokenStore`, OIDC `begin`/`complete`).
 - **Prefer well-maintained crates** over hand-rolling anything crypto-related.
@@ -25,14 +25,18 @@ services. Owner: chillincool. Public repo: github.com/chillincool/backroom.
 ## Layout
 
 - `crates/backroom-core`: the library
-  - `proto/` message parsing, CAP, numerics, mIRC formatting (strip only)
+  - `proto/` message parsing, CAP (`WANTED_CAPS`), numerics, mIRC formatting
+    (strip, or styled spans with the 99-colour palette)
   - `transport/` `Transport`/`Connector` traits; WebSocket (`wss://`, `ws://`)
     and TCP (`ircs://`, `irc+insecure://`) via `connector_for_url`; extra CAs
     via `TlsOptions`
   - `session/registration.rs` sans-IO CAP → SASL → `BOUNCER BIND` → `CAP END`
   - `sasl.rs`, `auth/` (OIDC + PKCE, refresh, `OidcCredentials`, `jwt_peek`)
   - `client.rs` async driver; `next_incoming()` is cancel-safe for `select!`
-  - `live/` long-lived session for apps (see below); `model.rs` chat model
+  - `live/` long-lived session for apps (see below); `members.rs` member
+    lists and away state
+  - `model.rs` chat model: `route` (message → buffer), `route_reply`
+    (numerics), `quit_or_nick`, `WhoisInfo`, `ChannelListing`, `BanEntry`
 - `crates/backroom-ffi`: UniFFI 0.32 bindings. One `BackroomClient` object
   (owns a tokio runtime; async methods spawn onto it). Swift implements
   `SecretStore` (`#[uniffi::export(foreign)]`): one opaque Keychain value,
@@ -45,7 +49,15 @@ services. Owner: chillincool. Public repo: github.com/chillincool/backroom.
   and Info.plist are git-ignored). `AppModel` (`@Observable`, main actor)
   owns the client via `BackroomClientProtocol` (faked in tests) and applies
   events; `Preferences` (`@Observable`, UserDefaults) and `Theme` reach
-  views through the environment (`\.theme`). Login opens the default browser and receives
+  views through the environment (`\.theme`). `Model/`: `AppModel`,
+  `ChatState` (`BufferModel` per buffer), `Composer` (slash commands, Tab
+  `Completion`), `Timeline` (folding, day separators, New line), `Panes`
+  (`PaneLayout` split tree, `WorkspaceTab`), `Mentions`, `Notifier`,
+  `Preferences`, `Theme`. `Views/`: `MainView` (sidebar | panes | members,
+  fixed widths via `SplitDivider`), `PaneViews`, `BufferView` (rows,
+  composer, typing), `TabStrip`, sheets (`JoinViews`, `SearchView`,
+  `ChannelSettingsView`, `WhoisView`), `Settings/` (one file per tab).
+  Login opens the default browser and receives
   `backroom://oauth/callback` via `onOpenURL` (`BrowserLogin`), not
   `ASWebAuthenticationSession`: that delegates to the default browser, and
   Firefox fails it instantly as "cancelled". Signing: `Signing.xcconfig`
@@ -102,11 +114,24 @@ Homebrew. Install tools with mise, not brew (`mise use -g` for personal tools).
 `live::start(SessionConfig)` → `(SessionHandle, Receiver<Event>)`. A
 coordinator task owns all state; one task per connection (control +
 one per network) does I/O with backoff (1 s doubling to 60 s), keepalive PINGs,
-and stops after a rejected login (`ConnectionState::AuthFailed`). Events:
-connection state, networks, buffers, live messages, history pages, read
-markers, errors, stopped. Commands: send, join, part, load history, mark read,
-shutdown. Coordinator is tested with an injected spawner; the connection task
-with `MockConnector::concurrent`.
+and stops after a rejected login (`ConnectionState::AuthFailed`).
+
+- Events: connection state, networks, buffers, members, topics, live
+  messages, history pages, read markers, channel list chunks, own nick,
+  away, WHOIS, search results, typing, presence (MONITOR), channel modes,
+  ban lists, errors, stopped.
+- Commands: send, join (with key), part, load history, mark read, add /
+  change / remove network, raw line, close buffer, list channels, search,
+  typing, load channel settings, shutdown.
+- Routing rules worth knowing: channel buffers only come from JOINs;
+  CHATHISTORY TARGETS correspondents get a buffer only if their recent
+  history has a real PRIVMSG; notices to us go to the server buffer unless
+  a conversation exists; QUIT/NICK fan out to shared channels; errors about
+  a channel go there; CTCP requests to us are answered here (VERSION string
+  from `SessionConfig::client_version`); a quiet WHO (WHOX) after joining
+  channels of up to 500 members fills away state.
+- The coordinator is tested with an injected spawner (`Harness`); the
+  connection task with `MockConnector::concurrent`.
 
 ## Status (2026-11-14)
 
@@ -115,18 +140,22 @@ with `MockConnector::concurrent`.
   topics, network management, `offline_access` (#11).
 - Merged PR 1 (#12): join/browse/new conversation, Settings window, themes
   (Rex-style cards), fonts, message layouts, New line, plain split layout.
-- PR 2 (branch `feat/irc-coverage`): server replies/errors routed (errors to
-  their channel), QUIT/NICK/MODE/INVITE shown, notices to us in the server
-  buffer (TARGETS correspondents probed for real PRIVMSGs first), WHOIS card,
-  away (own + members via away-notify and a quiet WHOX for channels ≤ 500),
-  more caps, mIRC spans (`format_spans`), commands, Tab completion, input
-  history, mentions/highlight words/ignore list, member moderation menu,
-  clickable links and #channels; split panes (`PaneLayout` tree) and tabs
-  in the title bar (each tab a layout, shown from 2 tabs on); side panels
-  keep dragged widths; no glass on toolbar items.
-- **PR 3** (agreed): notifications, `soju.im/search`, channel settings sheet,
-  MONITOR, CTCP replies (check soju's CTCP handling first), typing/redaction.
-  No DCC. Owner wants UI polish later ("not 100% satisfied with the look").
+- Merged PR 2 (#13): server replies, QUIT/NICK/MODE/INVITE, notices to the
+  server buffer, WHOIS card, away, more caps, mIRC spans, commands, Tab
+  completion, mentions/highlights/ignore, moderation menu, split panes and
+  title-bar tabs.
+- PR 3 (branch `feat/notifications-search`): macOS notifications (mentions,
+  PMs, optionally all; click opens; Dock badge), `soju.im/search` (⌘F),
+  channel settings sheet (modes, key, limit, bans), `+typing` both ways,
+  MONITOR online dots, CTCP VERSION/PING/TIME/CLIENTINFO answered.
+- Verified soju v0.11.1 facts: SEARCH needs `in=` (max 100 results, batch
+  `soju.im/search`); soju forwards CTCP to every client and answers none
+  (two clients both answering means duplicate replies); TAGMSG reaches only
+  clients with `message-tags` and `+typing` isn't stored; MONITOR needs the
+  upstream's ISUPPORT MONITOR, lists merged across clients.
+- Notifications: permission is asked at launch; asking on the first message
+  lost it (macOS shows the request as its own notification). The Dock badge
+  needs "Badge application icon" allowed.
 - `macos` is deliberately **not** a required check yet (owner: wait until the
   app is further along; it adds ~6 min per PR).
 - Dev testing uses the e2e stack's soju with real networks (Libera,
@@ -154,16 +183,24 @@ with `MockConnector::concurrent`.
 
 ## Pick up here (2026-11-14)
 
-- PR 2 open (`feat/irc-coverage`), owner approved. Next: PR 3 on a new
-  branch from `main` once it merges.
-- Dev setup running: e2e stack up (`mise run e2e:up`), soju-oauth2 data on
-  volume `soju-oauth2-data` (survives recreation; `e2e.sh down` deletes it),
-  alice has networks ergo-test, libera (nick backroom-dev), P2P-Network
-  (nick chillin-dev).
-- Not done / ideas: production use (add `backroom://oauth/callback` to
-  production Keycloak's `backroom` client), search, multiple accounts,
-  offline start without Keycloak reachable, `macos` as a required check
-  (deferred by owner).
+- All of the owner's four asks (GUI join, Settings, themes/interface, broad
+  IRC support) are done in PRs #12–#14. #14 (PR 3) was auto-merging when
+  this was written; check `gh pr view 14`. Next: ask the owner.
+- Dev setup: e2e stack up (`mise run e2e:up`); soju-oauth2 data lives on
+  volume `soju-oauth2-data` (survives recreation; `e2e.sh down` deletes it,
+  so warn first). alice has networks libera (nick backroom-dev),
+  P2P-Network (nick chillin-dev) and ergo-test (no nick set, so IRC nick
+  `alice`, the soju username; re-added 2026-11-14).
+- Test user "bob" on ergo (ergo isn't exposed to the host; 16667 is soju):
+  `docker run --rm -i --network backroom-e2e_default python:3.13-alpine`
+  with a small socket script (stdin lines sent raw; the last one lived in
+  the session scratchpad and is gone after it). Run it in a free Rex pane.
+- Ideas not planned: UI polish (owner isn't fully happy with the look but
+  wants to come back to it later), production use (add
+  `backroom://oauth/callback` to production Keycloak's `backroom` client;
+  confirm its `offline_access` optional scope), multiple accounts, offline
+  start without Keycloak, reactions, redaction, a CTCP off switch, `macos`
+  as a required check (deferred by owner).
 
 ## Decisions
 
@@ -174,7 +211,12 @@ with `MockConnector::concurrent`.
 - Develop the app against the e2e stack (`mise run e2e:up`, Keycloak on
   `127.0.0.1:18080`).
 - Themes: built-in ids start `builtin.`; nil colours mean the system colour
-  (so Default looks native). Preferences live in UserDefaults under `prefs.`.
+  (so Default looks native). Preferences live in UserDefaults under `prefs.`;
+  tabs and pane layouts under `tabs` (JSON).
+- Owner's UI taste: Rex is the reference (theme cards, light + dark theme
+  per appearance, title-bar tabs left-aligned and only from 2 tabs); flat
+  title bar, no glass; columns message layout by default; side panels keep
+  the width they're dragged to.
 
 ## Environment constraints
 

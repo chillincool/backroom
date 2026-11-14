@@ -1,6 +1,6 @@
 //! Owns the session state and routes between the front end and connections.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -13,8 +13,9 @@ use crate::batch::Batch;
 use crate::bouncer::{NetworkUpdate, parse_network_message};
 use crate::client::Incoming;
 use crate::model::{
-    BufferKind, ChannelListing, ChatMessage, MessageKind, NetworkId, NetworkInfo, RouteContext,
-    SERVER_BUFFER, WhoisInfo, buffer_key, irc_timestamp, quit_or_nick, route, route_reply,
+    BanEntry, BufferKind, ChannelListing, ChatMessage, MessageKind, NetworkId, NetworkInfo,
+    RouteContext, SERVER_BUFFER, TypingState, WhoisInfo, buffer_key, irc_timestamp, quit_or_nick,
+    route, route_reply,
 };
 use crate::proto::Message;
 use crate::proto::message::escape_tag_value;
@@ -23,6 +24,12 @@ use crate::session::Registered;
 /// Messages fetched to check whether a correspondent from TARGETS ever
 /// sent more than notices.
 const PROBE_LIMIT: usize = 50;
+
+/// The text of a CTCP message, without the \x01 delimiters.
+fn ctcp_body(msg: &Message) -> Option<&str> {
+    let text = msg.param(1)?.strip_prefix('\u{1}')?;
+    Some(text.strip_suffix('\u{1}').unwrap_or(text))
+}
 
 /// A CTCP request other than ACTION (VERSION, PING, …): not conversation.
 fn is_ctcp_query(msg: &Message) -> bool {
@@ -43,9 +50,11 @@ pub(super) async fn run(
     mut commands: mpsc::UnboundedReceiver<Command>,
     events: mpsc::UnboundedSender<Event>,
 ) {
+    let version = config.client_version.clone();
     let spawner: Spawner = Box::new(move |id, tx| connection::spawn(id, config.clone(), tx));
     let (from_conn_tx, mut from_conn) = mpsc::unbounded_channel();
     let mut c = Coordinator::new(spawner, from_conn_tx, events);
+    c.version = version;
     loop {
         tokio::select! {
             cmd = commands.recv() => match cmd {
@@ -87,6 +96,14 @@ struct Network {
     /// Correspondents from CHATHISTORY TARGETS whose recent history we're
     /// checking for real messages (keys).
     probing: HashSet<String>,
+    /// SEARCHes sent, oldest first: (target, text). Replies come in order.
+    searches: VecDeque<(String, String)>,
+    /// ISUPPORT `MONITOR`: we can watch our correspondents come and go.
+    monitor: bool,
+    /// ISUPPORT `CLIENTTAGDENY`: client tags the network drops.
+    client_tag_deny: String,
+    /// Ban lists being collected, by channel key.
+    bans: HashMap<String, Vec<BanEntry>>,
 }
 
 impl Network {
@@ -102,7 +119,22 @@ impl Network {
             }
             "PREFIX" | "CHANMODES" => self.members.set_isupport(key, value),
             "WHOX" => self.whox = value.is_some(),
+            "MONITOR" => self.monitor = value.is_some(),
+            "CLIENTTAGDENY" => self.client_tag_deny = value.unwrap_or("").to_owned(),
             _ => {}
+        }
+    }
+
+    /// `+typing` is a client tag; some networks drop them (CLIENTTAGDENY).
+    fn typing_allowed(&self) -> bool {
+        if !self.caps.contains("message-tags") {
+            return false;
+        }
+        let deny: Vec<&str> = self.client_tag_deny.split(',').collect();
+        if deny.contains(&"*") {
+            deny.contains(&"-typing")
+        } else {
+            !deny.contains(&"typing")
         }
     }
 
@@ -120,6 +152,8 @@ pub(super) struct Coordinator {
     events: mpsc::UnboundedSender<Event>,
     control: mpsc::UnboundedSender<ToConn>,
     networks: BTreeMap<NetworkId, Network>,
+    /// Our CTCP VERSION reply.
+    version: String,
 }
 
 impl Coordinator {
@@ -135,6 +169,7 @@ impl Coordinator {
             events,
             control,
             networks: BTreeMap::new(),
+            version: "Backroom".into(),
         }
     }
 
@@ -202,6 +237,47 @@ impl Coordinator {
                 let mut params = vec![channel];
                 params.extend(key);
                 self.send_to(&network, Message::new("JOIN", params));
+            }
+            Command::Search {
+                network,
+                target,
+                text,
+            } => {
+                let Some(net) = self.networks.get_mut(&network) else {
+                    return self.error(Some(&network), "unknown network");
+                };
+                if !net.caps.contains("soju.im/search") {
+                    return self.error(Some(&network), "this server can't search history");
+                }
+                net.searches.push_back((target.clone(), text.clone()));
+                let attrs = format!(
+                    "in={};text={};limit=100",
+                    escape_tag_value(&target),
+                    escape_tag_value(&text)
+                );
+                self.send_to(&network, Message::new("SEARCH", [attrs]));
+            }
+            Command::Typing {
+                network,
+                target,
+                state,
+            } => {
+                // No error if it can't be sent: typing notifications are
+                // best effort.
+                if let Some(net) = self.networks.get(&network)
+                    && net.connected
+                    && net.typing_allowed()
+                {
+                    let msg = Message::new("TAGMSG", [target]).with_tag("+typing", state.as_str());
+                    let _ = net.conn.send(ToConn::Send(msg));
+                }
+            }
+            Command::LoadChannelSettings { network, channel } => {
+                if let Some(net) = self.networks.get_mut(&network) {
+                    net.bans.insert(buffer_key(&channel), Vec::new());
+                }
+                self.send_to(&network, Message::new("MODE", [channel.clone()]));
+                self.send_to(&network, Message::new("MODE", [channel, "b".into()]));
             }
             Command::ListChannels { network } => {
                 if let Some(net) = self.networks.get_mut(&network) {
@@ -418,6 +494,10 @@ impl Coordinator {
                                 who_pending: HashSet::new(),
                                 whois: HashMap::new(),
                                 probing: HashSet::new(),
+                                searches: VecDeque::new(),
+                                monitor: false,
+                                client_tag_deny: String::new(),
+                                bans: HashMap::new(),
                             },
                         );
                         info
@@ -446,7 +526,11 @@ impl Coordinator {
         net.who_pending.clear();
         net.whois.clear();
         net.probing.clear();
+        net.searches.clear();
+        net.bans.clear();
         net.whox = false;
+        net.monitor = false;
+        net.client_tag_deny.clear();
         for (key, value) in &reg.isupport {
             net.set_isupport(key, Some(value));
         }
@@ -472,6 +556,7 @@ impl Coordinator {
                 nick: net.nick.clone(),
             });
         }
+        self.monitor_all(id);
     }
 
     fn batch(&mut self, id: &str, batch: Batch) {
@@ -506,6 +591,27 @@ impl Coordinator {
                         let _ = net.conn.send(ToConn::Send(probe));
                     }
                 }
+            }
+            "soju.im/search" => {
+                let Some(net) = self.networks.get_mut(id) else {
+                    return;
+                };
+                let Some((target, text)) = net.searches.pop_front() else {
+                    return;
+                };
+                let ctx = net.ctx();
+                let results = batch
+                    .messages
+                    .iter()
+                    .filter_map(|m| route(m, &ctx).map(|(buffer, _, chat)| (buffer, chat)))
+                    .collect();
+                self.emit(Event::SearchResults {
+                    network: id.to_owned(),
+                    target,
+                    text,
+                    results,
+                    error: None,
+                });
             }
             "chathistory" => {
                 let Some(target) = batch.params.first() else {
@@ -627,7 +733,90 @@ impl Coordinator {
                     time,
                 });
             }
+            // FAIL SEARCH <code> [context…] :<description>
+            "FAIL" if msg.param(0) == Some("SEARCH") => {
+                let pending = self
+                    .networks
+                    .get_mut(id)
+                    .and_then(|net| net.searches.pop_front());
+                if let Some((target, text)) = pending {
+                    self.emit(Event::SearchResults {
+                        network: id.to_owned(),
+                        target,
+                        text,
+                        results: vec![],
+                        error: msg.params.last().cloned(),
+                    });
+                }
+            }
             "FAIL" => self.error(Some(id), msg.to_string()),
+            "TAGMSG" => self.tagmsg(id, msg),
+            "PRIVMSG" | "NOTICE" if ctcp_body(msg).is_some_and(|b| !b.starts_with("ACTION")) => {
+                self.ctcp(id, msg);
+            }
+            // RPL_MONONLINE / RPL_MONOFFLINE <me> :<nick[!user@host]>[,…]
+            "730" | "731" => {
+                let online = msg.command == "730";
+                for target in msg.params.last().map_or("", |s| s.as_str()).split(',') {
+                    let nick = target.split('!').next().unwrap_or(target);
+                    if !nick.is_empty() {
+                        self.emit(Event::Presence {
+                            network: id.to_owned(),
+                            nick: nick.to_owned(),
+                            online,
+                        });
+                    }
+                }
+            }
+            // RPL_MONLIST / RPL_ENDOFMONLIST: not shown.
+            "732" | "733" => {}
+            // RPL_CHANNELMODEIS <me> <channel> <modes> [args…]
+            "324" => {
+                if let (Some(channel), Some(modes)) = (msg.param(1), msg.param(2)) {
+                    self.emit(Event::ChannelModes {
+                        network: id.to_owned(),
+                        channel: channel.to_owned(),
+                        modes: modes.to_owned(),
+                        params: msg.params.iter().skip(3).cloned().collect(),
+                    });
+                }
+            }
+            // RPL_BANLIST <me> <channel> <mask> [<setter> <time>]
+            "367" => {
+                if let (Some(net), Some(channel), Some(mask)) =
+                    (self.networks.get_mut(id), msg.param(1), msg.param(2))
+                    && let Some(list) = net.bans.get_mut(&buffer_key(channel))
+                {
+                    list.push(BanEntry {
+                        mask: mask.to_owned(),
+                        set_by: msg.param(3).map(str::to_owned),
+                        set_at: msg
+                            .param(4)
+                            .and_then(|t| t.parse().ok())
+                            .and_then(|t| DateTime::from_timestamp(t, 0)),
+                    });
+                } else {
+                    self.reply(id, msg);
+                }
+            }
+            // RPL_ENDOFBANLIST: our requests become a BanList event.
+            "368" => {
+                let Some(channel) = msg.param(1) else {
+                    return;
+                };
+                let bans = self
+                    .networks
+                    .get_mut(id)
+                    .and_then(|net| net.bans.remove(&buffer_key(channel)));
+                match bans {
+                    Some(bans) => self.emit(Event::BanList {
+                        network: id.to_owned(),
+                        channel: channel.to_owned(),
+                        bans,
+                    }),
+                    None => self.reply(id, msg),
+                }
+            }
             // RPL_LIST <me> <channel> <users> :<topic>
             "322" => {
                 let (Some(net), Some(name)) = (self.networks.get_mut(id), msg.param(1)) else {
@@ -648,7 +837,7 @@ impl Coordinator {
             "321" => {}
             // Handled by the member lists, or noise after joining: names,
             // topic setter, creation time, channel modes.
-            "353" | "333" | "329" | "324" => {}
+            "353" | "333" | "329" => {}
             // RPL_ENDOFNAMES: the list is complete; learn who's away.
             "366" => {
                 if let Some(chan) = msg.param(1) {
@@ -719,6 +908,7 @@ impl Coordinator {
             }
             // RPL_ISUPPORT <me> <token>… :are supported by this server
             "005" => {
+                let had_monitor = self.networks.get(id).is_some_and(|net| net.monitor);
                 if let Some(net) = self.networks.get_mut(id) {
                     let tokens = msg
                         .params
@@ -735,6 +925,10 @@ impl Coordinator {
                         }
                     }
                 }
+                // soju passes MONITOR on once it reaches the network.
+                if !had_monitor && self.networks.get(id).is_some_and(|net| net.monitor) {
+                    self.monitor_all(id);
+                }
             }
             // Any other numeric: part of a WHOIS, or a reply to show.
             code if code.len() == 3 && code.bytes().all(|b| b.is_ascii_digit()) => {
@@ -743,6 +937,118 @@ impl Coordinator {
                 }
             }
             _ => self.live(id, msg),
+        }
+    }
+
+    /// A TAGMSG: `+typing` notifications are reported, other tags ignored.
+    fn tagmsg(&mut self, id: &str, msg: &Message) {
+        let (Some(net), Some(target), Some(nick)) =
+            (self.networks.get(id), msg.param(0), msg.source_nick())
+        else {
+            return;
+        };
+        let Some(state) = msg.tag("+typing").and_then(TypingState::parse) else {
+            return;
+        };
+        if nick.eq_ignore_ascii_case(&net.nick) {
+            return;
+        }
+        let buffer = if net.ctx().is_channel(target) {
+            target
+        } else {
+            nick
+        };
+        self.emit(Event::Typing {
+            network: id.to_owned(),
+            buffer: buffer.to_owned(),
+            nick: nick.to_owned(),
+            state,
+        });
+    }
+
+    /// CTCP other than ACTION. Requests sent to us are answered (soju
+    /// doesn't, it passes them to every client) and noted in the server
+    /// buffer; replies to ours are shown there.
+    fn ctcp(&mut self, id: &str, msg: &Message) {
+        let (Some(net), Some(body), Some(nick)) =
+            (self.networks.get(id), ctcp_body(msg), msg.source_nick())
+        else {
+            return;
+        };
+        let own = nick.eq_ignore_ascii_case(&net.nick);
+        let to_us = msg
+            .param(0)
+            .is_some_and(|t| t.eq_ignore_ascii_case(&net.nick));
+        let (command, args) = body.split_once(' ').unwrap_or((body, ""));
+        let command = command.to_ascii_uppercase();
+        let text = if msg.command == "NOTICE" {
+            if own {
+                return;
+            }
+            format!("CTCP {command} reply from {nick}: {args}")
+        } else {
+            if own || !to_us {
+                return;
+            }
+            let answer = match command.as_str() {
+                "VERSION" => Some(self.version.clone()),
+                "PING" => Some(args.to_owned()),
+                "TIME" => Some(Utc::now().to_rfc2822()),
+                "CLIENTINFO" => Some("ACTION CLIENTINFO PING TIME VERSION".to_owned()),
+                _ => None,
+            };
+            if let Some(answer) = answer {
+                let body = if answer.is_empty() {
+                    command.clone()
+                } else {
+                    format!("{command} {answer}")
+                };
+                let reply = Message::new("NOTICE", [nick.to_owned(), format!("\u{1}{body}\u{1}")]);
+                let _ = net.conn.send(ToConn::Send(reply));
+            }
+            format!("{nick} sent CTCP {command}")
+        };
+        let mut chat = ChatMessage {
+            id: msg.tag("msgid").map(str::to_owned),
+            time: msg
+                .tag("time")
+                .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+                .map(|t| t.with_timezone(&Utc))
+                .unwrap_or_else(Utc::now),
+            sender: nick.to_owned(),
+            kind: MessageKind::Reply,
+            text,
+            own: false,
+        };
+        chat.text = chat.text.trim_end().to_owned();
+        self.ensure_buffer(id, SERVER_BUFFER, BufferKind::Server);
+        self.emit(Event::Message {
+            network: id.to_owned(),
+            buffer: SERVER_BUFFER.to_owned(),
+            message: chat,
+        });
+    }
+
+    /// Watches everyone we have a private conversation with (MONITOR).
+    fn monitor_all(&mut self, id: &str) {
+        let Some(net) = self.networks.get(id) else {
+            return;
+        };
+        if !net.monitor {
+            return;
+        }
+        let ctx = net.ctx();
+        let mut nicks: Vec<String> = net
+            .buffers
+            .iter()
+            .filter(|(name, kind)| **kind == BufferKind::Query && !ctx.is_channel(name))
+            .map(|(name, _)| name.clone())
+            .collect();
+        nicks.sort();
+        // Several lines if needed: each stays well under the 512-byte limit.
+        for chunk in nicks.chunks(20) {
+            let msg = Message::new("MONITOR", ["+".to_owned(), chunk.join(",")]);
+            let _ = net.conn.send(ToConn::Send(msg));
         }
     }
 
@@ -913,7 +1219,13 @@ impl Coordinator {
         let Some(net) = self.networks.get_mut(id) else {
             return;
         };
-        if net.buffers.remove(&buffer_key(name)).is_some() {
+        let removed = net.buffers.remove(&buffer_key(name));
+        if removed == Some(BufferKind::Query) && net.monitor {
+            let _ = net
+                .conn
+                .send(ToConn::Send(Message::new("MONITOR", ["-", name])));
+        }
+        if removed.is_some() {
             self.emit(Event::BufferRemoved {
                 network: id.to_owned(),
                 name: name.to_owned(),
@@ -927,6 +1239,11 @@ impl Coordinator {
         };
         if net.buffers.insert(buffer_key(name), kind).is_some() {
             return;
+        }
+        if kind == BufferKind::Query && net.monitor {
+            let _ = net
+                .conn
+                .send(ToConn::Send(Message::new("MONITOR", ["+", name])));
         }
         if kind != BufferKind::Server && net.caps.contains("draft/read-marker") {
             // Ask for the read marker; the reply is a MARKREAD.
@@ -1668,6 +1985,233 @@ mod tests {
         h.line(Some("1"), ":bob!u@h NOTICE me :psst");
         let ev = h.events();
         assert_eq!(messages(&ev)[1].0, "bob");
+    }
+
+    fn isupport(h: &mut Harness, tokens: &str) {
+        h.line(Some("1"), &format!(":srv 005 me {tokens} :are supported"));
+    }
+
+    #[test]
+    fn search_requests_and_results() {
+        let mut h = Harness::new();
+        h.connected_network(&["soju.im/search", "batch"]);
+        h.c.command(Command::Search {
+            network: "1".into(),
+            target: "#rust".into(),
+            text: "borrow checker".into(),
+        });
+        assert_eq!(
+            h.sent(Some("1")),
+            ["SEARCH in=#rust;text=borrow\\schecker;limit=100"]
+        );
+        let batch = Batch {
+            kind: "soju.im/search".into(),
+            params: vec![],
+            tags: vec![],
+            messages: vec![
+                Message::parse("@msgid=a;time=2026-10-01T00:00:00.000Z :bob!u@h PRIVMSG #rust :the borrow checker")
+                    .unwrap(),
+            ],
+            children: vec![],
+        };
+        h.c.on_connection(Some("1".into()), FromConn::Incoming(Incoming::Batch(batch)));
+        let ev = h.events();
+        let [
+            Event::SearchResults {
+                target,
+                text,
+                results,
+                error: None,
+                ..
+            },
+        ] = &ev[..]
+        else {
+            panic!("{ev:?}")
+        };
+        assert_eq!(
+            (target.as_str(), text.as_str()),
+            ("#rust", "borrow checker")
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "#rust");
+        assert_eq!(results[0].1.id.as_deref(), Some("a"));
+
+        // A refusal answers the oldest search.
+        h.c.command(Command::Search {
+            network: "1".into(),
+            target: "bob".into(),
+            text: "x".into(),
+        });
+        h.line(
+            Some("1"),
+            ":srv FAIL SEARCH INTERNAL_ERROR :Messages could not be retrieved",
+        );
+        let ev = h.events();
+        assert!(
+            matches!(&ev[..], [Event::SearchResults { error: Some(_), .. }]),
+            "{ev:?}"
+        );
+    }
+
+    #[test]
+    fn search_needs_the_cap() {
+        let mut h = Harness::new();
+        h.connected_network(&[]);
+        h.c.command(Command::Search {
+            network: "1".into(),
+            target: "#rust".into(),
+            text: "x".into(),
+        });
+        assert!(matches!(h.events()[..], [Event::Error { .. }]));
+        assert!(h.sent(Some("1")).is_empty());
+    }
+
+    #[test]
+    fn ctcp_requests_are_answered_and_replies_shown() {
+        let mut h = Harness::new();
+        h.c.version = "Backroom 1.0".into();
+        h.connected_network(&[]);
+        h.line(Some("1"), ":bob!u@h PRIVMSG me :\u{1}VERSION\u{1}");
+        h.line(Some("1"), ":bob!u@h PRIVMSG me :\u{1}PING 12345\u{1}");
+        h.line(Some("1"), ":bob!u@h PRIVMSG #chan :\u{1}VERSION\u{1}");
+        h.line(Some("1"), ":bob!u@h PRIVMSG me :\u{1}FINGER\u{1}");
+        assert_eq!(
+            h.sent(Some("1")),
+            [
+                "NOTICE bob :\u{1}VERSION Backroom 1.0\u{1}",
+                "NOTICE bob :\u{1}PING 12345\u{1}"
+            ]
+        );
+        h.line(Some("1"), ":bob!u@h NOTICE me :\u{1}VERSION irssi 1.4\u{1}");
+        let shown: Vec<_> = messages(&h.events())
+            .into_iter()
+            .map(|m| (m.0, m.3))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("*".into(), "bob sent CTCP VERSION".into()),
+                ("*".into(), "bob sent CTCP PING".into()),
+                ("*".into(), "bob sent CTCP FINGER".into()),
+                ("*".into(), "CTCP VERSION reply from bob: irssi 1.4".into()),
+            ]
+        );
+        // ACTION stays a chat message.
+        h.line(Some("1"), ":bob!u@h PRIVMSG me :\u{1}ACTION waves\u{1}");
+        assert_eq!(messages(&h.events())[0].1, MessageKind::Action);
+    }
+
+    #[test]
+    fn typing_goes_both_ways() {
+        let mut h = Harness::new();
+        h.connected_network(&["message-tags"]);
+        let typing = |state| Command::Typing {
+            network: "1".into(),
+            target: "#rust".into(),
+            state,
+        };
+        h.c.command(typing(TypingState::Active));
+        assert_eq!(h.sent(Some("1")), ["@+typing=active TAGMSG #rust"]);
+        // Networks that deny client tags don't get them.
+        isupport(&mut h, "CLIENTTAGDENY=*");
+        h.c.command(typing(TypingState::Done));
+        assert!(h.sent(Some("1")).is_empty());
+        isupport(&mut h, "CLIENTTAGDENY=*,-typing");
+        h.c.command(typing(TypingState::Paused));
+        assert_eq!(h.sent(Some("1")), ["@+typing=paused TAGMSG #rust"]);
+
+        h.line(Some("1"), "@+typing=active :bob!u@h TAGMSG #rust");
+        h.line(Some("1"), "@+typing=done :bob!u@h TAGMSG me");
+        h.line(Some("1"), "@+typing=active :me!u@h TAGMSG #rust");
+        assert_eq!(
+            h.events(),
+            [
+                Event::Typing {
+                    network: "1".into(),
+                    buffer: "#rust".into(),
+                    nick: "bob".into(),
+                    state: TypingState::Active
+                },
+                Event::Typing {
+                    network: "1".into(),
+                    buffer: "bob".into(),
+                    nick: "bob".into(),
+                    state: TypingState::Done
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn monitor_watches_private_conversations() {
+        let mut h = Harness::new();
+        h.connected_network(&[]);
+        h.line(Some("1"), ":alice!u@h PRIVMSG me :hi");
+        h.sent(Some("1"));
+        // soju passes MONITOR on once it reaches the network.
+        isupport(&mut h, "MONITOR=100");
+        assert_eq!(h.sent(Some("1")), ["MONITOR + alice"]);
+        h.line(Some("1"), ":bob!u@h PRIVMSG me :yo");
+        assert_eq!(h.sent(Some("1")), ["MONITOR + bob"]);
+        h.events();
+        h.line(Some("1"), ":srv 730 me :alice!u@h,bob!u@h");
+        h.line(Some("1"), ":srv 731 me :alice");
+        let presence: Vec<_> = h
+            .events()
+            .into_iter()
+            .map(|e| match e {
+                Event::Presence { nick, online, .. } => (nick, online),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            presence,
+            [
+                ("alice".into(), true),
+                ("bob".into(), true),
+                ("alice".into(), false)
+            ]
+        );
+        h.c.command(Command::CloseBuffer {
+            network: "1".into(),
+            name: "bob".into(),
+        });
+        assert_eq!(h.sent(Some("1")), ["MONITOR - bob"]);
+    }
+
+    #[test]
+    fn channel_settings_load_modes_and_bans() {
+        let mut h = Harness::new();
+        h.connected_network(&[]);
+        h.c.command(Command::LoadChannelSettings {
+            network: "1".into(),
+            channel: "#c".into(),
+        });
+        assert_eq!(h.sent(Some("1")), ["MODE #c", "MODE #c b"]);
+        h.line(Some("1"), ":srv 324 me #c +ntkl secret 20");
+        h.line(Some("1"), ":srv 367 me #c *!*@spam.example op 1700000000");
+        h.line(Some("1"), ":srv 367 me #c troll!*@*");
+        h.line(Some("1"), ":srv 368 me #c :End of channel ban list");
+        let ev = h.events();
+        assert_eq!(
+            ev[0],
+            Event::ChannelModes {
+                network: "1".into(),
+                channel: "#c".into(),
+                modes: "+ntkl".into(),
+                params: vec!["secret".into(), "20".into()],
+            }
+        );
+        let Event::BanList { bans, .. } = &ev[1] else {
+            panic!("{ev:?}")
+        };
+        assert_eq!(bans.len(), 2);
+        assert_eq!(bans[0].set_by.as_deref(), Some("op"));
+        assert_eq!(bans[0].set_at.map(|t| t.timestamp()), Some(1_700_000_000));
+        assert_eq!(bans[1].set_by, None);
+        // A ban list nobody asked for (a /mode #c b typed by hand) is shown.
+        h.line(Some("1"), ":srv 367 me #c x!*@*");
+        assert_eq!(messages(&h.events()).len(), 1);
     }
 
     #[test]

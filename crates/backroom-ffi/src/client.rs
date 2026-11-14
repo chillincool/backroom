@@ -27,6 +27,8 @@ pub struct ClientConfig {
     pub redirect_uri: String,
     /// Nick to register with; soju replaces it with each network's nick.
     pub nick: String,
+    /// Our answer to CTCP VERSION, e.g. "Backroom 0.1.0 (macOS)".
+    pub client_version: String,
 }
 
 struct Running {
@@ -149,11 +151,12 @@ impl BackroomClient {
                 }
             })?;
         let credentials = OidcCredentials::new(self.oidc().await?, self.store.clone());
-        let config = SessionConfig::new(
+        let mut config = SessionConfig::new(
             Arc::from(connector),
             Arc::new(credentials),
             self.config.nick.clone(),
         );
+        config.client_version = self.config.client_version.clone();
         let (handle, events) = self.runtime.spawn(async { live::start(config) }).await?;
         let running = Running {
             handle,
@@ -207,6 +210,43 @@ impl BackroomClient {
             channel,
             key,
         })
+    }
+
+    /// Searches a buffer's history on soju; answered by `SearchResults`.
+    pub fn search(
+        &self,
+        network: String,
+        target: String,
+        text: String,
+    ) -> Result<(), BackroomError> {
+        self.command(Command::Search {
+            network,
+            target,
+            text,
+        })
+    }
+
+    /// Tells the others in a conversation whether we're typing.
+    pub fn set_typing(
+        &self,
+        network: String,
+        target: String,
+        state: crate::types::TypingState,
+    ) -> Result<(), BackroomError> {
+        self.command(Command::Typing {
+            network,
+            target,
+            state: state.into(),
+        })
+    }
+
+    /// Asks for a channel's modes and ban list (`ChannelModes`, `BanList`).
+    pub fn load_channel_settings(
+        &self,
+        network: String,
+        channel: String,
+    ) -> Result<(), BackroomError> {
+        self.command(Command::LoadChannelSettings { network, channel })
     }
 
     /// Asks for the network's channel list; it arrives as `ChannelList`
@@ -326,6 +366,7 @@ mod tests {
             scopes: vec!["soju_roles".into()],
             redirect_uri: "backroom://oauth/callback".into(),
             nick: "dave".into(),
+            client_version: "Backroom test".into(),
         }
     }
 

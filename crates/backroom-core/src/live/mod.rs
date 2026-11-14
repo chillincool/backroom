@@ -28,7 +28,8 @@ use tokio::sync::mpsc;
 
 use crate::auth::CredentialProvider;
 use crate::model::{
-    BufferKind, ChannelListing, ChatMessage, Member, NetworkId, NetworkInfo, WhoisInfo,
+    BanEntry, BufferKind, ChannelListing, ChatMessage, Member, NetworkId, NetworkInfo, TypingState,
+    WhoisInfo,
 };
 use crate::transport::Connector;
 
@@ -42,6 +43,8 @@ pub struct SessionConfig {
     /// Send a PING after this long without traffic; give up on the
     /// connection after twice as long.
     pub keepalive: Duration,
+    /// Our answer to CTCP VERSION, e.g. "Backroom 0.1 (macOS)".
+    pub client_version: String,
 }
 
 impl SessionConfig {
@@ -56,6 +59,7 @@ impl SessionConfig {
             nick: nick.into(),
             backoff: Backoff::default(),
             keepalive: Duration::from_secs(60),
+            client_version: "Backroom".into(),
         }
     }
 }
@@ -160,6 +164,42 @@ pub enum Event {
         channels: Vec<ChannelListing>,
         done: bool,
     },
+    /// Messages matching a [`Command::Search`], oldest first, with the buffer
+    /// each belongs to; `error` if the server refused.
+    SearchResults {
+        network: NetworkId,
+        target: String,
+        text: String,
+        results: Vec<(String, ChatMessage)>,
+        error: Option<String>,
+    },
+    /// Someone's typing state in a buffer.
+    Typing {
+        network: NetworkId,
+        buffer: String,
+        nick: String,
+        state: TypingState,
+    },
+    /// Whether someone we have a private conversation with is online
+    /// (MONITOR, where the network supports it).
+    Presence {
+        network: NetworkId,
+        nick: String,
+        online: bool,
+    },
+    /// A channel's modes (`RPL_CHANNELMODEIS`): `+ntk` and their arguments.
+    ChannelModes {
+        network: NetworkId,
+        channel: String,
+        modes: String,
+        params: Vec<String>,
+    },
+    /// A channel's ban list, after [`Command::LoadChannelSettings`].
+    BanList {
+        network: NetworkId,
+        channel: String,
+        bans: Vec<BanEntry>,
+    },
     /// Our nick on a network: after registering and whenever it changes.
     OwnNick {
         network: NetworkId,
@@ -231,6 +271,25 @@ pub enum Command {
     /// [`Event::ChannelList`] chunks.
     ListChannels {
         network: NetworkId,
+    },
+    /// Searches a buffer's history on soju (`soju.im/search`). Answered with
+    /// [`Event::SearchResults`].
+    Search {
+        network: NetworkId,
+        target: String,
+        text: String,
+    },
+    /// Tells the others in a conversation that we're typing.
+    Typing {
+        network: NetworkId,
+        target: String,
+        state: TypingState,
+    },
+    /// Asks for a channel's modes and ban list ([`Event::ChannelModes`],
+    /// [`Event::BanList`]).
+    LoadChannelSettings {
+        network: NetworkId,
+        channel: String,
     },
     /// Sends a raw IRC line on a network, e.g. `WHOIS alice`.
     SendRaw {

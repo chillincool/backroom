@@ -1,17 +1,19 @@
 import AppKit
 import BackroomCore
 import SwiftUI
+import UserNotifications
 
 @main
 struct BackroomApp: App {
     private static let login = BrowserLogin()
+    private static let notifier = Notifier()
     @State private var prefs: Preferences
     @State private var model: AppModel
 
     init() {
         let prefs = Preferences()
         _prefs = State(initialValue: prefs)
-        _model = State(initialValue: AppModel(
+        let model = AppModel(
             settings: ServerSettings.load(),
             authenticator: Self.login,
             preferences: prefs,
@@ -20,7 +22,20 @@ struct BackroomApp: App {
                     config: settings.clientConfig,
                     secretStore: KeychainSecretStore(
                         service: "net.chillincool.backroom", account: settings.keychainAccount))
-            }))
+            })
+        _model = State(initialValue: model)
+        // Under XCTest there's no session, and no notifications.
+        if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil {
+            let notifier = Self.notifier
+            UNUserNotificationCenter.current().delegate = notifier
+            notifier.open = { [weak model] id in model?.reveal(id) }
+            if prefs.notifications { Task { await notifier.requestPermission() } }
+            model.notify = { [weak prefs] buffer, message in
+                notifier.post(
+                    message, in: buffer, network: model.networkName(buffer.id.network),
+                    sound: prefs?.notificationSound ?? true)
+            }
+        }
     }
 
     var body: some Scene {
@@ -72,6 +87,9 @@ struct ChatCommands: Commands {
                 .disabled(network == nil)
             Button("Browse Channels…") { network.map { model.sheet = .browseChannels(network: $0) } }
                 .keyboardShortcut("j", modifiers: [.command, .shift])
+                .disabled(network == nil)
+            Button("Search…") { network.map { model.sheet = .search(network: $0) } }
+                .keyboardShortcut("f")
                 .disabled(network == nil)
             Divider()
             Button("New Tab") { model.newTab() }

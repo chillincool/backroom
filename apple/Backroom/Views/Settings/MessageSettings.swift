@@ -36,6 +36,7 @@ struct MessageSettings: View {
                 Picker("Nick colours", selection: $prefs.nickColoring) {
                     ForEach(NickColoring.allCases) { Text($0.title).tag($0) }
                 }
+                Toggle("Let others see when I'm typing", isOn: $prefs.sendTyping)
                 Toggle("mIRC colours and formatting", isOn: $prefs.showFormatting)
                     .help("Bold, italics and colours people put in their messages. Off shows plain text.")
             }

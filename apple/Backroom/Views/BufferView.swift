@@ -14,11 +14,18 @@ struct BufferView: View {
     @State private var completion: Completion?
     /// Position in the buffer's sent lines while stepping with ↑/↓.
     @State private var historyIndex: Int?
+    /// When we last told the others we're typing, and the timer that says
+    /// we paused.
+    @State private var typingSent: Date?
+    @State private var typingPause: Task<Void, Never>?
+    /// A message shown from search, highlighted for a moment.
+    @State private var flashed: String?
 
     var body: some View {
         let buffer = model.buffers[id]
         let style = ChatStyle(prefs: prefs, theme: theme)
         VStack(spacing: 0) {
+            ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     HistoryHeader(buffer: buffer) { model.loadOlder(id) }
@@ -30,6 +37,7 @@ struct BufferView: View {
                             switch item {
                             case .message(let message, let continued):
                                 MessageRow(message: message, continued: continued, buffer: buffer, style: style)
+                                    .background(flashed == message.stableID ? theme.accentColor.opacity(0.3) : .clear)
                             case .presence(let run):
                                 PresenceRow(run: run, style: style)
                             case .day(let date):
@@ -45,6 +53,13 @@ struct BufferView: View {
             }
             .defaultScrollAnchor(.bottom)
             .background(theme.backgroundColor)
+            .overlay(alignment: .bottomLeading) {
+                if let buffer { TypingIndicator(buffer: buffer) }
+            }
+            // A message picked in search: scroll to it once it's loaded.
+            .onChange(of: buffer?.messages.count, initial: true) { scrollToTarget(buffer, proxy) }
+            .onChange(of: buffer?.scrollTarget) { scrollToTarget(buffer, proxy) }
+            }
 
             Divider()
             TextField(placeholder(buffer), text: $draft, axis: .vertical)
@@ -64,7 +79,9 @@ struct BufferView: View {
                 .onKeyPress(.downArrow) { stepHistory(buffer, back: false) ? .handled : .ignored }
                 .onChange(of: draft) { _, new in
                     if let completion, new != completion.result { self.completion = nil }
+                    typing(new)
                 }
+                .onDisappear { stopTyping() }
         }
         // #channel links (in messages and the topic) join the channel.
         .environment(\.openURL, OpenURLAction { url in
@@ -79,6 +96,51 @@ struct BufferView: View {
         }
         .onChange(of: composerFocused) { _, focused in
             if focused { model.focus(pane) }
+        }
+    }
+
+    private func scrollToTarget(_ buffer: BufferModel?, _ proxy: ScrollViewProxy) {
+        guard let buffer, let target = buffer.scrollTarget,
+            buffer.messages.contains(where: { $0.stableID == target })
+        else { return }
+        buffer.scrollTarget = nil
+        Task {
+            // Let the list lay the new rows out first.
+            try? await Task.sleep(for: .milliseconds(100))
+            withAnimation { proxy.scrollTo(target, anchor: .center) }
+            flashed = target
+            try? await Task.sleep(for: .seconds(2))
+            withAnimation { if flashed == target { flashed = nil } }
+        }
+    }
+
+    /// Typing notifications: active at most every 3 s while typing, paused
+    /// after 6 s without a keystroke, done when the line is cleared or sent.
+    private func typing(_ text: String) {
+        guard prefs.sendTyping, model.buffers[id]?.kind != .server else { return }
+        if text.isEmpty || text.hasPrefix("/") {
+            stopTyping()
+            return
+        }
+        if typingSent.map({ Date.now.timeIntervalSince($0) >= 3 }) ?? true {
+            model.setTyping(id, .active)
+            typingSent = .now
+        }
+        typingPause?.cancel()
+        typingPause = Task {
+            try? await Task.sleep(for: .seconds(6))
+            guard !Task.isCancelled else { return }
+            model.setTyping(id, .paused)
+            typingSent = nil
+        }
+    }
+
+    private func stopTyping() {
+        typingPause?.cancel()
+        typingPause = nil
+        if typingSent != nil {
+            model.setTyping(id, .done)
+            typingSent = nil
         }
     }
 
@@ -138,6 +200,37 @@ struct BufferView: View {
     private func placeholder(_ buffer: BufferModel?) -> String {
         guard let buffer else { return "" }
         return buffer.kind == .server ? "Commands, e.g. /join #channel" : "Message \(buffer.name)"
+    }
+}
+
+/// "alice is typing…" at the foot of the message list.
+struct TypingIndicator: View {
+    @Environment(\.theme) private var theme
+    let buffer: BufferModel
+
+    var body: some View {
+        // Re-checked every second so notifications expire.
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+            let nicks = buffer.typingNow(at: context.date)
+            if !nicks.isEmpty {
+                Text(Self.text(nicks))
+                    .font(.caption)
+                    .foregroundStyle(theme.mutedColor)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 2)
+                    .background(theme.backgroundColor.opacity(0.9), in: Capsule())
+                    .padding(.leading, 12)
+                    .padding(.bottom, 2)
+            }
+        }
+    }
+
+    static func text(_ nicks: [String]) -> String {
+        switch nicks.count {
+        case 1: "\(nicks[0]) is typing…"
+        case 2: "\(nicks[0]) and \(nicks[1]) are typing…"
+        default: "\(nicks.count) people are typing…"
+        }
     }
 }
 

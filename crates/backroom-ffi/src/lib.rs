@@ -14,8 +14,8 @@ pub use client::{BackroomClient, ClientConfig};
 pub use error::BackroomError;
 pub use store::SecretStore;
 pub use types::{
-    BufferKind, ChannelListing, ChatMessage, ConnectionState, FormattedSpan, Member, MessageKind,
-    Network, SessionEvent, WhoisInfo,
+    BanEntry, BufferKind, ChannelListing, ChatMessage, ConnectionState, FormattedSpan, Member,
+    MessageKind, Network, SearchHit, SessionEvent, TypingState, WhoisInfo,
 };
 
 uniffi::setup_scaffolding!();

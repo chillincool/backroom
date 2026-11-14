@@ -193,6 +193,12 @@ struct NetworkGroup: View {
                     BufferRow(buffer: buffer)
                         .tag(id)
                         .contextMenu {
+                            if buffer.kind == .channel {
+                                Button("Channel Settings…") {
+                                    model.openChannelSettings(network: id.network, channel: buffer.name)
+                                }
+                                Divider()
+                            }
                             Button("Open in Split Right") { model.split(.horizontal, showing: id) }
                             Button("Open in Split Down") { model.split(.vertical, showing: id) }
                             Divider()
@@ -282,6 +288,16 @@ struct BufferRow: View {
         HStack {
             Image(systemName: buffer.kind == .channel ? "number" : "person")
                 .foregroundStyle(theme.mutedColor)
+                .overlay(alignment: .bottomTrailing) {
+                    // Online (green) or offline (grey), where MONITOR tells us.
+                    if buffer.kind == .query, let online = buffer.online {
+                        Circle()
+                            .fill(online ? Color.green : Color.gray)
+                            .frame(width: 6, height: 6)
+                            .offset(x: 2, y: 1)
+                            .help(online ? "\(buffer.name) is online" : "\(buffer.name) is offline")
+                    }
+                }
             Text(buffer.name)
                 .fontWeight(unread > 0 ? .semibold : .regular)
                 .lineLimit(1)
