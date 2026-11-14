@@ -121,6 +121,41 @@ pub struct WhoisInfo {
     pub other: Vec<String>,
 }
 
+/// Someone's typing state in a conversation (`+typing` client tag).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypingState {
+    Active,
+    Paused,
+    Done,
+}
+
+impl TypingState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TypingState::Active => "active",
+            TypingState::Paused => "paused",
+            TypingState::Done => "done",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "active" => Some(TypingState::Active),
+            "paused" => Some(TypingState::Paused),
+            "done" => Some(TypingState::Done),
+            _ => None,
+        }
+    }
+}
+
+/// An entry of a channel's ban list (`RPL_BANLIST`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BanEntry {
+    pub mask: String,
+    pub set_by: Option<String>,
+    pub set_at: Option<DateTime<Utc>>,
+}
+
 /// One channel from a `LIST` reply (`RPL_LIST`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelListing {

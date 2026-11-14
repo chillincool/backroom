@@ -117,6 +117,58 @@ impl From<model::Member> for Member {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, uniffi::Enum)]
+pub enum TypingState {
+    Active,
+    Paused,
+    Done,
+}
+
+impl From<model::TypingState> for TypingState {
+    fn from(s: model::TypingState) -> Self {
+        match s {
+            model::TypingState::Active => TypingState::Active,
+            model::TypingState::Paused => TypingState::Paused,
+            model::TypingState::Done => TypingState::Done,
+        }
+    }
+}
+
+impl From<TypingState> for model::TypingState {
+    fn from(s: TypingState) -> Self {
+        match s {
+            TypingState::Active => model::TypingState::Active,
+            TypingState::Paused => model::TypingState::Paused,
+            TypingState::Done => model::TypingState::Done,
+        }
+    }
+}
+
+/// A message found by a search, and the buffer it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SearchHit {
+    pub buffer: String,
+    pub message: ChatMessage,
+}
+
+/// An entry of a channel's ban list.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, uniffi::Record)]
+pub struct BanEntry {
+    pub mask: String,
+    pub set_by: Option<String>,
+    pub set_at: Option<SystemTime>,
+}
+
+impl From<model::BanEntry> for BanEntry {
+    fn from(b: model::BanEntry) -> Self {
+        BanEntry {
+            mask: b.mask,
+            set_by: b.set_by,
+            set_at: b.set_at.map(Into::into),
+        }
+    }
+}
+
 /// What a WHOIS found out about someone.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct WhoisInfo {
@@ -322,6 +374,40 @@ pub enum SessionEvent {
         channels: Vec<ChannelListing>,
         done: bool,
     },
+    /// Messages matching a search, oldest first; `error` if it failed.
+    SearchResults {
+        network: String,
+        target: String,
+        text: String,
+        results: Vec<SearchHit>,
+        error: Option<String>,
+    },
+    /// Someone's typing state in a buffer.
+    Typing {
+        network: String,
+        buffer: String,
+        nick: String,
+        state: TypingState,
+    },
+    /// Whether someone we talk with privately is online (MONITOR).
+    Presence {
+        network: String,
+        nick: String,
+        online: bool,
+    },
+    /// A channel's modes, e.g. `+ntk` with arguments `["key"]`.
+    ChannelModes {
+        network: String,
+        channel: String,
+        modes: String,
+        params: Vec<String>,
+    },
+    /// A channel's ban list.
+    BanList {
+        network: String,
+        channel: String,
+        bans: Vec<BanEntry>,
+    },
     /// Our nick on a network, after registering and on every change.
     OwnNick {
         network: String,
@@ -421,6 +507,65 @@ impl From<live::Event> for SessionEvent {
                 network,
                 channels: channels.into_iter().map(Into::into).collect(),
                 done,
+            },
+            E::SearchResults {
+                network,
+                target,
+                text,
+                results,
+                error,
+            } => SessionEvent::SearchResults {
+                network,
+                target,
+                text,
+                results: results
+                    .into_iter()
+                    .map(|(buffer, message)| SearchHit {
+                        buffer,
+                        message: message.into(),
+                    })
+                    .collect(),
+                error,
+            },
+            E::Typing {
+                network,
+                buffer,
+                nick,
+                state,
+            } => SessionEvent::Typing {
+                network,
+                buffer,
+                nick,
+                state: state.into(),
+            },
+            E::Presence {
+                network,
+                nick,
+                online,
+            } => SessionEvent::Presence {
+                network,
+                nick,
+                online,
+            },
+            E::ChannelModes {
+                network,
+                channel,
+                modes,
+                params,
+            } => SessionEvent::ChannelModes {
+                network,
+                channel,
+                modes,
+                params,
+            },
+            E::BanList {
+                network,
+                channel,
+                bans,
+            } => SessionEvent::BanList {
+                network,
+                channel,
+                bans: bans.into_iter().map(Into::into).collect(),
             },
             E::OwnNick { network, nick } => SessionEvent::OwnNick { network, nick },
             E::Away { network, away } => SessionEvent::Away { network, away },
