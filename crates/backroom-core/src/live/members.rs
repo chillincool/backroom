@@ -1,10 +1,14 @@
 //! Channel membership: built from NAMES replies, then kept current through
-//! JOIN, PART, KICK, QUIT, NICK and MODE.
+//! JOIN, PART, KICK, QUIT, NICK and MODE; away state from `away-notify`
+//! and WHO replies.
 
 use std::collections::{BTreeMap, HashMap};
 
 use crate::model::{Member, buffer_key};
 use crate::proto::Message;
+
+/// Token in our WHOX requests, so their replies can be told apart.
+pub(super) const WHO_TOKEN: &str = "273";
 
 /// Membership prefixes from ISUPPORT `PREFIX`, highest rank first.
 #[derive(Debug, Clone)]
@@ -132,6 +136,7 @@ impl Members {
                             Member {
                                 nick: nick.to_owned(),
                                 prefix: prefix.to_owned(),
+                                away: false,
                             },
                         );
                     }
@@ -165,6 +170,7 @@ impl Members {
                     Member {
                         nick: source.to_owned(),
                         prefix: String::new(),
+                        away: false,
                     },
                 );
                 if own { vec![] } else { self.complete(chan) }
@@ -209,6 +215,35 @@ impl Members {
                 }
                 changed
             }
+            // away-notify: AWAY :<message> (away) or AWAY (back)
+            "AWAY" => {
+                let away = msg.param(0).is_some_and(|m| !m.is_empty());
+                self.set_away_everywhere(source, away)
+            }
+            // RPL_WHOREPLY <me> <channel> <user> <host> <server> <nick> <flags> :<hops> <realname>
+            "352" => {
+                if let (Some(chan), Some(nick), Some(flags)) =
+                    (msg.param(1), msg.param(5), msg.param(6))
+                {
+                    self.set_away(chan, nick, flags.starts_with('G'));
+                }
+                vec![]
+            }
+            // RPL_WHOSPCRPL for our `WHO <channel> %tcnf,<WHO_TOKEN>`:
+            // <me> <token> <channel> <nick> <flags>
+            "354" if msg.param(1) == Some(WHO_TOKEN) => {
+                if let (Some(chan), Some(nick), Some(flags)) =
+                    (msg.param(2), msg.param(3), msg.param(4))
+                {
+                    self.set_away(chan, nick, flags.starts_with('G'));
+                }
+                vec![]
+            }
+            // RPL_ENDOFWHO <me> <mask> :End of WHO list
+            "315" => msg
+                .param(1)
+                .map(|chan| self.complete(chan))
+                .unwrap_or_default(),
             // MODE <channel> <modes> [args…]
             "MODE" => {
                 let (Some(chan), Some(modes)) = (msg.param(0), msg.param(1)) else {
@@ -273,6 +308,52 @@ impl Members {
                 .then_with(|| buffer_key(&a.nick).cmp(&buffer_key(&b.nick)))
         });
         members
+    }
+
+    /// Channels (as the server spells them) that `nick` is in.
+    pub(super) fn channels_of(&self, nick: &str) -> Vec<String> {
+        let key = buffer_key(nick);
+        let mut names: Vec<String> = self
+            .channels
+            .values()
+            .filter(|ch| ch.members.contains_key(&key))
+            .map(|ch| ch.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// How many members `channel` has.
+    pub(super) fn count(&self, channel: &str) -> usize {
+        self.channels
+            .get(&buffer_key(channel))
+            .map_or(0, |ch| ch.members.len())
+    }
+
+    fn set_away(&mut self, chan: &str, nick: &str, away: bool) {
+        if let Some(member) = self
+            .channels
+            .get_mut(&buffer_key(chan))
+            .and_then(|ch| ch.members.get_mut(&buffer_key(nick)))
+        {
+            member.away = away;
+        }
+    }
+
+    fn set_away_everywhere(&mut self, nick: &str, away: bool) -> Vec<String> {
+        let key = buffer_key(nick);
+        let mut changed = vec![];
+        for ch in self.channels.values_mut() {
+            if let Some(member) = ch.members.get_mut(&key)
+                && member.away != away
+            {
+                member.away = away;
+                if !ch.collecting {
+                    changed.push(ch.name.clone());
+                }
+            }
+        }
+        changed
     }
 
     fn channel_mut(&mut self, name: &str) -> &mut Channel {
@@ -424,6 +505,33 @@ mod tests {
         apply(&mut m, ":srv 353 me = #x :+v !y @o me");
         apply(&mut m, ":srv 366 me #x :End");
         assert_eq!(nicks(&m, "#x"), ["!y", "@o", "+v", "me"]);
+    }
+
+    #[test]
+    fn away_from_away_notify_and_who() {
+        let mut m = members();
+        apply(&mut m, ":me!u@h JOIN #c");
+        apply(&mut m, ":srv 353 me = #c :alice bob me");
+        apply(&mut m, ":srv 366 me #c :End");
+        assert_eq!(apply(&mut m, ":alice!u@h AWAY :lunch"), ["#c"]);
+        assert!(m.list("#c").iter().any(|x| x.nick == "alice" && x.away));
+        assert!(
+            apply(&mut m, ":alice!u@h AWAY :still lunch").is_empty(),
+            "no change"
+        );
+        assert_eq!(apply(&mut m, ":alice!u@h AWAY"), ["#c"]);
+
+        assert!(apply(&mut m, ":srv 354 me 273 #c bob G").is_empty());
+        assert!(apply(&mut m, ":srv 352 me #c u h srv alice H :0 Alice").is_empty());
+        assert_eq!(apply(&mut m, ":srv 315 me #c :End of WHO"), ["#c"]);
+        let away: Vec<_> = m
+            .list("#c")
+            .into_iter()
+            .filter(|x| x.away)
+            .map(|x| x.nick)
+            .collect();
+        assert_eq!(away, ["bob"]);
+        assert_eq!(m.channels_of("BOB"), ["#c"]);
     }
 
     #[test]

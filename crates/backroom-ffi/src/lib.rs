@@ -14,11 +14,20 @@ pub use client::{BackroomClient, ClientConfig};
 pub use error::BackroomError;
 pub use store::SecretStore;
 pub use types::{
-    BufferKind, ChannelListing, ChatMessage, ConnectionState, Member, MessageKind, Network,
-    SessionEvent,
+    BufferKind, ChannelListing, ChatMessage, ConnectionState, FormattedSpan, Member, MessageKind,
+    Network, SessionEvent, WhoisInfo,
 };
 
 uniffi::setup_scaffolding!();
+
+/// Splits message text into runs of one mIRC style (bold, colours, …).
+#[uniffi::export]
+pub fn format_spans(text: String) -> Vec<FormattedSpan> {
+    backroom_core::proto::formatting::parse_formatting(&text)
+        .into_iter()
+        .map(Into::into)
+        .collect()
+}
 
 /// Removes mIRC formatting codes (bold, colours, …) from message text.
 #[uniffi::export]

@@ -37,6 +37,19 @@ pub enum MessageKind {
     Part,
     Kick,
     Topic,
+    /// Someone disconnected; the text is their reason.
+    Quit,
+    /// Nick change: `sender` is the old nick, the text the new one.
+    Nick,
+    /// Channel modes and their arguments, e.g. `+o alice`.
+    Mode,
+    /// In the server buffer: we were invited, the text is the channel. In a
+    /// channel: the text is who was invited.
+    Invite,
+    /// A server reply, as text.
+    Reply,
+    /// An error reply, as text.
+    Error,
 }
 
 impl From<model::MessageKind> for MessageKind {
@@ -49,6 +62,12 @@ impl From<model::MessageKind> for MessageKind {
             model::MessageKind::Part => MessageKind::Part,
             model::MessageKind::Kick => MessageKind::Kick,
             model::MessageKind::Topic => MessageKind::Topic,
+            model::MessageKind::Quit => MessageKind::Quit,
+            model::MessageKind::Nick => MessageKind::Nick,
+            model::MessageKind::Mode => MessageKind::Mode,
+            model::MessageKind::Invite => MessageKind::Invite,
+            model::MessageKind::Reply => MessageKind::Reply,
+            model::MessageKind::Error => MessageKind::Error,
         }
     }
 }
@@ -84,6 +103,8 @@ pub struct Member {
     pub nick: String,
     /// Membership prefixes, highest first (`@`, `+`, `@+`, …); empty if none.
     pub prefix: String,
+    /// Marked away; false if unknown.
+    pub away: bool,
 }
 
 impl From<model::Member> for Member {
@@ -91,6 +112,81 @@ impl From<model::Member> for Member {
         Member {
             nick: m.nick,
             prefix: m.prefix,
+            away: m.away,
+        }
+    }
+}
+
+/// What a WHOIS found out about someone.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct WhoisInfo {
+    pub nick: String,
+    pub user: Option<String>,
+    pub host: Option<String>,
+    pub realname: Option<String>,
+    pub server: Option<String>,
+    pub server_info: Option<String>,
+    pub account: Option<String>,
+    /// Channels, with membership prefixes (`@#ops`).
+    pub channels: Vec<String>,
+    pub idle: Option<Duration>,
+    pub signon: Option<SystemTime>,
+    /// Away message, if away.
+    pub away: Option<String>,
+    pub operator: bool,
+    pub secure: bool,
+    pub other: Vec<String>,
+}
+
+impl From<model::WhoisInfo> for WhoisInfo {
+    fn from(w: model::WhoisInfo) -> Self {
+        WhoisInfo {
+            nick: w.nick,
+            user: w.user,
+            host: w.host,
+            realname: w.realname,
+            server: w.server,
+            server_info: w.server_info,
+            account: w.account,
+            channels: w.channels,
+            idle: w.idle_secs.map(Duration::from_secs),
+            signon: w.signon.map(Into::into),
+            away: w.away,
+            operator: w.operator,
+            secure: w.secure,
+            other: w.other,
+        }
+    }
+}
+
+/// A run of message text in one mIRC style. Colours are `0xRRGGBB`.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FormattedSpan {
+    pub text: String,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub strikethrough: bool,
+    pub monospace: bool,
+    /// Swap foreground and background.
+    pub reverse: bool,
+    pub fg: Option<u32>,
+    pub bg: Option<u32>,
+}
+
+impl From<backroom_core::proto::formatting::Span> for FormattedSpan {
+    fn from(s: backroom_core::proto::formatting::Span) -> Self {
+        let st = s.style;
+        FormattedSpan {
+            text: s.text,
+            bold: st.bold,
+            italic: st.italic,
+            underline: st.underline,
+            strikethrough: st.strikethrough,
+            monospace: st.monospace,
+            reverse: st.reverse,
+            fg: st.fg,
+            bg: st.bg,
         }
     }
 }
@@ -226,6 +322,21 @@ pub enum SessionEvent {
         channels: Vec<ChannelListing>,
         done: bool,
     },
+    /// Our nick on a network, after registering and on every change.
+    OwnNick {
+        network: String,
+        nick: String,
+    },
+    /// Whether we're marked away on a network.
+    Away {
+        network: String,
+        away: bool,
+    },
+    /// A complete WHOIS reply.
+    Whois {
+        network: String,
+        info: WhoisInfo,
+    },
     /// Something failed that the user may want to see.
     Error {
         network: Option<String>,
@@ -310,6 +421,12 @@ impl From<live::Event> for SessionEvent {
                 network,
                 channels: channels.into_iter().map(Into::into).collect(),
                 done,
+            },
+            E::OwnNick { network, nick } => SessionEvent::OwnNick { network, nick },
+            E::Away { network, away } => SessionEvent::Away { network, away },
+            E::Whois { network, info } => SessionEvent::Whois {
+                network,
+                info: info.into(),
             },
             E::Error { network, message } => SessionEvent::Error { network, message },
             E::Stopped => SessionEvent::Stopped,

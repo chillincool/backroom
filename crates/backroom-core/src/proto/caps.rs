@@ -6,7 +6,8 @@ use std::collections::BTreeMap;
 ///
 /// Names verified against soju v0.11.1 (`downstream.go`). Some are passthrough
 /// caps that soju only offers when the bound upstream network supports them
-/// (`message-tags`, `labeled-response`, `away-notify`, `account-tag`).
+/// (`message-tags`, `labeled-response`, `away-notify`, `account-tag`,
+/// `account-notify`, `chghost`, `extended-join`, `multi-prefix`).
 pub const WANTED_CAPS: &[&str] = &[
     "sasl",
     "batch",
@@ -16,7 +17,13 @@ pub const WANTED_CAPS: &[&str] = &[
     "echo-message",
     "away-notify",
     "account-tag",
+    "account-notify",
     "cap-notify",
+    "chghost",
+    "extended-join",
+    "invite-notify",
+    "multi-prefix",
+    "setname",
     "draft/chathistory",
     "draft/read-marker",
     "soju.im/bouncer-networks",
