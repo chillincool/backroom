@@ -1,8 +1,8 @@
 import Foundation
 import Security
 
-/// Keeps the login tokens (an opaque value serialized by the Rust core) in
-/// one generic-password Keychain item. Never log the value.
+/// Keeps one login's secret (the soju password, or OIDC tokens serialized by
+/// the Rust core) in one generic-password Keychain item. Never log the value.
 public final class KeychainSecretStore: SecretStore, @unchecked Sendable {
     // Immutable after init; Keychain calls are thread-safe.
     private let service: String

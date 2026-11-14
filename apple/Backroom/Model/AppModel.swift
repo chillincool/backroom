@@ -22,7 +22,13 @@ final class AppModel {
     }
 
     private(set) var phase: Phase = .loggedOut
-    private(set) var settings: ServerSettings
+    /// The saved servers; the session uses `settings`, the selected one.
+    private(set) var servers: ServerList
+    /// The server in use; blank when none is saved.
+    var settings: ServerSettings { servers.current ?? .blank }
+    /// Set by the login screen ("Add Server…", "Edit Server…"): Settings →
+    /// Account opens this server in its editor and clears it.
+    var serverToEdit: ServerSettings?
     /// The control connection's state.
     private(set) var control: ConnectionState?
     private(set) var networks: [NetworkState] = []
@@ -139,10 +145,10 @@ final class AppModel {
         }
     }
 
-    init(settings: ServerSettings, authenticator: any WebAuthenticator,
+    init(servers: ServerList, authenticator: any WebAuthenticator,
          defaults: UserDefaults = .standard, preferences: Preferences? = nil,
          makeClient: @escaping ClientFactory) {
-        self.settings = settings
+        self.servers = servers
         self.defaults = defaults
         self.preferences = preferences ?? Preferences(defaults: defaults)
         let saved: (tabs: [WorkspaceTab], current: UUID)? = defaults.data(forKey: Self.tabsKey)
@@ -169,14 +175,18 @@ final class AppModel {
 
     // MARK: Lifecycle
 
-    /// Creates the client for the current settings and connects if a login
-    /// is saved.
-    func start() async {
+    /// Creates the client for the current settings and, with `connect`,
+    /// connects if a login is saved.
+    func start(connect autoConnect: Bool = true) async {
         stopSession()
+        guard settings.isComplete else {
+            phase = .loggedOut
+            return
+        }
         do {
             let client = try makeClient(settings)
             self.client = client
-            if try client.hasLogin() {
+            if autoConnect, try client.hasLogin() {
                 await connect()
             } else {
                 phase = .loggedOut
@@ -186,6 +196,53 @@ final class AppModel {
         }
     }
 
+    /// Switches to another saved server and connects if it has a login.
+    func select(server id: UUID) async {
+        guard id != servers.current?.id, servers.servers.contains(where: { $0.id == id }) else { return }
+        servers.selected = id
+        servers.save(to: defaults)
+        await start()
+    }
+
+    /// Adds a server or saves changes to one. Changing the server in use
+    /// starts over with it; the first one saved becomes the one in use.
+    func save(server: ServerSettings) async {
+        let before = servers.current
+        servers.save(server)
+        servers.save(to: defaults)
+        if servers.current?.connectsLike(before) != true { await start() }
+    }
+
+    /// Forgets a server and its stored login.
+    func remove(server id: UUID) async {
+        guard let server = servers.servers.first(where: { $0.id == id }) else { return }
+        let inUse = id == servers.current?.id
+        if inUse { stopSession() }
+        if server.isComplete {
+            do { try makeClient(server).logout() } catch { notice = Self.describe(error) }
+        }
+        servers.remove(id)
+        servers.save(to: defaults)
+        if inUse { await start() }
+    }
+
+    /// Saves the password of a password account and connects; soju checks
+    /// it, and a wrong one comes back as `authFailed`.
+    func logIn(password: String) async {
+        guard let client, phase != .loggingIn, !password.isEmpty else { return }
+        do {
+            try client.loginWithPassword(password: password)
+        } catch {
+            if case .failed = phase {} else { phase = .loggedOut }
+            notice = "Login failed: \(Self.describe(error))"
+            return
+        }
+        notice = nil
+        await connect()
+    }
+
+    /// Single sign-on: opens the login page in the browser and connects
+    /// once it redirects back.
     func logIn() async {
         guard let client, phase != .loggingIn else { return }
         phase = .loggingIn
@@ -213,13 +270,6 @@ final class AppModel {
         eventTask = nil
         resetChat()
         phase = .loggedOut
-    }
-
-    /// Saves new settings and starts over with them.
-    func apply(settings new: ServerSettings) async {
-        settings = new
-        new.save()
-        await start()
     }
 
     private func connect() async {
@@ -269,7 +319,7 @@ final class AppModel {
                 client?.disconnect()
                 resetChat()
                 phase = .loggedOut
-                notice = "Your login was rejected (\(reason)). Log in again."
+                notice = Self.loginRejected(reason, login: settings.login)
             }
         case .connection(let id?, let state):
             if let i = networkIndex(id) { networks[i].connection = state }
@@ -836,6 +886,22 @@ final class AppModel {
     private enum LoginError: Error, CustomStringConvertible {
         case badURL
         var description: String { "the server returned an invalid login URL" }
+    }
+
+    /// What to say when soju turns the login down.
+    static func loginRejected(_ reason: String, login: ServerSettings.Login) -> String {
+        // From the core when soju doesn't offer our SASL mechanism.
+        if reason.contains("doesn't accept OAUTHBEARER") {
+            return "This server doesn't support single sign-on. Check the server address, or log in with a username and password."
+        }
+        if reason.contains("doesn't accept PLAIN") {
+            return "This server doesn't accept passwords; log in with single sign-on."
+        }
+        switch login {
+        // soju's 904 text is generic ("Authentication failed").
+        case .password: return "Wrong username or password."
+        case .singleSignOn: return "Your login was rejected (\(reason)). Log in again."
+        }
     }
 
     static func describe(_ error: Error) -> String {

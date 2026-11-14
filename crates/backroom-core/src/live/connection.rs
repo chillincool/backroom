@@ -90,6 +90,21 @@ async fn run(
                 }));
                 return;
             }
+            // Wrong kind of login for this server (e.g. single sign-on
+            // against a soju with its own accounts): retrying can't help.
+            Err(ClientError::Registration(RegistrationError::SaslUnavailable {
+                wanted,
+                offered,
+            })) => {
+                let offered = match offered {
+                    Some(o) if !o.is_empty() => format!("it offers {o}"),
+                    _ => "it offers no SASL login".into(),
+                };
+                emit(FromConn::State(ConnectionState::AuthFailed {
+                    reason: format!("the server doesn't accept {wanted} logins ({offered})"),
+                }));
+                return;
+            }
             Err(ClientError::Auth(e)) => {
                 emit(FromConn::State(ConnectionState::AuthFailed {
                     reason: e.to_string(),
@@ -325,6 +340,26 @@ mod tests {
         assert_eq!(seen[0], "Connecting");
         assert!(seen[1].contains("Invalid credentials"), "{seen:?}");
         // The task has ended: no further states, even after a long wait.
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unsupported_login_method_stops_reconnecting() {
+        let mock = MockConnector::new(vec![
+            expect("USER"),
+            server(":soju CAP * LS :sasl=OAUTHBEARER batch"),
+        ]);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let _conn = spawn(None, config(Arc::new(mock)), tx);
+        let seen = collect(&mut rx, |e| {
+            matches!(e, FromConn::State(ConnectionState::AuthFailed { .. }))
+        })
+        .await;
+        assert!(
+            seen[1].contains("doesn't accept PLAIN logins (it offers OAUTHBEARER)"),
+            "{seen:?}"
+        );
         tokio::time::sleep(Duration::from_secs(600)).await;
         assert!(rx.try_recv().is_err());
     }

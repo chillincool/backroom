@@ -3,10 +3,13 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::SystemTime;
 
 use backroom_core::auth::{
-    OidcClient, OidcConfig, OidcCredentials, PendingAuthorization, TokenStore,
+    CredentialProvider, OidcClient, OidcConfig, OidcCredentials, PendingAuthorization,
+    StaticCredentials, TokenStore,
 };
 use backroom_core::live::{self, Command, Event, SessionConfig, SessionHandle};
+use backroom_core::sasl::SaslCredentials;
 use backroom_core::transport::{TlsOptions, connector_for_url};
+use secrecy::SecretString;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -17,18 +20,31 @@ use crate::{BackroomError, SessionEvent};
 pub struct ClientConfig {
     /// soju's URL: `wss://`, `ws://`, `ircs://` or `irc+insecure://`.
     pub server_url: String,
-    /// OIDC issuer (the Keycloak realm URL).
-    pub issuer: String,
-    pub client_id: String,
-    /// Scopes besides `openid`, e.g. `soju_roles`.
-    pub scopes: Vec<String>,
-    /// Where the login page sends the browser back to, e.g.
-    /// `backroom://oauth/callback`. Must be registered on the client.
-    pub redirect_uri: String,
+    pub login: LoginMethod,
     /// Nick to register with; soju replaces it with each network's nick.
     pub nick: String,
     /// Our answer to CTCP VERSION, e.g. "Backroom 0.1.0 (macOS)".
     pub client_version: String,
+}
+
+/// How the account logs in to soju.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum LoginMethod {
+    /// soju's `auth oauth2`: a browser login (`begin_login`,
+    /// `complete_login`), then SASL OAUTHBEARER with the access token.
+    Oidc {
+        /// OIDC issuer (the Keycloak realm URL).
+        issuer: String,
+        client_id: String,
+        /// Scopes besides `openid`, e.g. `soju_roles`.
+        scopes: Vec<String>,
+        /// Where the login page sends the browser back to, e.g.
+        /// `backroom://oauth/callback`. Must be registered on the client.
+        redirect_uri: String,
+    },
+    /// soju's own accounts (`auth internal`, also `auth http`): SASL PLAIN
+    /// with a password saved by `login_with_password`.
+    Password { username: String },
 }
 
 struct Running {
@@ -42,7 +58,14 @@ struct Running {
 pub struct BackroomClient {
     runtime: Runtime,
     config: ClientConfig,
+    /// OIDC tokens, in the secret store.
     store: Arc<dyn TokenStore>,
+    /// The same secret store, holding the password for
+    /// [`LoginMethod::Password`].
+    secret: Arc<dyn SecretStore>,
+    /// The password after the first read (each Keychain read can prompt).
+    /// `None`: not read yet. `Some(None)`: read, nothing stored.
+    password: Mutex<Option<Option<SecretString>>>,
     /// Filled by the first discovery, then reused.
     oidc: tokio::sync::Mutex<Option<OidcClient>>,
     pending: Mutex<Option<PendingAuthorization>>,
@@ -55,18 +78,62 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl BackroomClient {
     async fn oidc(&self) -> Result<OidcClient, BackroomError> {
+        let LoginMethod::Oidc {
+            issuer,
+            client_id,
+            scopes,
+            ..
+        } = &self.config.login
+        else {
+            return Err(uses_password());
+        };
         let mut cached = self.oidc.lock().await;
         if let Some(client) = cached.as_ref() {
             return Ok(client.clone());
         }
         let config = OidcConfig {
-            issuer: self.config.issuer.clone(),
-            client_id: self.config.client_id.clone(),
-            scopes: self.config.scopes.clone(),
+            issuer: issuer.clone(),
+            client_id: client_id.clone(),
+            scopes: scopes.clone(),
         };
         let client = self.runtime.spawn(OidcClient::discover(config)).await??;
         *cached = Some(client.clone());
         Ok(client)
+    }
+
+    fn stored_password(&self) -> Result<Option<SecretString>, BackroomError> {
+        let mut cache = lock(&self.password);
+        if let Some(cached) = cache.as_ref() {
+            return Ok(cached.clone());
+        }
+        let password = self.secret.load()?.map(SecretString::from);
+        *cache = Some(password.clone());
+        Ok(password)
+    }
+
+    /// The credentials for `connect`, or `NotLoggedIn`.
+    async fn credentials(&self) -> Result<Arc<dyn CredentialProvider>, BackroomError> {
+        let not_logged_in = || BackroomError::NotLoggedIn {
+            message: "no stored login".into(),
+        };
+        match &self.config.login {
+            LoginMethod::Oidc { .. } => {
+                if self.store.load()?.is_none() {
+                    return Err(not_logged_in());
+                }
+                Ok(Arc::new(OidcCredentials::new(
+                    self.oidc().await?,
+                    self.store.clone(),
+                )))
+            }
+            LoginMethod::Password { username } => {
+                let password = self.stored_password()?.ok_or_else(not_logged_in)?;
+                Ok(Arc::new(StaticCredentials(SaslCredentials::Plain {
+                    username: username.clone(),
+                    password,
+                })))
+            }
+        }
     }
 
     fn command(&self, command: Command) -> Result<(), BackroomError> {
@@ -101,22 +168,47 @@ impl BackroomClient {
         Ok(Arc::new(BackroomClient {
             runtime,
             config,
-            store: Arc::new(ForeignTokenStore::new(secret_store)),
+            store: Arc::new(ForeignTokenStore::new(secret_store.clone())),
+            secret: secret_store,
+            password: Mutex::new(None),
             oidc: tokio::sync::Mutex::new(None),
             pending: Mutex::new(None),
             session: Mutex::new(None),
         }))
     }
 
-    /// True if tokens are stored, so `connect` can be tried without a login.
+    /// True if a login (tokens or password) is stored, so `connect` can be
+    /// tried without logging in.
     pub fn has_login(&self) -> Result<bool, BackroomError> {
-        Ok(self.store.load()?.is_some())
+        Ok(match self.config.login {
+            LoginMethod::Oidc { .. } => self.store.load()?.is_some(),
+            LoginMethod::Password { .. } => self.stored_password()?.is_some(),
+        })
     }
 
-    /// Starts a login and returns the URL to open in the login sheet. Pass
-    /// the URL it redirects to to `complete_login`.
+    /// Saves the password for a [`LoginMethod::Password`] account. soju
+    /// checks it on `connect`; a wrong one ends in `AuthFailed`.
+    pub fn login_with_password(&self, password: String) -> Result<(), BackroomError> {
+        if !matches!(self.config.login, LoginMethod::Password { .. }) {
+            return Err(BackroomError::Config {
+                message: "this account logs in with single sign-on".into(),
+            });
+        }
+        let password = SecretString::from(password);
+        let mut cache = lock(&self.password);
+        self.secret
+            .save(secrecy::ExposeSecret::expose_secret(&password).to_owned())?;
+        *cache = Some(Some(password));
+        Ok(())
+    }
+
+    /// Starts a single sign-on login and returns the URL to open in the
+    /// browser. Pass the URL it redirects to to `complete_login`.
     pub async fn begin_login(&self) -> Result<String, BackroomError> {
-        let pending = self.oidc().await?.begin(&self.config.redirect_uri)?;
+        let LoginMethod::Oidc { redirect_uri, .. } = &self.config.login else {
+            return Err(uses_password());
+        };
+        let pending = self.oidc().await?.begin(redirect_uri)?;
         let url = pending.auth_url.to_string();
         *lock(&self.pending) = Some(pending);
         Ok(url)
@@ -139,23 +231,15 @@ impl BackroomClient {
     /// Starts (or restarts) the session with the stored login. Progress and
     /// failures, including a rejected login, arrive through `next_event`.
     pub async fn connect(&self) -> Result<(), BackroomError> {
-        if self.store.load()?.is_none() {
-            return Err(BackroomError::NotLoggedIn {
-                message: "no stored login".into(),
-            });
-        }
+        let credentials = self.credentials().await?;
         let connector =
             connector_for_url(&self.config.server_url, TlsOptions::default()).map_err(|e| {
                 BackroomError::Config {
                     message: e.to_string(),
                 }
             })?;
-        let credentials = OidcCredentials::new(self.oidc().await?, self.store.clone());
-        let mut config = SessionConfig::new(
-            Arc::from(connector),
-            Arc::new(credentials),
-            self.config.nick.clone(),
-        );
+        let mut config =
+            SessionConfig::new(Arc::from(connector), credentials, self.config.nick.clone());
         config.client_version = self.config.client_version.clone();
         let (handle, events) = self.runtime.spawn(async { live::start(config) }).await?;
         let running = Running {
@@ -347,8 +431,16 @@ impl BackroomClient {
     pub fn logout(&self) -> Result<(), BackroomError> {
         self.disconnect();
         lock(&self.pending).take();
+        let mut password = lock(&self.password);
         self.store.clear()?;
+        *password = Some(None);
         Ok(())
+    }
+}
+
+fn uses_password() -> BackroomError {
+    BackroomError::Config {
+        message: "this account logs in with a password".into(),
     }
 }
 
@@ -361,10 +453,12 @@ mod tests {
     fn config(server_url: &str) -> ClientConfig {
         ClientConfig {
             server_url: server_url.into(),
-            issuer: "http://127.0.0.1:1/realms/none".into(),
-            client_id: "backroom".into(),
-            scopes: vec!["soju_roles".into()],
-            redirect_uri: "backroom://oauth/callback".into(),
+            login: LoginMethod::Oidc {
+                issuer: "http://127.0.0.1:1/realms/none".into(),
+                client_id: "backroom".into(),
+                scopes: vec!["soju_roles".into()],
+                redirect_uri: "backroom://oauth/callback".into(),
+            },
             nick: "dave".into(),
             client_version: "Backroom test".into(),
         }
@@ -423,6 +517,52 @@ mod tests {
             BackroomClient::new(config("ws://127.0.0.1:1/socket"), memory.clone()).unwrap();
         client.logout().unwrap();
         assert!(memory.0.lock().unwrap().is_none());
+    }
+
+    fn password_client(memory: Arc<MemoryStore>) -> Arc<BackroomClient> {
+        let mut config = config("ws://127.0.0.1:1/socket");
+        config.login = LoginMethod::Password {
+            username: "dave".into(),
+        };
+        BackroomClient::new(config, memory).unwrap()
+    }
+
+    #[test]
+    fn password_login_is_saved_and_connects() {
+        let memory = Arc::new(MemoryStore::default());
+        let client = password_client(memory.clone());
+        assert!(!client.has_login().unwrap());
+        let err = block_on_elsewhere(client.connect()).unwrap_err();
+        assert!(matches!(err, BackroomError::NotLoggedIn { .. }), "{err:?}");
+
+        client.login_with_password("dave-secret".into()).unwrap();
+        assert_eq!(memory.0.lock().unwrap().as_deref(), Some("dave-secret"));
+        assert!(client.has_login().unwrap());
+        // Nothing listens on port 1: the session starts and keeps retrying.
+        block_on_elsewhere(client.connect()).unwrap();
+        client.logout().unwrap();
+        assert!(memory.0.lock().unwrap().is_none());
+        assert!(!client.has_login().unwrap());
+    }
+
+    #[test]
+    fn stored_password_is_found_on_the_next_launch() {
+        let memory = Arc::new(MemoryStore(Mutex::new(Some("dave-secret".into()))));
+        let client = password_client(memory);
+        assert!(client.has_login().unwrap());
+        block_on_elsewhere(client.connect()).unwrap();
+        client.disconnect();
+    }
+
+    #[test]
+    fn methods_of_the_other_login_are_refused() {
+        let password = password_client(Arc::new(MemoryStore::default()));
+        let err = block_on_elsewhere(password.begin_login()).unwrap_err();
+        assert!(matches!(err, BackroomError::Config { .. }), "{err:?}");
+
+        let sso = client();
+        let err = sso.login_with_password("x".into()).unwrap_err();
+        assert!(matches!(err, BackroomError::Config { .. }), "{err:?}");
     }
 
     /// Polls a future on a separate runtime, the way Swift's executor polls
