@@ -45,6 +45,9 @@ struct ServerSettings: Codable, Equatable, Sendable {
     /// doesn't log you out.
     static let scopes = ["soju_roles", "offline_access"]
 
+    /// A new install: the login screen asks for the rest.
+    static let blank = ServerSettings(serverURL: "", login: .password, nick: "")
+
     /// The local e2e stack (`mise run e2e:up`), log in as alice / alice.
     static let e2e = ServerSettings(
         serverURL: "ws://127.0.0.1:18081/", login: .singleSignOn,
@@ -70,7 +73,7 @@ struct ServerSettings: Codable, Equatable, Sendable {
             .oidc(issuer: issuer, clientId: Self.clientID, scopes: Self.scopes, redirectUri: Self.redirectURI)
         }
         // soju gives each network its own nick; this is only the default.
-        let nick = nick.isEmpty && login == .password ? username : nick
+        let nick = !nick.isEmpty ? nick : !username.isEmpty ? username : "backroom"
         return ClientConfig(serverUrl: serverURL, login: method, nick: nick, clientVersion: Self.clientVersion)
     }
 
@@ -95,11 +98,11 @@ struct ServerSettings: Codable, Equatable, Sendable {
     static func load(from defaults: UserDefaults = .standard) -> ServerSettings {
         guard let data = defaults.data(forKey: key),
             let settings = try? JSONDecoder().decode(ServerSettings.self, from: data)
-        else { return .e2e }
+        else { return .blank }
         return settings
     }
 
-    func save(to defaults: UserDefaults = .standard) {
+    func save(to defaults: UserDefaults) {
         if let data = try? JSONEncoder().encode(self) {
             defaults.set(data, forKey: Self.key)
         }

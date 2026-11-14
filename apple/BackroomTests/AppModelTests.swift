@@ -124,11 +124,50 @@ let net = Network(id: "1", name: "libera", upstreamState: "connected", attribute
         #expect(model.phase == .online)
     }
 
+    @Test func newInstallStartsAtTheLoginScreen() async {
+        var made = 0
+        let defaults = UserDefaults(suiteName: "backroom-tests-\(UUID().uuidString)")!
+        let model = AppModel(settings: .blank, authenticator: FakeAuthenticator(), defaults: defaults,
+                             makeClient: { _ in made += 1; return FakeClient() })
+        await model.start()
+        #expect(model.phase == .loggedOut)
+        #expect(made == 0)
+    }
+
+    @Test func loginScreenSavesSettingsThenLogsIn() async {
+        let client = FakeClient()
+        let defaults = UserDefaults(suiteName: "backroom-tests-\(UUID().uuidString)")!
+        var configs: [ServerSettings] = []
+        let model = AppModel(settings: .blank, authenticator: FakeAuthenticator(), defaults: defaults,
+                             makeClient: { configs.append($0); return client })
+        await model.start()
+        await model.logIn(.e2ePassword, password: "dave-secret")
+        #expect(configs == [.e2ePassword])
+        #expect(client.calls == ["password 11 chars", "connect"])
+        #expect(model.phase == .online)
+        #expect(ServerSettings.load(from: defaults) == .e2ePassword)
+
+        // Same settings again (after a wrong password): no new client.
+        await model.logIn(.e2ePassword, password: "again")
+        #expect(configs.count == 1)
+    }
+
+    @Test func loginScreenSingleSignOn() async {
+        let client = FakeClient()
+        let defaults = UserDefaults(suiteName: "backroom-tests-\(UUID().uuidString)")!
+        let model = AppModel(settings: .blank, authenticator: FakeAuthenticator(), defaults: defaults,
+                             makeClient: { _ in client })
+        await model.start()
+        await model.logIn(.e2e)
+        #expect(client.calls.last == "connect")
+        #expect(model.settings == .e2e)
+    }
+
     @Test func rejectedPasswordLogsOut() async {
         let (model, _) = await makeModel(settings: .e2ePassword)
         model.apply(.connection(network: nil, state: .authFailed(reason: "invalid credentials")))
         #expect(model.phase == .loggedOut)
-        #expect(model.notice?.contains("password") == true)
+        #expect(model.notice == "Wrong username or password.")
     }
 
     @Test func passwordSettings() throws {
@@ -144,6 +183,8 @@ let net = Network(id: "1", name: "libera", upstreamState: "connected", attribute
         #expect(noNick.clientConfig.nick == "dave")
         noNick.username = ""
         #expect(!noNick.isComplete)
+        #expect(noNick.clientConfig.nick == "backroom")
+        #expect(!ServerSettings.blank.isComplete)
     }
 
     @Test func settingsSavedBeforePasswordsAreSingleSignOn() throws {

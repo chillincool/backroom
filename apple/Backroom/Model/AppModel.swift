@@ -169,14 +169,18 @@ final class AppModel {
 
     // MARK: Lifecycle
 
-    /// Creates the client for the current settings and connects if a login
-    /// is saved.
-    func start() async {
+    /// Creates the client for the current settings and, with `connect`,
+    /// connects if a login is saved.
+    func start(connect autoConnect: Bool = true) async {
         stopSession()
+        guard settings.isComplete else {
+            phase = .loggedOut
+            return
+        }
         do {
             let client = try makeClient(settings)
             self.client = client
-            if try client.hasLogin() {
+            if autoConnect, try client.hasLogin() {
                 await connect()
             } else {
                 phase = .loggedOut
@@ -186,6 +190,28 @@ final class AppModel {
         }
     }
 
+    /// Switches to `new` without connecting, ready to log in.
+    private func use(_ new: ServerSettings) async {
+        guard new != settings || client == nil else { return }
+        settings = new
+        new.save(to: defaults)
+        await start(connect: false)
+    }
+
+    /// The login screen: saves `new` and logs in with a password.
+    func logIn(_ new: ServerSettings, password: String) async {
+        guard phase != .loggingIn, new.login == .password, new.isComplete, !password.isEmpty else { return }
+        await use(new)
+        await logIn(password: password)
+    }
+
+    /// The login screen: saves `new` and logs in with single sign-on.
+    func logIn(_ new: ServerSettings) async {
+        guard phase != .loggingIn, new.login == .singleSignOn, new.isComplete else { return }
+        await use(new)
+        await logIn()
+    }
+
     /// Saves the password of a password account and connects; soju checks
     /// it, and a wrong one comes back as `authFailed`.
     func logIn(password: String) async {
@@ -193,9 +219,11 @@ final class AppModel {
         do {
             try client.loginWithPassword(password: password)
         } catch {
+            if case .failed = phase {} else { phase = .loggedOut }
             notice = "Login failed: \(Self.describe(error))"
             return
         }
+        notice = nil
         await connect()
     }
 
@@ -233,7 +261,7 @@ final class AppModel {
     /// Saves new settings and starts over with them.
     func apply(settings new: ServerSettings) async {
         settings = new
-        new.save()
+        new.save(to: defaults)
         await start()
     }
 
@@ -284,8 +312,9 @@ final class AppModel {
                 client?.disconnect()
                 resetChat()
                 phase = .loggedOut
+                // soju's 904 text is generic ("Authentication failed").
                 notice = settings.login == .password
-                    ? "soju rejected the password (\(reason)). Check it and log in again."
+                    ? "Wrong username or password."
                     : "Your login was rejected (\(reason)). Log in again."
             }
         case .connection(let id?, let state):
