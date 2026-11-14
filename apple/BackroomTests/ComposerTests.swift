@@ -50,9 +50,48 @@ import Testing
         #expect(Composer.parse("/quote PRIVMSG x :y", buffer: "#b") == .raw("PRIVMSG x :y"))
     }
 
-    @Test func otherCommandsGoToTheServer() {
+    @Test func ircCommands() {
         #expect(Composer.parse("/whois alice", buffer: "#b") == .raw("WHOIS alice"))
         #expect(Composer.parse("/nick newme", buffer: "#b") == .raw("NICK newme"))
-        #expect(Composer.parse("/away", buffer: "#b") == .raw("AWAY"))
+        #expect(Composer.parse("/away", buffer: "#b") == .raw("AWAY :Away"))
+        #expect(Composer.parse("/away lunch", buffer: "#b") == .raw("AWAY :lunch"))
+        #expect(Composer.parse("/back", buffer: "#b") == .raw("AWAY"))
+        #expect(Composer.parse("/invite bob", buffer: "#b") == .raw("INVITE bob #b"))
+        #expect(Composer.parse("/invite bob #x", buffer: "bob") == .raw("INVITE bob #x"))
+        #expect(Composer.parse("/notice bob psst", buffer: "#b") == .raw("NOTICE bob :psst"))
+        #expect(Composer.parse("/ctcp bob version", buffer: "#b") == .raw("PRIVMSG bob :\u{1}VERSION\u{1}"))
+        #expect(Composer.parse("/motd", buffer: "*") == .raw("MOTD"))
+        #expect(Composer.parse("/list", buffer: "*") == .listChannels)
+        #expect(Composer.parse("/ignore spam", buffer: "*") == .ignore("spam"))
+    }
+
+    @Test func channelModeration() {
+        #expect(Composer.parse("/kick bob", buffer: "#b") == .raw("KICK #b bob"))
+        #expect(Composer.parse("/kick bob be nice", buffer: "#b") == .raw("KICK #b bob :be nice"))
+        #expect(Composer.parse("/ban bob", buffer: "#b") == .raw("MODE #b +b bob!*@*"))
+        #expect(Composer.parse("/unban *!*@spam.example", buffer: "#b") == .raw("MODE #b -b *!*@spam.example"))
+        #expect(Composer.parse("/op alice bob", buffer: "#b") == .raw("MODE #b +oo alice bob"))
+        #expect(Composer.parse("/devoice carol", buffer: "#b") == .raw("MODE #b -v carol"))
+        #expect(Composer.parse("/mode +m", buffer: "#b") == .raw("MODE #b +m"))
+        #expect(Composer.parse("/mode me +i", buffer: "#b") == .raw("MODE me +i"))
+        #expect(Composer.parse("/cycle", buffer: "#b") == .cycle(channel: "#b"))
+        // Channel commands outside a channel.
+        #expect(Composer.parse("/kick bob", buffer: "bob") == .invalid("/kick works in a channel."))
+        #expect(Composer.parse("/part", buffer: "*") == .invalid("/part works in a channel."))
+    }
+
+    @Test func tabCompletesAndCycles() {
+        let nicks = ["alice", "Albert", "bob"]
+        var c = Completion.start("al", nicks: nicks, channels: [])
+        #expect(c?.line == "alice: ")
+        c?.next()
+        #expect(c?.line == "Albert: ")
+        c?.next()
+        #expect(c?.line == "alice: ")
+        #expect(Completion.start("hi b", nicks: nicks, channels: [])?.line == "hi bob ")
+        #expect(Completion.start("see #ru", nicks: nicks, channels: ["#rust"])?.line == "see #rust ")
+        #expect(Completion.start("/wh", nicks: nicks, channels: [])?.line == "/whois ")
+        #expect(Completion.start("zz", nicks: nicks, channels: []) == nil)
+        #expect(Completion.start("hi ", nicks: nicks, channels: []) == nil)
     }
 }

@@ -41,12 +41,14 @@ final class AppModel {
         case joinChannel(network: String)
         case browseChannels(network: String)
         case newConversation(network: String)
+        case whois(network: String, info: WhoisInfo)
 
         var id: String {
             switch self {
             case .joinChannel(let n): "join-\(n)"
             case .browseChannels(let n): "browse-\(n)"
             case .newConversation(let n): "query-\(n)"
+            case .whois(let n, let info): "whois-\(n)-\(info.nick)"
             }
         }
     }
@@ -65,6 +67,8 @@ final class AppModel {
     /// A channel the user just /joined; selected once it exists.
     @ObservationIgnored private var pendingSelection: BufferID?
     @ObservationIgnored private let defaults: UserDefaults
+    /// Highlight words and the ignore list come from here.
+    @ObservationIgnored let preferences: Preferences
     private static let lastBufferKey = "lastBuffer"
 
     @ObservationIgnored private var client: (any BackroomClientProtocol)?
@@ -82,9 +86,11 @@ final class AppModel {
     }
 
     init(settings: ServerSettings, authenticator: any WebAuthenticator,
-         defaults: UserDefaults = .standard, makeClient: @escaping ClientFactory) {
+         defaults: UserDefaults = .standard, preferences: Preferences? = nil,
+         makeClient: @escaping ClientFactory) {
         self.settings = settings
         self.defaults = defaults
+        self.preferences = preferences ?? Preferences(defaults: defaults)
         self.authenticator = authenticator
         self.makeClient = makeClient
     }
@@ -251,6 +257,15 @@ final class AppModel {
             guard channelLists[network] != nil else { return }
             channelLists[network]?.channels.append(contentsOf: channels)
             if done { channelLists[network]?.loading = false }
+        case .ownNick(let network, let nick):
+            if let i = networkIndex(network) {
+                networks[i].nick = nick
+                refreshMentions(network: network)
+            }
+        case .away(let network, let away):
+            if let i = networkIndex(network) { networks[i].away = away }
+        case .whois(let network, let info):
+            sheet = .whois(network: network, info: info)
         case .error(_, let message):
             notice = message
         case .stopped:
@@ -263,7 +278,9 @@ final class AppModel {
         let id = BufferID(network: network, name: name)
         if buffers[id] == nil {
             let kind = kind ?? Self.guessKind(name)
-            buffers[id] = BufferModel(id: id, name: name, kind: kind)
+            let buffer = BufferModel(id: id, name: name, kind: kind)
+            buffer.mentions = mentionMatcher(network: network)
+            buffers[id] = buffer
             if let i = networkIndex(network) {
                 // The server buffer goes first.
                 if kind == .server {
@@ -325,6 +342,46 @@ final class AppModel {
         select(id)
     }
 
+    // MARK: Mentions and ignores
+
+    private func mentionMatcher(network: String) -> MentionMatcher {
+        MentionMatcher(
+            nick: networkIndex(network).flatMap { networks[$0].nick },
+            words: preferences.highlightWords, ignored: preferences.ignored)
+    }
+
+    /// Rebuilds mention matching after our nick, the highlight words or the
+    /// ignore list changed (`network` nil: everywhere).
+    func refreshMentions(network: String? = nil) {
+        for (id, buffer) in buffers where network == nil || id.network == network {
+            let matcher = mentionMatcher(network: id.network)
+            if buffer.mentions != matcher { buffer.mentions = matcher }
+        }
+    }
+
+    // MARK: IRC actions
+
+    /// Sends a raw line on a network.
+    @discardableResult
+    func sendRaw(network: String, _ line: String) -> Bool {
+        guard let client else { return false }
+        return run { try client.sendRaw(network: network, line: line) }
+    }
+
+    func setAway(network: String, away: Bool) {
+        sendRaw(network: network, away ? "AWAY :Away" : "AWAY")
+    }
+
+    /// Our nick on a network, once known.
+    func ownNick(network: String) -> String? {
+        networkIndex(network).flatMap { networks[$0].nick }
+    }
+
+    /// Our membership prefix in a channel ("" if none, nil if unknown).
+    func ownPrefix(in buffer: BufferModel) -> String? {
+        ownNick(network: buffer.id.network).flatMap { buffer.prefixByNick[$0.lowercased()] }
+    }
+
     /// The network menu commands act on: the selected buffer's, else the first.
     var currentNetwork: String? { selection?.network ?? networks.first?.id }
 
@@ -379,7 +436,7 @@ final class AppModel {
     /// Asks for the page before the oldest loaded message.
     func loadOlder(_ id: BufferID) {
         guard let buffer = buffers[id], let client, !buffer.historyLoading,
-            !buffer.historyExhausted, let oldest = buffer.messages.first
+            !buffer.historyExhausted, !buffer.cleared, let oldest = buffer.messages.first
         else { return }
         buffers[id]?.historyLoading = true
         run {
@@ -420,6 +477,34 @@ final class AppModel {
             return run { try client.sendMessage(network: id.network, target: nick, text: text) }
         case .raw(let line):
             return run { try client.sendRaw(network: id.network, line: line) }
+        case .cycle(let channel):
+            pendingSelection = id
+            return run {
+                try client.part(network: id.network, channel: channel, reason: nil)
+                try client.join(network: id.network, channel: channel, key: nil)
+            }
+        case .listChannels:
+            sheet = .browseChannels(network: id.network)
+            return true
+        case .clear:
+            buffer.clear()
+            return true
+        case .close:
+            if buffer.kind == .server {
+                notice = "The server buffer can't be closed."
+                return false
+            }
+            close(id)
+            return true
+        case .ignore(let nick):
+            preferences.ignore(nick)
+            refreshMentions()
+            notice = "Ignoring \(nick). /unignore \(nick) undoes it."
+            return true
+        case .unignore(let nick):
+            preferences.unignore(nick)
+            refreshMentions()
+            return true
         case .invalid(let message):
             notice = message
             return false

@@ -321,6 +321,65 @@ let net = Network(id: "1", name: "libera", upstreamState: "connected", attribute
         #expect(model.selection == BufferID(network: "1", name: "#secret"))
     }
 
+    @Test func mentionsCountOurNickAndHighlightWords() async {
+        let (model, _) = await makeModel()
+        model.preferences.highlightWords = ["backroom"]
+        model.apply(.networkUpdated(network: net))
+        model.apply(.ownNick(network: "1", nick: "chris"))
+        for (i, text) in ["hi Chris!", "chrissy is here", "try backroom", "nothing", "@chris: ping"].enumerated() {
+            model.apply(.message(network: "1", buffer: "#b", message: msg(text, at: TimeInterval(i))))
+        }
+        let buffer = model.buffers[BufferID(network: "1", name: "#b")]!
+        #expect(buffer.unread == 5)
+        #expect(buffer.unreadMentions == 3)
+        // Private messages always count.
+        model.apply(.message(network: "1", buffer: "bob", message: msg("hey", at: 9, from: "bob")))
+        #expect(model.buffers[BufferID(network: "1", name: "bob")]?.unreadMentions == 1)
+    }
+
+    @Test func ignoredPeopleDontCount() async {
+        let (model, _) = await makeModel()
+        model.apply(.networkUpdated(network: net))
+        model.apply(.bufferAdded(network: "1", name: "*", kind: .server))
+        model.select(BufferID(network: "1", name: "*"))
+        #expect(model.send("/ignore Spammer"))
+        model.apply(.message(network: "1", buffer: "#b", message: msg("buy now", at: 1, from: "spammer")))
+        #expect(model.buffers[BufferID(network: "1", name: "#b")]?.unread == 0)
+        #expect(model.send("/unignore spammer"))
+        #expect(model.buffers[BufferID(network: "1", name: "#b")]?.unread == 1)
+    }
+
+    @Test func nickAwayAndWhoisEvents() async {
+        let (model, _) = await makeModel()
+        model.apply(.networkUpdated(network: net))
+        model.apply(.ownNick(network: "1", nick: "me"))
+        model.apply(.away(network: "1", away: true))
+        #expect(model.networks[0].nick == "me")
+        #expect(model.networks[0].away)
+        let info = WhoisInfo(
+            nick: "bob", user: nil, host: nil, realname: nil, server: nil, serverInfo: nil, account: nil,
+            channels: [], idle: nil, signon: nil, away: nil, operator: false, secure: false, other: [])
+        model.apply(.whois(network: "1", info: info))
+        #expect(model.sheet == .whois(network: "1", info: info))
+    }
+
+    @Test func composerActionsForBuffers() async {
+        let (model, client) = await makeModel()
+        model.apply(.networkUpdated(network: net))
+        model.apply(.bufferAdded(network: "1", name: "#b", kind: .channel))
+        let id = BufferID(network: "1", name: "#b")
+        model.select(id)
+        model.apply(.message(network: "1", buffer: "#b", message: msg("hi", at: 1)))
+        #expect(model.send("/clear"))
+        #expect(model.buffers[id]?.messages.isEmpty == true)
+        #expect(model.send("/list"))
+        #expect(model.sheet == .browseChannels(network: "1"))
+        #expect(model.send("/cycle"))
+        #expect(client.calls.suffix(2) == ["part 1 #b -", "join 1 #b"])
+        #expect(model.send("/op alice"))
+        #expect(client.calls.last == "raw 1 MODE #b +o alice")
+    }
+
     @Test func serverBufferRejectsMessages() async {
         let (model, client) = await makeModel()
         model.apply(.networkUpdated(network: net))
@@ -345,7 +404,7 @@ let net = Network(id: "1", name: "libera", upstreamState: "connected", attribute
         model.apply(.bufferAdded(network: "1", name: "#b", kind: .channel))
         let id = BufferID(network: "1", name: "#b")
         model.apply(.members(network: "1", channel: "#B", members: [
-            Member(nick: "op", prefix: "@"), Member(nick: "alice", prefix: ""),
+            Member(nick: "op", prefix: "@", away: false), Member(nick: "alice", prefix: "", away: false),
         ]))
         #expect(model.buffers[id]?.members.map(\.nick) == ["op", "alice"])
 

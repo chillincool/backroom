@@ -190,10 +190,10 @@ struct NetworkGroup: View {
                 }
             }
         } label: {
-            let unread = isExpanded
-                ? server.flatMap { model.buffers[$0]?.unread } ?? 0
-                : network.buffers.reduce(0) { $0 + (model.buffers[$1]?.unread ?? 0) }
-            let row = NetworkRow(network: network, unread: unread)
+            let counted = isExpanded ? (server.map { [$0] } ?? []) : network.buffers
+            let unread = counted.reduce(0) { $0 + (model.buffers[$1]?.unread ?? 0) }
+            let mentions = counted.reduce(0) { $0 + (model.buffers[$1]?.unreadMentions ?? 0) }
+            let row = NetworkRow(network: network, unread: unread, mentions: mentions)
                 .contextMenu {
                     let connected = network.connection.isConnected
                     Button("Join Channel…") { model.sheet = .joinChannel(network: network.id) }
@@ -202,6 +202,11 @@ struct NetworkGroup: View {
                         .disabled(!connected)
                     Button("New Conversation…") { model.sheet = .newConversation(network: network.id) }
                         .disabled(!connected)
+                    Divider()
+                    Button(network.away ? "Set Back" : "Set Away") {
+                        model.setAway(network: network.id, away: !network.away)
+                    }
+                    .disabled(!connected)
                     Divider()
                     Button("Edit Network…") { editing = true }
                     Divider()
@@ -226,6 +231,7 @@ struct NetworkRow: View {
     @Environment(\.theme) private var theme
     let network: NetworkState
     let unread: Int
+    let mentions: Int
 
     var body: some View {
         HStack {
@@ -235,12 +241,17 @@ struct NetworkRow: View {
                 .fontWeight(.semibold)
                 .lineLimit(1)
             Spacer()
+            if network.away {
+                Image(systemName: "moon.fill")
+                    .foregroundStyle(theme.mutedColor)
+                    .help("You're marked away")
+            }
             if !network.connection.isConnected {
                 Image(systemName: "exclamationmark.circle")
                     .foregroundStyle(.orange)
                     .help(network.connection.summary)
             }
-            UnreadBadge(count: unread)
+            UnreadBadge(count: unread, mentions: mentions)
         }
         .help(network.connection.summary)
     }
@@ -260,13 +271,15 @@ struct BufferRow: View {
                 .lineLimit(1)
                 .help(buffer.name)
             Spacer()
-            UnreadBadge(count: unread)
+            UnreadBadge(count: unread, mentions: buffer.unreadMentions)
         }
     }
 }
 
+/// Unread count; red when something mentions you or is a private message.
 struct UnreadBadge: View {
     let count: Int
+    var mentions = 0
 
     var body: some View {
         if count > 0 {
@@ -274,8 +287,9 @@ struct UnreadBadge: View {
                 .font(.caption.monospacedDigit())
                 .padding(.horizontal, 6)
                 .padding(.vertical, 1)
-                .background(Capsule().fill(.tint))
+                .background(Capsule().fill(mentions > 0 ? AnyShapeStyle(Color.red) : AnyShapeStyle(.tint)))
                 .foregroundStyle(.white)
+                .help(mentions > 0 ? "\(count) unread, \(mentions) for you" : "\(count) unread")
         }
     }
 }

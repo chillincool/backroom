@@ -7,8 +7,8 @@ import Testing
 @MainActor @Suite struct MemberListTests {
     @Test func groupsByHighestRankThenOnline() {
         let groups = MemberList.group([
-            Member(nick: "owner", prefix: "~@"), Member(nick: "op", prefix: "@+"),
-            Member(nick: "voice", prefix: "+"), Member(nick: "plain", prefix: ""),
+            Member(nick: "owner", prefix: "~@", away: false), Member(nick: "op", prefix: "@+", away: false),
+            Member(nick: "voice", prefix: "+", away: false), Member(nick: "plain", prefix: "", away: false),
         ])
         #expect(groups.map(\.rank.title) == ["Owners", "Operators", "Voiced", "Online"])
         #expect(groups.map { $0.members.map(\.nick) } == [["owner"], ["op"], ["voice"], ["plain"]])
@@ -16,8 +16,8 @@ import Testing
 
     @Test func unusualRanksGetTheirOwnGroupInNetworkOrder() {
         let groups = MemberList.group([
-            Member(nick: "creator", prefix: "!@"), Member(nick: "op", prefix: "@"),
-            Member(nick: "plain", prefix: ""),
+            Member(nick: "creator", prefix: "!@", away: false), Member(nick: "op", prefix: "@", away: false),
+            Member(nick: "plain", prefix: "", away: false),
         ])
         #expect(groups.map(\.rank.title) == ["! members", "Operators", "Online"])
         #expect(NickColor.color(nick: "n", prefix: "!", theme: .defaultLight, coloring: .rank) == .indigo)

@@ -12,6 +12,7 @@ struct SheetContent: View {
             case .joinChannel(let network): JoinChannelSheet(network: network)
             case .browseChannels(let network): ChannelBrowser(network: network)
             case .newConversation(let network): NewConversationSheet(network: network)
+            case .whois(let network, let info): WhoisView(network: network, info: info)
             }
         }
     }

@@ -5,16 +5,23 @@ import SwiftUI
 @main
 struct BackroomApp: App {
     private static let login = BrowserLogin()
-    @State private var prefs = Preferences()
-    @State private var model = AppModel(
-        settings: ServerSettings.load(),
-        authenticator: login,
-        makeClient: { settings in
-            try BackroomClient(
-                config: settings.clientConfig,
-                secretStore: KeychainSecretStore(
-                    service: "net.chillincool.backroom", account: settings.keychainAccount))
-        })
+    @State private var prefs: Preferences
+    @State private var model: AppModel
+
+    init() {
+        let prefs = Preferences()
+        _prefs = State(initialValue: prefs)
+        _model = State(initialValue: AppModel(
+            settings: ServerSettings.load(),
+            authenticator: Self.login,
+            preferences: prefs,
+            makeClient: { settings in
+                try BackroomClient(
+                    config: settings.clientConfig,
+                    secretStore: KeychainSecretStore(
+                        service: "net.chillincool.backroom", account: settings.keychainAccount))
+            }))
+    }
 
     var body: some Scene {
         Window("Backroom", id: "main") {

@@ -82,4 +82,13 @@ import Testing
         #expect(!TimelineItem.build([m("a", .privmsg, at: 1)], unreadAfter: Date(timeIntervalSince1970: 1))
             .contains(.unreadLine))
     }
+
+    @Test func quitsFoldWithPartsAndIgnoredPeopleAreHidden() {
+        let items = TimelineItem.build(
+            [m("a", .part, at: 1), m("b", .quit, at: 2), m("spam", .privmsg, at: 3), m("c", .privmsg, at: 4)],
+            isIgnored: { $0 == "spam" })
+        #expect(items.count == 2)
+        guard case .presence(let run) = items[0] else { Issue.record("\(items)"); return }
+        #expect(TimelineItem.summary(run) == "← a and b left")
+    }
 }

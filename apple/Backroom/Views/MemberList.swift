@@ -1,3 +1,4 @@
+import AppKit
 import BackroomCore
 import SwiftUI
 
@@ -41,10 +42,8 @@ struct MemberList: View {
                                     member: member,
                                     color: NickColor.color(
                                         nick: member.nick, prefix: member.prefix, theme: theme,
-                                        coloring: prefs.nickColoring)
-                                ) {
-                                    model.openQuery(network: buffer.id.network, nick: member.nick)
-                                }
+                                        coloring: prefs.nickColoring),
+                                    buffer: buffer)
                             }
                         }
                     } header: {
@@ -110,21 +109,64 @@ struct MemberList: View {
 }
 
 struct MemberRow: View {
+    @Environment(AppModel.self) private var model
+    @Environment(Preferences.self) private var prefs
     let member: Member
     let color: Color
-    /// Opens a private conversation with this member.
-    let message: () -> Void
+    let buffer: BufferModel
 
     var body: some View {
         Text(NickColor.label(member.nick, prefix: member.prefix))
             .foregroundStyle(color)
+            .opacity(member.away ? 0.45 : 1)
             .lineLimit(1)
-            .help(member.nick)
+            .help(member.away ? "\(member.nick) (away)" : member.nick)
             .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
             .onTapGesture(count: 2, perform: message)
-            .contextMenu {
-                Button("Send Message", action: message)
+            .contextMenu { menu }
+    }
+
+    private var network: String { buffer.id.network }
+
+    private func message() {
+        model.openQuery(network: network, nick: member.nick)
+    }
+
+    private func mode(_ change: String) {
+        model.sendRaw(network: network, "MODE \(buffer.name) \(change) \(member.nick)")
+    }
+
+    @ViewBuilder private var menu: some View {
+        Button("Send Message", action: message)
+        Button("Whois") { model.sendRaw(network: network, "WHOIS \(member.nick)") }
+        Button("Copy Nick") {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(member.nick, forType: .string)
+        }
+        Divider()
+        let ignored = prefs.ignored.contains { $0.caseInsensitiveCompare(member.nick) == .orderedSame }
+        Button(ignored ? "Stop Ignoring" : "Ignore") {
+            if ignored { prefs.unignore(member.nick) } else { prefs.ignore(member.nick) }
+        }
+        // Moderation, when we're a half-op or above here.
+        if let own = model.ownPrefix(in: buffer), own.contains(where: { "~&@%".contains($0) }) {
+            Divider()
+            let op = member.prefix.contains("@")
+            let voiced = member.prefix.contains("+")
+            if own.contains(where: { "~&@".contains($0) }) {
+                Button(op ? "Remove Operator" : "Make Operator") { mode(op ? "-o" : "+o") }
             }
+            Button(voiced ? "Remove Voice" : "Give Voice") { mode(voiced ? "-v" : "+v") }
+            Divider()
+            Button("Kick") { model.sendRaw(network: network, "KICK \(buffer.name) \(member.nick)") }
+            Button("Ban") {
+                model.sendRaw(network: network, "MODE \(buffer.name) +b \(Composer.banMask(member.nick))")
+            }
+            Button("Kick and Ban") {
+                model.sendRaw(network: network, "MODE \(buffer.name) +b \(Composer.banMask(member.nick))")
+                model.sendRaw(network: network, "KICK \(buffer.name) \(member.nick)")
+            }
+        }
     }
 }

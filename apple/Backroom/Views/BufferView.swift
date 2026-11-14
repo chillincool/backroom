@@ -9,13 +9,16 @@ struct BufferView: View {
     let id: BufferID
     @State private var draft = ""
     @FocusState private var composerFocused: Bool
+    @State private var completion: Completion?
+    /// Position in the buffer's sent lines while stepping with ↑/↓.
+    @State private var historyIndex: Int?
 
     var body: some View {
         let buffer = model.buffers[id]
         let style = ChatStyle(prefs: prefs, theme: theme)
         VStack(spacing: 0) {
             if let buffer, let topic = buffer.topic, topic != buffer.dismissedTopic {
-                TopicBanner(topic: topic) { buffer.dismissedTopic = topic }
+                TopicBanner(topic: topic, formatting: prefs.showFormatting) { buffer.dismissedTopic = topic }
                 Divider()
             }
             ScrollView {
@@ -23,7 +26,8 @@ struct BufferView: View {
                     HistoryHeader(buffer: buffer) { model.loadOlder(id) }
                     if let buffer {
                         ForEach(TimelineItem.build(
-                            buffer.messages, presence: prefs.presence, unreadAfter: buffer.unreadLine
+                            buffer.messages, presence: prefs.presence, unreadAfter: buffer.unreadLine,
+                            isIgnored: buffer.mentions.isIgnored
                         )) { item in
                             switch item {
                             case .message(let message, let continued):
@@ -53,13 +57,78 @@ struct BufferView: View {
                 .padding(10)
                 .background(theme.backgroundColor)
                 .focused($composerFocused)
-                .onSubmit {
-                    if model.send(draft) { draft = "" }
-                    composerFocused = true
+                .onSubmit { submit(buffer) }
+                .onKeyPress(.tab) {
+                    complete(buffer)
+                    return .handled
+                }
+                .onKeyPress(.upArrow) { stepHistory(buffer, back: true) ? .handled : .ignored }
+                .onKeyPress(.downArrow) { stepHistory(buffer, back: false) ? .handled : .ignored }
+                .onChange(of: draft) { _, new in
+                    if let completion, new != completion.result { self.completion = nil }
                 }
         }
+        // #channel links (in messages and the topic) join the channel.
+        .environment(\.openURL, OpenURLAction { url in
+            guard let channel = MessageText.channel(from: url) else { return .systemAction }
+            model.join(network: id.network, channel: channel)
+            return .handled
+        })
         .navigationTitle(title(buffer))
         .onAppear { composerFocused = true }
+    }
+
+    private func submit(_ buffer: BufferModel?) {
+        let line = draft
+        if model.send(line) {
+            if let buffer, !line.trimmingCharacters(in: .whitespaces).isEmpty {
+                buffer.sentHistory.append(line)
+                if buffer.sentHistory.count > 200 { buffer.sentHistory.removeFirst() }
+            }
+            draft = ""
+            historyIndex = nil
+        }
+        composerFocused = true
+    }
+
+    /// Tab: completes the last word with a nick, channel or command; again
+    /// for the next match.
+    private func complete(_ buffer: BufferModel?) {
+        guard let buffer else { return }
+        if var current = completion, draft == current.result {
+            current.next()
+            completion = current
+            draft = current.result
+            return
+        }
+        // Recent speakers first, then everyone else.
+        var seen = Set<String>()
+        let speakers = buffer.messages.reversed().filter { !$0.own && $0.kind.isChat }.map(\.sender)
+        let nicks = (speakers + buffer.members.map(\.nick) + (buffer.kind == .query ? [buffer.name] : []))
+            .filter { seen.insert($0.lowercased()).inserted }
+        let channels = model.networks.first { $0.id == id.network }?.buffers
+            .compactMap { model.buffers[$0] }.filter { $0.kind == .channel }.map(\.name) ?? []
+        guard let started = Completion.start(draft, nicks: nicks, channels: channels) else { return }
+        completion = started
+        draft = started.result
+    }
+
+    /// ↑/↓ through lines sent here, when the composer is empty or showing
+    /// one of them. Returns false to let the key move the cursor instead.
+    private func stepHistory(_ buffer: BufferModel?, back: Bool) -> Bool {
+        guard let history = buffer?.sentHistory, !history.isEmpty, !draft.contains("\n") else { return false }
+        if let index = historyIndex, history.indices.contains(index), draft != history[index] { return false }
+        if historyIndex == nil, !draft.isEmpty { return false }
+        let next = back ? (historyIndex ?? history.count) - 1 : (historyIndex ?? history.count) + 1
+        if next < 0 { return true }
+        if next >= history.count {
+            historyIndex = nil
+            draft = ""
+        } else {
+            historyIndex = next
+            draft = history[next]
+        }
+        return true
     }
 
     private func title(_ buffer: BufferModel?) -> String {
@@ -84,6 +153,7 @@ struct ChatStyle {
     let timestamps: TimestampStyle
     let coloring: NickColoring
     let repeatNick: Bool
+    let formatting: Bool
     let padding: CGFloat
     /// Column widths for the columns layout.
     let timeWidth: CGFloat
@@ -97,6 +167,7 @@ struct ChatStyle {
         timestamps = prefs.timestamps
         coloring = prefs.nickColoring
         repeatNick = prefs.repeatNick
+        formatting = prefs.showFormatting
         padding = prefs.density.padding
         let nsFont = prefs.nsFont()
         nickWidth = Self.width(String(repeating: "n", count: prefs.nickColumnWidth), NSFontManager.shared.convert(nsFont, toHaveTrait: .boldFontMask))
@@ -143,7 +214,9 @@ struct HistoryHeader: View {
 
     var body: some View {
         Group {
-            if buffer?.historyExhausted == true {
+            if buffer?.cleared == true {
+                Text("Cleared")
+            } else if buffer?.historyExhausted == true {
                 Text("Beginning of history")
             } else if buffer?.historyLoading == true {
                 ProgressView().controlSize(.small)
@@ -160,6 +233,7 @@ struct HistoryHeader: View {
 }
 
 struct MessageRow: View {
+    @Environment(AppModel.self) private var model
     let message: ChatMessage
     let continued: Bool
     /// Read here, not by the list, so member changes only redraw visible rows.
@@ -169,6 +243,7 @@ struct MessageRow: View {
     private var theme: Theme { style.theme }
 
     var body: some View {
+        let mention = buffer.isMention(message)
         Group {
             switch style.layout {
             case .columns: columns
@@ -179,6 +254,13 @@ struct MessageRow: View {
         .font(style.font)
         .textSelection(.enabled)
         .padding(.vertical, style.padding)
+        .background {
+            if mention {
+                theme.accentColor.opacity(0.14)
+                    .padding(.horizontal, -6)
+                    .clipShape(RoundedRectangle(cornerRadius: 3))
+            }
+        }
     }
 
     private var prefix: String? { buffer.prefixByNick[message.sender.lowercased()] }
@@ -188,9 +270,21 @@ struct MessageRow: View {
             .foregroundColor(style.nickColor(message, prefix: prefix))
     }
 
-    private var text: String { stripFormatting(text: message.text) }
+    /// The message text with formatting and links.
+    private var body_: Text {
+        Text(MessageText.attributed(message.text, formatting: style.formatting, theme: theme))
+    }
+
+    private var plain: String { stripFormatting(text: message.text) }
 
     private var hidesNick: Bool { continued && !style.repeatNick }
+
+    private var isEvent: Bool {
+        switch message.kind {
+        case .privmsg, .notice, .action, .reply, .error: false
+        default: true
+        }
+    }
 
     // MARK: Columns: time │ nick │ text
 
@@ -210,17 +304,20 @@ struct MessageRow: View {
         switch message.kind {
         case .privmsg: if hidesNick { Text("") } else { nick }
         case .notice: Text("-\(nick)-")
-        case .action, .topic: Text("*").foregroundStyle(theme.mutedColor)
         case .join: Text("→").foregroundStyle(theme.mutedColor)
-        case .part, .kick: Text("←").foregroundStyle(theme.mutedColor)
+        case .part, .kick, .quit: Text("←").foregroundStyle(theme.mutedColor)
+        case .reply: Text("–").foregroundStyle(theme.mutedColor)
+        case .error: Text("!").bold().foregroundStyle(.red)
+        case .action, .topic, .nick, .mode, .invite: Text("*").foregroundStyle(theme.mutedColor)
         }
     }
 
     @ViewBuilder private var columnText: some View {
         switch message.kind {
-        case .privmsg, .notice: Text(text).foregroundStyle(theme.textColor)
-        case .action: Text("\(nick) \(text)").italic().foregroundStyle(theme.textColor)
-        default: event
+        case .privmsg, .notice, .reply: body_.foregroundStyle(theme.textColor)
+        case .error: body_.foregroundStyle(.red)
+        case .action: Text("\(nick) \(body_)").italic().foregroundStyle(theme.textColor)
+        default: eventLine
         }
     }
 
@@ -237,14 +334,16 @@ struct MessageRow: View {
         switch message.kind {
         case .privmsg:
             if hidesNick {
-                Text(text).foregroundStyle(theme.textColor)
+                body_.foregroundStyle(theme.textColor)
                     .padding(.leading, style.nickWidth / 2)
             } else {
-                Text("\(nick)  \(text)").foregroundStyle(theme.textColor)
+                Text("\(nick)  \(body_)").foregroundStyle(theme.textColor)
             }
-        case .notice: Text("-\(nick)-  \(text)").foregroundStyle(theme.textColor)
-        case .action: Text("* \(nick) \(text)").italic().foregroundStyle(theme.textColor)
-        default: event
+        case .notice: Text("-\(nick)-  \(body_)").foregroundStyle(theme.textColor)
+        case .action: Text("* \(nick) \(body_)").italic().foregroundStyle(theme.textColor)
+        case .reply: body_.foregroundStyle(theme.textColor)
+        case .error: Text("! \(body_)").foregroundStyle(.red)
+        default: eventLine
         }
     }
 
@@ -260,7 +359,7 @@ struct MessageRow: View {
                     }
                     .padding(.top, 6)
                 }
-                Text(text).foregroundStyle(theme.textColor)
+                body_.foregroundStyle(theme.textColor)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
         } else {
@@ -268,19 +367,38 @@ struct MessageRow: View {
         }
     }
 
-    // MARK: Joins, parts, kicks and topics
+    // MARK: Events: joins, parts, quits, kicks, topics, nicks, modes, invites
+
+    @ViewBuilder private var eventLine: some View {
+        if message.kind == .invite, buffer.kind == .server {
+            // We were invited: offer to join.
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                event
+                Button("Join \(plain)") { model.join(network: buffer.id.network, channel: plain) }
+                    .buttonStyle(.link)
+            }
+        } else {
+            event
+        }
+    }
 
     private var event: Text {
+        let who = message.sender
         let line: String = switch message.kind {
-        case .join: "\(message.sender) joined"
-        case .part: "\(message.sender) left\(text.isEmpty ? "" : " (\(text))")"
-        case .kick: "\(message.sender) kicked \(text)"
-        case .topic: "\(message.sender) set the topic: \(text)"
-        default: text
+        case .join: "\(who) joined"
+        case .part: "\(who) left\(plain.isEmpty ? "" : " (\(plain))")"
+        case .quit: "\(who) quit\(plain.isEmpty ? "" : " (\(plain))")"
+        case .kick: "\(who) kicked \(plain)"
+        case .topic: "\(who) set the topic: \(plain)"
+        case .nick: message.own ? "You are now known as \(plain)" : "\(who) is now known as \(plain)"
+        case .mode: "\(who) set mode \(plain)"
+        case .invite: buffer.kind == .server ? "\(who) invited you to \(plain)" : "\(who) invited \(plain)"
+        default: plain
         }
         let arrow = switch message.kind {
         case .join: "→ "
-        case .part, .kick: "← "
+        case .part, .kick, .quit: "← "
+        case .nick, .mode, .invite: "* "
         default: ""
         }
         return Text(style.layout == .columns ? line : arrow + line).foregroundColor(theme.mutedColor)
@@ -291,13 +409,14 @@ struct MessageRow: View {
 struct TopicBanner: View {
     @Environment(\.theme) private var theme
     let topic: String
+    let formatting: Bool
     let close: () -> Void
 
     var body: some View {
         let text = stripFormatting(text: topic)
         HStack(alignment: .top, spacing: 8) {
             Image(systemName: "text.quote").foregroundStyle(theme.mutedColor)
-            Text(text)
+            Text(MessageText.attributed(topic, formatting: formatting, theme: theme))
                 .foregroundStyle(theme.textColor)
                 .lineLimit(2)
                 .textSelection(.enabled)

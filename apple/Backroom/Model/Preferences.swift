@@ -111,6 +111,12 @@ final class Preferences {
     var timestamps: TimestampStyle { didSet { set(timestamps.rawValue, "timestamps") } }
     var presence: PresenceStyle { didSet { set(presence.rawValue, "presence") } }
     var nickColoring: NickColoring { didSet { set(nickColoring.rawValue, "nickColoring") } }
+    /// Show mIRC colours and formatting; off strips them.
+    var showFormatting: Bool { didSet { set(showFormatting, "showFormatting") } }
+    /// Words that count as mentions, besides our nick.
+    var highlightWords: [String] { didSet { set(highlightWords, "highlightWords") } }
+    /// Nicks whose messages are hidden.
+    var ignored: [String] { didSet { set(ignored, "ignored") } }
 
     static let monospaced = "monospaced"
     static let fontSizes: ClosedRange<Double> = 10...24
@@ -141,6 +147,9 @@ final class Preferences {
         timestamps = value("timestamps", TimestampStyle.minutes)
         presence = value("presence", PresenceStyle.fold)
         nickColoring = value("nickColoring", NickColoring.rank)
+        showFormatting = defaults.object(forKey: Self.prefix + "showFormatting") as? Bool ?? true
+        highlightWords = defaults.stringArray(forKey: Self.prefix + "highlightWords") ?? []
+        ignored = defaults.stringArray(forKey: Self.prefix + "ignored") ?? []
     }
 
     private nonisolated static func read(_ defaults: UserDefaults, _ key: String) -> String? {
@@ -149,6 +158,14 @@ final class Preferences {
 
     private func set(_ value: Any?, _ key: String) {
         defaults.set(value, forKey: Self.prefix + key)
+    }
+
+    func ignore(_ nick: String) {
+        if !ignored.contains(where: { $0.caseInsensitiveCompare(nick) == .orderedSame }) { ignored.append(nick) }
+    }
+
+    func unignore(_ nick: String) {
+        ignored.removeAll { $0.caseInsensitiveCompare(nick) == .orderedSame }
     }
 
     // MARK: Themes
