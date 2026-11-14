@@ -17,6 +17,10 @@ platform services.
   - `sasl.rs`: OAUTHBEARER / PLAIN encoding and chunking
   - `auth/`: OIDC + PKCE, refresh, `TokenStore` / `CredentialProvider` traits
   - `batch.rs`, `bouncer.rs`, `client.rs`: batches, bouncer-networks, async driver
+  - `live/`: long-lived session for apps: control + per-network connections,
+    reconnect with backoff, events out (messages, buffers, history, read
+    markers) and commands in
+  - `model.rs`: platform-neutral chat model and message routing
 - `crates/backroom-cli`: the `backroom` spike CLI
 
 ## CLI

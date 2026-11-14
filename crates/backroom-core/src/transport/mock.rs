@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use tokio::sync::Notify;
 
 use super::{Connector, Transport, TransportError};
 
@@ -12,10 +13,16 @@ use super::{Connector, Transport, TransportError};
 /// Each script step is either a server line to deliver, or a wait for the
 /// client to send a line starting with a given prefix. Waiting keeps the
 /// conversation in lock-step, like a real server.
+///
+/// By default, reading while the script expects a send panics: with a
+/// single task, that's a deadlock. [`MockConnector::concurrent`] instead
+/// waits, for clients that read and send from different tasks.
 #[derive(Clone)]
 pub(crate) struct MockConnector {
     script: Arc<Mutex<VecDeque<Step>>>,
     pub sent: Arc<Mutex<Vec<String>>>,
+    progress: Arc<Notify>,
+    wait_for_sends: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -29,6 +36,15 @@ impl MockConnector {
         MockConnector {
             script: Arc::new(Mutex::new(script.into_iter().collect())),
             sent: Arc::default(),
+            progress: Arc::default(),
+            wait_for_sends: false,
+        }
+    }
+
+    pub fn concurrent(script: impl IntoIterator<Item = Step>) -> Self {
+        MockConnector {
+            wait_for_sends: true,
+            ..Self::new(script)
         }
     }
 
@@ -51,6 +67,8 @@ impl Connector for MockConnector {
         Ok(Box::new(MockTransport {
             script: self.script.clone(),
             sent: self.sent.clone(),
+            progress: self.progress.clone(),
+            wait_for_sends: self.wait_for_sends,
         }))
     }
 }
@@ -58,6 +76,8 @@ impl Connector for MockConnector {
 struct MockTransport {
     script: Arc<Mutex<VecDeque<Step>>>,
     sent: Arc<Mutex<Vec<String>>>,
+    progress: Arc<Notify>,
+    wait_for_sends: bool,
 }
 
 #[async_trait]
@@ -70,22 +90,31 @@ impl Transport for MockTransport {
             && line.starts_with(prefix.as_str())
         {
             script.pop_front();
+            self.progress.notify_waiters();
         }
         Ok(())
     }
 
     async fn recv(&mut self) -> Result<Option<String>, TransportError> {
-        let mut script = self.script.lock().unwrap();
-        match script.front() {
-            Some(Step::Server(_)) => match script.pop_front() {
-                Some(Step::Server(line)) => Ok(Some(line)),
-                _ => unreachable!(),
-            },
-            Some(Step::Expect(prefix)) => panic!(
-                "client is waiting for input but script expects it to send {prefix:?}; sent so far: {:#?}",
-                self.sent.lock().unwrap()
-            ),
-            None => Ok(None),
+        loop {
+            // Registered before checking, so a send in between isn't missed.
+            let progressed = self.progress.notified();
+            {
+                let mut script = self.script.lock().unwrap();
+                match script.front() {
+                    Some(Step::Server(_)) => match script.pop_front() {
+                        Some(Step::Server(line)) => return Ok(Some(line)),
+                        _ => unreachable!(),
+                    },
+                    Some(Step::Expect(prefix)) if !self.wait_for_sends => panic!(
+                        "client is waiting for input but script expects it to send {prefix:?}; sent so far: {:#?}",
+                        self.sent.lock().unwrap()
+                    ),
+                    Some(Step::Expect(_)) => {}
+                    None => return Ok(None),
+                }
+            }
+            progressed.await;
         }
     }
 

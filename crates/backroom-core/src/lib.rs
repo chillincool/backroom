@@ -6,9 +6,11 @@ pub mod auth;
 pub mod batch;
 pub mod bouncer;
 pub mod client;
+pub mod live;
+pub mod model;
 pub mod proto;
 pub mod sasl;
 pub mod session;
 pub mod transport;
 
-pub use client::{Client, ClientError, ConnectOptions};
+pub use client::{Client, ClientError, ConnectOptions, Incoming};
