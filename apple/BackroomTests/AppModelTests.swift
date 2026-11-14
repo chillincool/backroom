@@ -170,6 +170,15 @@ let net = Network(id: "1", name: "libera", upstreamState: "connected", attribute
         #expect(model.notice == "Wrong username or password.")
     }
 
+    @Test func unsupportedLoginMethodIsExplained() {
+        let sso = AppModel.loginRejected(
+            "the server doesn't accept OAUTHBEARER logins (it offers PLAIN)", login: .singleSignOn)
+        #expect(sso.hasPrefix("This server doesn't support single sign-on"))
+        let password = AppModel.loginRejected(
+            "the server doesn't accept PLAIN logins (it offers OAUTHBEARER)", login: .password)
+        #expect(password.hasPrefix("This server doesn't accept passwords"))
+    }
+
     @Test func passwordSettings() throws {
         let settings = ServerSettings.e2ePassword
         #expect(settings.keychainAccount == "password dave ws://127.0.0.1:28081/")

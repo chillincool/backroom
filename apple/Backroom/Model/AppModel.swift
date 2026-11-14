@@ -312,10 +312,7 @@ final class AppModel {
                 client?.disconnect()
                 resetChat()
                 phase = .loggedOut
-                // soju's 904 text is generic ("Authentication failed").
-                notice = settings.login == .password
-                    ? "Wrong username or password."
-                    : "Your login was rejected (\(reason)). Log in again."
+                notice = Self.loginRejected(reason, login: settings.login)
             }
         case .connection(let id?, let state):
             if let i = networkIndex(id) { networks[i].connection = state }
@@ -882,6 +879,22 @@ final class AppModel {
     private enum LoginError: Error, CustomStringConvertible {
         case badURL
         var description: String { "the server returned an invalid login URL" }
+    }
+
+    /// What to say when soju turns the login down.
+    static func loginRejected(_ reason: String, login: ServerSettings.Login) -> String {
+        // From the core when soju doesn't offer our SASL mechanism.
+        if reason.contains("doesn't accept OAUTHBEARER") {
+            return "This server doesn't support single sign-on. Check the server address, or log in with a username and password."
+        }
+        if reason.contains("doesn't accept PLAIN") {
+            return "This server doesn't accept passwords; log in with single sign-on."
+        }
+        switch login {
+        // soju's 904 text is generic ("Authentication failed").
+        case .password: return "Wrong username or password."
+        case .singleSignOn: return "Your login was rejected (\(reason)). Log in again."
+        }
     }
 
     static func describe(_ error: Error) -> String {
