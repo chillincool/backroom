@@ -20,7 +20,7 @@ import Testing
             Member(nick: "plain", prefix: ""),
         ])
         #expect(groups.map(\.rank.title) == ["! members", "Operators", "Online"])
-        #expect(NickColor.color(prefix: "!") == .indigo)
+        #expect(NickColor.color(nick: "n", prefix: "!", theme: .defaultLight, coloring: .rank) == .indigo)
     }
 
     @Test func labelsUseTheHighestPrefix() {
@@ -30,10 +30,10 @@ import Testing
     }
 
     @Test func coloursFollowStatus() {
-        #expect(NickColor.color(prefix: "@+") == .green)
-        #expect(NickColor.color(prefix: "+") == .orange)
-        #expect(NickColor.color(prefix: "") == .primary)
-        #expect(NickColor.color(prefix: "%") == .teal)
-        #expect(NickColor.color(prefix: nil) == .primary)
+        #expect(NickColor.color(nick: "n", prefix: "@+", theme: .defaultLight, coloring: .rank) == .green)
+        #expect(NickColor.color(nick: "n", prefix: "+", theme: .defaultLight, coloring: .rank) == .orange)
+        #expect(NickColor.color(nick: "n", prefix: "", theme: .defaultLight, coloring: .rank) == .primary)
+        #expect(NickColor.color(nick: "n", prefix: "%", theme: .defaultLight, coloring: .rank) == .teal)
+        #expect(NickColor.color(nick: "n", prefix: nil, theme: .defaultLight, coloring: .rank) == .primary)
     }
 }

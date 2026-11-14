@@ -2850,6 +2850,9 @@
         "/soju-users"
       ],
       "lastName": "E2E",
+      "realmRoles": [
+        "default-roles-e2e"
+      ],
       "username": "alice"
     },
     {
@@ -2866,6 +2869,9 @@
       "firstName": "mallory",
       "groups": [],
       "lastName": "E2E",
+      "realmRoles": [
+        "default-roles-e2e"
+      ],
       "username": "mallory"
     }
   ],

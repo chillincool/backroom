@@ -95,6 +95,25 @@ impl From<model::Member> for Member {
     }
 }
 
+/// One channel from the network's channel list.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, uniffi::Record)]
+pub struct ChannelListing {
+    pub name: String,
+    pub users: u32,
+    /// Topic, mIRC formatting included.
+    pub topic: String,
+}
+
+impl From<model::ChannelListing> for ChannelListing {
+    fn from(c: model::ChannelListing) -> Self {
+        ChannelListing {
+            name: c.name,
+            users: c.users,
+            topic: c.topic,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct Network {
     /// soju network ID; pass it back in commands.
@@ -200,6 +219,13 @@ pub enum SessionEvent {
         buffer: String,
         time: Option<SystemTime>,
     },
+    /// Part of the channel list answering `list_channels`; `done` marks
+    /// the last chunk.
+    ChannelList {
+        network: String,
+        channels: Vec<ChannelListing>,
+        done: bool,
+    },
     /// Something failed that the user may want to see.
     Error {
         network: Option<String>,
@@ -275,6 +301,15 @@ impl From<live::Event> for SessionEvent {
                 network,
                 buffer,
                 time: time.map(Into::into),
+            },
+            E::ChannelList {
+                network,
+                channels,
+                done,
+            } => SessionEvent::ChannelList {
+                network,
+                channels: channels.into_iter().map(Into::into).collect(),
+                done,
             },
             E::Error { network, message } => SessionEvent::Error { network, message },
             E::Stopped => SessionEvent::Stopped,

@@ -44,7 +44,8 @@ services. Owner: chillincool. Public repo: github.com/chillincool/backroom.
 - `apple/Backroom`: SwiftUI app (`project.yml` → XcodeGen; project, build dir
   and Info.plist are git-ignored). `AppModel` (`@Observable`, main actor)
   owns the client via `BackroomClientProtocol` (faked in tests) and applies
-  events. Login opens the default browser and receives
+  events; `Preferences` (`@Observable`, UserDefaults) and `Theme` reach
+  views through the environment (`\.theme`). Login opens the default browser and receives
   `backroom://oauth/callback` via `onOpenURL` (`BrowserLogin`), not
   `ASWebAuthenticationSession`: that delegates to the default browser, and
   Firefox fails it instantly as "cancelled". Signing: `Signing.xcconfig`
@@ -110,15 +111,26 @@ with `MockConnector::concurrent`.
 ## Status (2026-11-14)
 
 - Merged: Phase 1 (`cece7a5`), `live` session (#8), `backroom-ffi` +
-  `apple/BackroomCore` (#9), macOS app + `macos` CI job (#10).
-- Branch `feat/app-polish` (committed, not pushed): member lists (NAMES,
-  ranks from ISUPPORT PREFIX, live updates), topics, add/edit/remove
-  networks (`BOUNCER ADD/CHANGE/DELNETWORK`), raw commands, buffer removal
-  on PART/KICK, replayed own JOINs hidden, channel buffers only from JOINs
-  (TARGETS adds queries only); app: rank-coloured nicks with symbols,
-  collapsible member groups, topic banner, join/part runs folded, PMs from
-  the member list, `/j` `/p` `/m` `/q` `/t` `/quote` (other commands go raw),
-  reopen last conversation, `/join` switches.
+  `apple/BackroomCore` (#9), macOS app + `macos` CI job (#10), members,
+  topics, network management, `offline_access` (#11).
+- PR 1 of the owner's feature plan (branch `feat/settings-themes`): join /
+  browse channels (`LIST` → `Event::ChannelList` chunks) / new conversation
+  from the network menu and File menu; JOIN keys (redacted in raw tracing);
+  Settings window (Account, Networks, Appearance, Messages); themes (System /
+  Light / Dark, one light + one dark theme, Rex-style cards, presets Default,
+  Solarized, Gruvbox, Dracula, Nord, High Contrast, custom themes with editor
+  and JSON import/export); fonts grouped (Nerd Fonts, monospaced, other);
+  layouts Columns (default) / Inline / Stacked, optional nick repeat;
+  day separators; red "New" line at the last read spot; `HSplitView` layout.
+- Agreed plan for what follows: **PR 2** server replies (numerics to the
+  server buffer, errors to their channel, WHOIS card), QUIT/NICK/MODE/INVITE
+  in the timeline, more caps (`invite-notify`, `setname`, `account-notify`,
+  `chghost`, `extended-join`, `multi-prefix`, …), away state, real commands
+  (`/nick /away /whois /kick /ban /op …`, `/list` opens the browser), member
+  context menu with moderation, mentions + highlight words, mIRC formatting
+  rendered, clickable links/channels, Tab nick completion, input history.
+  **PR 3** notifications, `soju.im/search`, channel settings sheet, MONITOR,
+  CTCP replies (check soju's CTCP handling first), typing/redaction. No DCC.
 - `macos` is deliberately **not** a required check yet (owner: wait until the
   app is further along; it adds ~6 min per PR).
 - Dev testing uses the e2e stack's soju with real networks (Libera,
@@ -135,32 +147,26 @@ with `MockConnector::concurrent`.
 - SwiftUI performance: each buffer is its own `@Observable` (`BufferModel`)
   and the member list is a `LazyVStack`; a sectioned `List` with ~1,600 rows
   made channel switching take seconds.
+- macOS 26 UI notes: `NavigationSplitView`'s sidebar floats around the window
+  buttons (owner dislikes it; hence `HSplitView`); toolbar `.status` items
+  lose their text. Owner runs with transparency off; a Glass/Classic option
+  was considered and skipped.
+- Imported Keycloak users get no realm roles; the e2e realm gives test users
+  `default-roles-e2e` (carries `offline_access`). Production: confirm the
+  `backroom` client has `offline_access` as an optional client scope.
 
 ## Pick up here (2026-11-14)
 
-- Branch `feat/app-polish`, 3+ commits ahead of `main`, **not pushed**. When
-  ready: `git push -u origin feat/app-polish`, `gh pr create`, then
-  `gh pr merge --squash --auto` (dismiss CodeQL test-password alerts if any).
-- Just changed: the app requests `offline_access` so its refresh token
-  outlives Keycloak's 30-min idle session (`ssoSessionIdleTimeout`); before,
-  any reconnect after 30 min connected logged the user out
-  (`REFRESH_TOKEN_ERROR … Token is not active`). **Verify** after the owner
-  logs out/in: alice should have an offline session for `backroom`
-  (Keycloak admin API: `GET /admin/realms/e2e/users/<id>/offline-sessions/<client-uuid>`).
-  Production: confirm the `backroom` client has `offline_access` as an
-  optional client scope before relying on it.
-- Owner still has to rejoin channels in the test stack (`/j libera,linux,backroom-dev`
-  on libera, `/j backroom` on ergo-test, `/j 420` on P2P-Network).
+- PR 1 open (`feat/settings-themes`), owner approved the UI. Next: PR 2 on a
+  new branch from `main` once it merges.
 - Dev setup running: e2e stack up (`mise run e2e:up`), soju-oauth2 data on
   volume `soju-oauth2-data` (survives recreation; `e2e.sh down` deletes it),
   alice has networks ergo-test, libera (nick backroom-dev), P2P-Network
-  (nick chillin-dev). Rex backroom tab panes: nvim, lazygit, bacon
-  (`clippy-all`), Claude, shell, plus soju log, CI watcher and the bob test
-  bot (scratchpad script; gone after this session).
+  (nick chillin-dev).
 - Not done / ideas: production use (add `backroom://oauth/callback` to
-  production Keycloak's `backroom` client), notifications, search, nick
-  completion, multiple accounts, mIRC colours, offline start without
-  Keycloak reachable, `macos` as a required check (deferred by owner).
+  production Keycloak's `backroom` client), search, multiple accounts,
+  offline start without Keycloak reachable, `macos` as a required check
+  (deferred by owner).
 
 ## Decisions
 
@@ -170,12 +176,8 @@ with `MockConnector::concurrent`.
 - Intel-only builds while developing; `--universal` when packaging.
 - Develop the app against the e2e stack (`mise run e2e:up`, Keycloak on
   `127.0.0.1:18080`).
-
-## Next
-
-- Ideas noted but not planned: nick list, topic bar, notifications, search,
-  multiple accounts, mIRC colours, adding networks from the app, offline
-  start (`connect` needs OIDC discovery), production redirect in Keycloak.
+- Themes: built-in ids start `builtin.`; nil colours mean the system colour
+  (so Default looks native). Preferences live in UserDefaults under `prefs.`.
 
 ## Environment constraints
 

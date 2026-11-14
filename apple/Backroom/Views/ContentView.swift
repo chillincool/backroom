@@ -3,6 +3,8 @@ import SwiftUI
 
 struct ContentView: View {
     @Environment(AppModel.self) private var model
+    @Environment(Preferences.self) private var prefs
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         Group {
@@ -18,6 +20,7 @@ struct ContentView: View {
                 NoticeBar(text: notice) { model.notice = nil }
             }
         }
+        .environment(\.theme, prefs.theme(dark: colorScheme == .dark))
     }
 }
 

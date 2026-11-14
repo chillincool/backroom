@@ -32,6 +32,29 @@ final class AppModel {
     private(set) var selection: BufferID?
     /// The latest error worth showing; the view clears it.
     var notice: String?
+    /// A sheet to show over the main window (from menus and the sidebar).
+    var sheet: Sheet?
+    /// Channel lists by network, from "Browse Channels".
+    private(set) var channelLists: [String: ChannelList] = [:]
+
+    enum Sheet: Identifiable, Equatable {
+        case joinChannel(network: String)
+        case browseChannels(network: String)
+        case newConversation(network: String)
+
+        var id: String {
+            switch self {
+            case .joinChannel(let n): "join-\(n)"
+            case .browseChannels(let n): "browse-\(n)"
+            case .newConversation(let n): "query-\(n)"
+            }
+        }
+    }
+
+    struct ChannelList: Equatable {
+        var channels: [ChannelListing] = []
+        var loading = true
+    }
 
     static let historyPage: UInt32 = 100
 
@@ -50,7 +73,12 @@ final class AppModel {
     @ObservationIgnored private let authenticator: any WebAuthenticator
     /// Whether the app is frontmost; buffers are only marked read then.
     @ObservationIgnored var isActive = true {
-        didSet { if isActive, let selection { markRead(selection) } }
+        didSet {
+            guard isActive, let selection else { return }
+            // Coming back to the app: mark where the unseen messages start.
+            if let buffer = buffers[selection], buffer.unread > 0 { buffer.unreadLine = buffer.readMarker }
+            markRead(selection)
+        }
     }
 
     init(settings: ServerSettings, authenticator: any WebAuthenticator,
@@ -150,6 +178,8 @@ final class AppModel {
         buffers = [:]
         selection = nil
         recent = []
+        sheet = nil
+        channelLists = [:]
     }
 
     // MARK: Events
@@ -216,6 +246,11 @@ final class AppModel {
             if let time, buffer.readMarker.map({ time > $0 }) ?? true {
                 buffer.readMarker = time
             }
+        case .channelList(let network, let channels, let done):
+            // Chunks only extend a list someone asked for.
+            guard channelLists[network] != nil else { return }
+            channelLists[network]?.channels.append(contentsOf: channels)
+            if done { channelLists[network]?.loading = false }
         case .error(_, let message):
             notice = message
         case .stopped:
@@ -267,6 +302,8 @@ final class AppModel {
         recent.removeAll { $0 == id }
         recent.insert(id, at: 0)
         defaults.set([id.network, id.key], forKey: Self.lastBufferKey)
+        // Before marking read: the line shows where this visit's news starts.
+        buffer.unreadLine = buffer.readMarker
         if !buffer.historyRequested {
             buffers[id]?.historyRequested = true
             buffers[id]?.historyLoading = true
@@ -286,6 +323,32 @@ final class AppModel {
     func openQuery(network: String, nick: String) {
         let id = ensureBuffer(network: network, name: nick, kind: .query)
         select(id)
+    }
+
+    /// The network menu commands act on: the selected buffer's, else the first.
+    var currentNetwork: String? { selection?.network ?? networks.first?.id }
+
+    /// Joins channels (comma-separated) and switches to the first: now if
+    /// we're already in it, else once the server confirms.
+    @discardableResult
+    func join(network: String, channel: String, key: String? = nil) -> Bool {
+        guard let client else { return false }
+        let target = BufferID(network: network, name: String(channel.split(separator: ",").first ?? ""))
+        if buffers[target] != nil {
+            select(target)
+        } else {
+            pendingSelection = target
+        }
+        return run { try client.join(network: network, channel: channel, key: key) }
+    }
+
+    /// Asks for a network's channel list, replacing any earlier one.
+    func listChannels(network: String) {
+        guard let client else { return }
+        channelLists[network] = ChannelList()
+        if !run({ try client.listChannels(network: network) }) {
+            channelLists[network]?.loading = false
+        }
     }
 
     /// Asks soju to add a network; it appears once soju has it.
@@ -347,15 +410,8 @@ final class AppModel {
             }
             let line = if case .action = action { Composer.actionText(text) } else { text }
             return run { try client.sendMessage(network: id.network, target: buffer.name, text: line) }
-        case .join(let channel):
-            // Switch to it: now if we're already there, else once joined.
-            let target = BufferID(network: id.network, name: String(channel.split(separator: ",").first ?? ""))
-            if buffers[target] != nil {
-                select(target)
-            } else {
-                pendingSelection = target
-            }
-            return run { try client.join(network: id.network, channel: channel) }
+        case .join(let channel, let key):
+            return join(network: id.network, channel: channel, key: key)
         case .part(let channel, let reason):
             return run { try client.part(network: id.network, channel: channel, reason: reason) }
         case .query(let nick, let text):

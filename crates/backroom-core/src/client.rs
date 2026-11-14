@@ -332,7 +332,7 @@ async fn recv_line(
 
 async fn send_message(transport: &mut dyn Transport, msg: &Message) -> Result<(), ClientError> {
     let line = msg.to_string();
-    tracing::trace!(target: RAW, "-> {line}");
+    tracing::trace!(target: RAW, "-> {}", traced(msg, &line));
     transport.send(&line).await?;
     Ok(())
 }
@@ -341,6 +341,15 @@ async fn send_outgoing(transport: &mut dyn Transport, out: Outgoing) -> Result<(
     match out {
         Outgoing::Message(msg) => send_message(transport, &msg).await,
         Outgoing::Authenticate(arg) => send_authenticate(transport, &arg).await,
+    }
+}
+
+/// An outgoing line as traced: channel keys (`JOIN #c key`) are passwords.
+fn traced<'a>(msg: &Message, line: &'a str) -> std::borrow::Cow<'a, str> {
+    if msg.command.eq_ignore_ascii_case("JOIN") && msg.params.len() > 1 {
+        format!("JOIN {} <redacted>", msg.params[0]).into()
+    } else {
+        line.into()
     }
 }
 
@@ -356,6 +365,16 @@ async fn send_authenticate(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn join_keys_are_not_traced() {
+        let msg = Message::new("JOIN", ["#secret", "sesame"]);
+        let line = msg.to_string();
+        assert_eq!(traced(&msg, &line), "JOIN #secret <redacted>");
+        let msg = Message::new("JOIN", ["#open"]);
+        let line = msg.to_string();
+        assert_eq!(traced(&msg, &line), "JOIN #open");
+    }
+
     use super::*;
     use crate::auth::StaticCredentials;
     use crate::sasl::SaslCredentials;

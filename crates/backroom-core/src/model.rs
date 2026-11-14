@@ -80,6 +80,16 @@ pub struct ChatMessage {
     pub own: bool,
 }
 
+/// One channel from a `LIST` reply (`RPL_LIST`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelListing {
+    pub name: String,
+    /// Visible users, as the server counts them.
+    pub users: u32,
+    /// Topic, mIRC formatting included; often prefixed with modes like `[+nt]`.
+    pub topic: String,
+}
+
 /// Network-specific facts needed to route messages.
 #[derive(Debug, Clone)]
 pub struct RouteContext<'a> {

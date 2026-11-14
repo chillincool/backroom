@@ -30,6 +30,9 @@ def user(name, groups):
         "firstName": name,
         "lastName": "E2E",
         "groups": groups,
+        # Imported users don't get the realm's default roles on their own;
+        # offline_access (in default-roles-e2e) lets backroom get offline tokens.
+        "realmRoles": ["default-roles-e2e"],
         "credentials": [{"type": "password", "value": name, "temporary": False}],
     }
 

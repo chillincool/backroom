@@ -21,7 +21,10 @@ final class FakeClient: BackroomClientProtocol, @unchecked Sendable {
     }
     func disconnect() { calls.append("disconnect") }
     func hasLogin() throws -> Bool { loggedIn }
-    func join(network: String, channel: String) throws { calls.append("join \(network) \(channel)") }
+    func join(network: String, channel: String, key: String?) throws {
+        calls.append("join \(network) \(channel)" + (key.map { " key=\($0)" } ?? ""))
+    }
+    func listChannels(network: String) throws { calls.append("list \(network)") }
     func loadHistory(network: String, target: String, before: Date?, limit: UInt32) throws {
         calls.append("history \(network) \(target) \(before == nil ? "latest" : "before")")
     }
@@ -153,6 +156,23 @@ let net = Network(id: "1", name: "libera", upstreamState: "connected", attribute
         #expect(client.calls.last == "read 1 #b 30")
     }
 
+    @Test func selectingRemembersWhereUnreadStarts() async {
+        let (model, _) = await makeModel()
+        model.apply(.networkUpdated(network: net))
+        let id = BufferID(network: "1", name: "#b")
+        model.apply(.message(network: "1", buffer: "#b", message: msg("old", at: 10)))
+        model.apply(.readMarker(network: "1", buffer: "#b", time: Date(timeIntervalSince1970: 10)))
+        model.apply(.message(network: "1", buffer: "#b", message: msg("new", at: 20)))
+
+        model.select(id)
+        #expect(model.buffers[id]?.unreadLine == Date(timeIntervalSince1970: 10))
+        #expect(model.buffers[id]?.readMarker == Date(timeIntervalSince1970: 20))
+        // Coming back with nothing new: no line.
+        model.select(nil)
+        model.select(id)
+        #expect(model.buffers[id]?.unreadLine == Date(timeIntervalSince1970: 20))
+    }
+
     @Test func staleReadMarkersDontBringUnreadBack() async {
         let (model, _) = await makeModel()
         model.apply(.networkUpdated(network: net))
@@ -274,6 +294,31 @@ let net = Network(id: "1", name: "libera", upstreamState: "connected", attribute
         // Not for channels we're not in.
         model.apply(.topic(network: "1", channel: "#gone", topic: "x"))
         #expect(model.buffers[BufferID(network: "1", name: "#gone")] == nil)
+    }
+
+    @Test func channelListsAccumulateChunks() async {
+        let (model, client) = await makeModel()
+        model.apply(.networkUpdated(network: net))
+        // Lists nobody asked for are ignored.
+        model.apply(.channelList(network: "1", channels: [ChannelListing(name: "#x", users: 1, topic: "")], done: true))
+        #expect(model.channelLists["1"] == nil)
+
+        model.listChannels(network: "1")
+        #expect(client.calls.last == "list 1")
+        model.apply(.channelList(network: "1", channels: [ChannelListing(name: "#a", users: 3, topic: "t")], done: false))
+        #expect(model.channelLists["1"]?.loading == true)
+        model.apply(.channelList(network: "1", channels: [ChannelListing(name: "#b", users: 5, topic: "")], done: true))
+        #expect(model.channelLists["1"]?.channels.map(\.name) == ["#a", "#b"])
+        #expect(model.channelLists["1"]?.loading == false)
+    }
+
+    @Test func joinFromTheGUIWithAKey() async {
+        let (model, client) = await makeModel()
+        model.apply(.networkUpdated(network: net))
+        model.join(network: "1", channel: "#secret", key: "sesame")
+        #expect(client.calls.last == "join 1 #secret key=sesame")
+        model.apply(.bufferAdded(network: "1", name: "#secret", kind: .channel))
+        #expect(model.selection == BufferID(network: "1", name: "#secret"))
     }
 
     @Test func serverBufferRejectsMessages() async {

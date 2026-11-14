@@ -195,8 +195,24 @@ impl BackroomClient {
         })
     }
 
-    pub fn join(&self, network: String, channel: String) -> Result<(), BackroomError> {
-        self.command(Command::Join { network, channel })
+    /// Joins channels (comma-separated); `key` is for `+k` channels.
+    pub fn join(
+        &self,
+        network: String,
+        channel: String,
+        key: Option<String>,
+    ) -> Result<(), BackroomError> {
+        self.command(Command::Join {
+            network,
+            channel,
+            key,
+        })
+    }
+
+    /// Asks for the network's channel list; it arrives as `ChannelList`
+    /// events.
+    pub fn list_channels(&self, network: String) -> Result<(), BackroomError> {
+        self.command(Command::ListChannels { network })
     }
 
     pub fn part(
@@ -335,7 +351,9 @@ mod tests {
     #[test]
     fn commands_need_a_session() {
         let client = client();
-        let err = client.join("1".into(), "#backroom".into()).unwrap_err();
+        let err = client
+            .join("1".into(), "#backroom".into(), None)
+            .unwrap_err();
         assert!(matches!(err, BackroomError::NotConnected));
         client.disconnect();
     }

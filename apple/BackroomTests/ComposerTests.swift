@@ -23,10 +23,10 @@ import Testing
     }
 
     @Test func join() {
-        #expect(Composer.parse("/join #rust", buffer: "#b") == .join("#rust"))
-        #expect(Composer.parse("/j #rust extra", buffer: "#b") == .join("#rust"))
-        #expect(Composer.parse("/J #Rust", buffer: "#b") == .join("#Rust"))
-        #expect(Composer.parse("/join", buffer: "#b") == .invalid("Usage: /join <#channel>"))
+        #expect(Composer.parse("/join #rust", buffer: "#b") == .join("#rust", key: nil))
+        #expect(Composer.parse("/j #rust sesame extra", buffer: "#b") == .join("#rust", key: "sesame"))
+        #expect(Composer.parse("/J #Rust", buffer: "#b") == .join("#Rust", key: nil))
+        #expect(Composer.parse("/join", buffer: "#b") == .invalid("Usage: /join <#channel> [key]"))
     }
 
     @Test func partDefaultsToCurrentBuffer() {
@@ -36,8 +36,8 @@ import Testing
     }
 
     @Test func joinAddsTheHash() {
-        #expect(Composer.parse("/j rust", buffer: "#b") == .join("#rust"))
-        #expect(Composer.parse("/join rust,#go,&local", buffer: "#b") == .join("#rust,#go,&local"))
+        #expect(Composer.parse("/j rust", buffer: "#b") == .join("#rust", key: nil))
+        #expect(Composer.parse("/join rust,#go,&local", buffer: "#b") == .join("#rust,#go,&local", key: nil))
     }
 
     @Test func shortcuts() {
