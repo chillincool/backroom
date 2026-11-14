@@ -6,6 +6,7 @@ struct MainView: View {
     @AppStorage("showMembers") private var showMembers = true
 
     var body: some View {
+        @Bindable var model = model
         NavigationSplitView {
             SidebarView()
                 .navigationSplitViewColumnWidth(min: 180, ideal: 220)
@@ -30,6 +31,7 @@ struct MainView: View {
                 }
             }
         }
+        .sheet(item: $model.sheet) { SheetContent(sheet: $0) }
         .toolbar {
             ToolbarItem(placement: .status) {
                 ConnectionBadge(state: model.control)
@@ -151,6 +153,14 @@ struct NetworkGroup: View {
                 : network.buffers.reduce(0) { $0 + (model.buffers[$1]?.unread ?? 0) }
             let row = NetworkRow(network: network, unread: unread)
                 .contextMenu {
+                    let connected = network.connection.isConnected
+                    Button("Join Channel…") { model.sheet = .joinChannel(network: network.id) }
+                        .disabled(!connected)
+                    Button("Browse Channels…") { model.sheet = .browseChannels(network: network.id) }
+                        .disabled(!connected)
+                    Button("New Conversation…") { model.sheet = .newConversation(network: network.id) }
+                        .disabled(!connected)
+                    Divider()
                     Button("Edit Network…") { editing = true }
                     Divider()
                     Button("Remove Network…", role: .destructive) { confirmingRemoval = true }

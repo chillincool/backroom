@@ -6,6 +6,8 @@ import SwiftUI
 /// and only the visible rows should be built.
 struct MemberList: View {
     @Environment(AppModel.self) private var model
+    @Environment(Preferences.self) private var prefs
+    @Environment(\.theme) private var theme
     let buffer: BufferModel
     @AppStorage("collapsedRanks") private var collapsedRanks = ""
 
@@ -28,14 +30,19 @@ struct MemberList: View {
             LazyVStack(alignment: .leading, spacing: 2, pinnedViews: [.sectionHeaders]) {
                 Text("\(buffer.members.count) members")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(theme.mutedColor)
                     .padding(.bottom, 4)
                 ForEach(groups, id: \.rank.id) { group in
                     let collapsed = collapsedRanks.contains(group.rank.symbol)
                     Section {
                         if !collapsed {
                             ForEach(group.members, id: \.nick) { member in
-                                MemberRow(member: member) {
+                                MemberRow(
+                                    member: member,
+                                    color: NickColor.color(
+                                        nick: member.nick, prefix: member.prefix, theme: theme,
+                                        coloring: prefs.nickColoring)
+                                ) {
                                     model.openQuery(network: buffer.id.network, nick: member.nick)
                                 }
                             }
@@ -52,18 +59,19 @@ struct MemberList: View {
                                     .font(.caption.bold())
                                 Spacer()
                             }
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(theme.mutedColor)
                             .padding(.vertical, 3)
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
-                        .background(.background)
+                        .background(theme.backgroundColor)
                     }
                 }
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
         }
+        .background(theme.backgroundColor)
         .overlay {
             if buffer.members.isEmpty {
                 ContentUnavailableView("No Members Yet", systemImage: "person.2")
@@ -103,12 +111,13 @@ struct MemberList: View {
 
 struct MemberRow: View {
     let member: Member
+    let color: Color
     /// Opens a private conversation with this member.
     let message: () -> Void
 
     var body: some View {
         Text(NickColor.label(member.nick, prefix: member.prefix))
-            .foregroundStyle(NickColor.color(prefix: member.prefix))
+            .foregroundStyle(color)
             .lineLimit(1)
             .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())

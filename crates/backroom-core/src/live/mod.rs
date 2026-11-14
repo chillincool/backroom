@@ -27,7 +27,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::mpsc;
 
 use crate::auth::CredentialProvider;
-use crate::model::{BufferKind, ChatMessage, Member, NetworkId, NetworkInfo};
+use crate::model::{BufferKind, ChannelListing, ChatMessage, Member, NetworkId, NetworkInfo};
 use crate::transport::Connector;
 
 #[derive(Clone)]
@@ -150,6 +150,14 @@ pub enum Event {
         buffer: String,
         time: Option<DateTime<Utc>>,
     },
+    /// Part of the channel list, in reply to [`Command::ListChannels`].
+    /// Big networks list tens of thousands of channels, so they arrive in
+    /// chunks; `done` marks the last one (which may be empty).
+    ChannelList {
+        network: NetworkId,
+        channels: Vec<ChannelListing>,
+        done: bool,
+    },
     /// Something failed that the user may want to see, e.g. a `FAIL` reply
     /// or a command for a disconnected network.
     Error {
@@ -167,9 +175,11 @@ pub enum Command {
         target: String,
         text: String,
     },
+    /// Joins channels (comma-separated), with a key for `+k` channels.
     Join {
         network: NetworkId,
         channel: String,
+        key: Option<String>,
     },
     Part {
         network: NetworkId,
@@ -198,6 +208,11 @@ pub enum Command {
     },
     /// Deletes a network from soju (`BOUNCER DELNETWORK`).
     RemoveNetwork {
+        network: NetworkId,
+    },
+    /// Asks for the network's channel list (`LIST`). Answered with
+    /// [`Event::ChannelList`] chunks.
+    ListChannels {
         network: NetworkId,
     },
     /// Sends a raw IRC line on a network, e.g. `WHOIS alice`.

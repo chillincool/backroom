@@ -34,4 +34,38 @@ import Testing
         let run = [m("a", .join, at: 1), m("a", .part, at: 2), m("A", .join, at: 3)]
         #expect(TimelineItem.summary(run) == "→ a joined · ← a left")
     }
+
+    @Test func presenceCanBeShownOrHidden() {
+        let messages = [m("a", .join, at: 1), m("b", .part, at: 2), m("a", .privmsg, at: 3)]
+        #expect(TimelineItem.build(messages, presence: .show).count == 3)
+        let hidden = TimelineItem.build(messages, presence: .hide)
+        #expect(hidden.count == 1)
+        guard case .message = hidden[0] else { Issue.record("\(hidden)"); return }
+    }
+
+    @Test func runsFromOneSenderAreContinued() {
+        let items = TimelineItem.build([
+            m("a", .privmsg, at: 1), m("A", .privmsg, at: 2), m("b", .privmsg, at: 3),
+            m("b", .action, at: 4), m("b", .privmsg, at: 5),
+            // A long pause breaks the run.
+            m("b", .privmsg, at: 5 + TimelineItem.runGap),
+        ])
+        let continued = items.map { if case .message(_, let c) = $0 { c } else { false } }
+        #expect(continued == [false, true, false, false, false, false])
+    }
+
+    @Test func daysAreSeparated() {
+        var utc = Calendar(identifier: .gregorian)
+        utc.timeZone = TimeZone(identifier: "UTC")!
+        let day: TimeInterval = 86_400
+        let items = TimelineItem.build(
+            [m("a", .privmsg, at: 10), m("a", .privmsg, at: day + 10), m("a", .privmsg, at: day + 20)],
+            calendar: utc)
+        #expect(items.count == 4)
+        guard case .day(let date) = items[1], case .message(_, let continued) = items[2] else {
+            Issue.record("\(items)"); return
+        }
+        #expect(date == Date(timeIntervalSince1970: day))
+        #expect(!continued, "a new day starts a new run")
+    }
 }

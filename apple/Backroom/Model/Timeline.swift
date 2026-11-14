@@ -1,34 +1,67 @@
 import BackroomCore
 import Foundation
 
-/// What a buffer's message list shows: messages, with each run of joins and
-/// parts folded into one line.
-enum TimelineItem: Identifiable {
-    case message(ChatMessage)
+/// What a buffer's message list shows: messages, joins and parts (alone,
+/// folded into runs or hidden) and a separator where the day changes.
+enum TimelineItem: Identifiable, Equatable {
+    /// `continued`: the previous line is a message from the same sender,
+    /// so the nick can be left out.
+    case message(ChatMessage, continued: Bool)
     case presence([ChatMessage])
+    case day(Date)
 
     var id: String {
         switch self {
-        case .message(let m): m.stableID
+        case .message(let m, _): m.stableID
         case .presence(let run): "presence-" + (run.first?.stableID ?? "")
+        case .day(let date): "day-\(date.timeIntervalSince1970)"
         }
     }
 
-    static func build(_ messages: [ChatMessage]) -> [TimelineItem] {
+    /// A run of messages from one sender breaks after this long a pause.
+    static let runGap: TimeInterval = 30 * 60
+
+    static func build(
+        _ messages: [ChatMessage], presence: PresenceStyle = .fold, calendar: Calendar = .current
+    ) -> [TimelineItem] {
         var items: [TimelineItem] = []
         var run: [ChatMessage] = []
+        var day: Date?
+        /// The last message shown with its sender, while a run can continue.
+        var previous: ChatMessage?
+
+        func flush() {
+            if !run.isEmpty { items.append(.presence(run)) }
+            run = []
+        }
+
         for message in messages {
+            let start = calendar.startOfDay(for: message.time)
+            if start != day {
+                flush()
+                // No separator above the first day: the header says where history starts.
+                if day != nil { items.append(.day(start)) }
+                day = start
+                previous = nil
+            }
             if message.kind == .join || message.kind == .part {
-                run.append(message)
+                switch presence {
+                case .hide: continue
+                case .fold: run.append(message)
+                case .show: items.append(.message(message, continued: false))
+                }
+                previous = nil
                 continue
             }
-            if !run.isEmpty {
-                items.append(.presence(run))
-                run = []
-            }
-            items.append(.message(message))
+            flush()
+            let continued = message.kind == .privmsg && previous.map {
+                $0.kind == .privmsg && $0.sender.lowercased() == message.sender.lowercased()
+                    && message.time.timeIntervalSince($0.time) < runGap
+            } == true
+            items.append(.message(message, continued: continued))
+            previous = message
         }
-        if !run.isEmpty { items.append(.presence(run)) }
+        flush()
         return items
     }
 

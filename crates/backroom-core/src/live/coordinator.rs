@@ -13,12 +13,16 @@ use crate::batch::Batch;
 use crate::bouncer::{NetworkUpdate, parse_network_message};
 use crate::client::Incoming;
 use crate::model::{
-    BufferKind, ChatMessage, MessageKind, NetworkId, NetworkInfo, RouteContext, SERVER_BUFFER,
-    buffer_key, irc_timestamp, route,
+    BufferKind, ChannelListing, ChatMessage, MessageKind, NetworkId, NetworkInfo, RouteContext,
+    SERVER_BUFFER, buffer_key, irc_timestamp, route,
 };
 use crate::proto::Message;
 use crate::proto::message::escape_tag_value;
 use crate::session::Registered;
+
+/// `RPL_LIST` entries per [`Event::ChannelList`]: few enough events for
+/// a 50,000-channel network, each small enough to apply quickly.
+const LIST_CHUNK: usize = 500;
 
 /// Starts a connection task; replaced in tests.
 type Spawner = Box<dyn FnMut(ConnId, FromConnTx) -> mpsc::UnboundedSender<ToConn> + Send>;
@@ -59,6 +63,8 @@ struct Network {
     /// connection, and those aren't news.
     requested_joins: HashSet<String>,
     members: Members,
+    /// `RPL_LIST` entries not yet sent to the front end.
+    channel_list: Vec<ChannelListing>,
 }
 
 impl Network {
@@ -153,12 +159,32 @@ impl Coordinator {
                     self.live(&network, &own);
                 }
             }
-            Command::Join { network, channel } => {
+            Command::Join {
+                network,
+                channel,
+                key,
+            } => {
+                let key = key.filter(|k| !k.is_empty());
+                let bad = |s: &str| s.is_empty() || s.contains([' ', '\r', '\n', '\0']);
+                if bad(&channel) || key.as_deref().is_some_and(bad) {
+                    return self.error(
+                        Some(&network),
+                        "channel names and keys can't contain spaces",
+                    );
+                }
                 if let Some(net) = self.networks.get_mut(&network) {
                     net.requested_joins
                         .extend(channel.split(',').map(buffer_key));
                 }
-                self.send_to(&network, Message::new("JOIN", [channel]));
+                let mut params = vec![channel];
+                params.extend(key);
+                self.send_to(&network, Message::new("JOIN", params));
+            }
+            Command::ListChannels { network } => {
+                if let Some(net) = self.networks.get_mut(&network) {
+                    net.channel_list.clear();
+                }
+                self.send_to(&network, Message::new("LIST", Vec::<String>::new()));
             }
             Command::Part {
                 network,
@@ -363,6 +389,7 @@ impl Coordinator {
                                 buffers: HashMap::new(),
                                 requested_joins: HashSet::new(),
                                 members: Members::new(&BTreeMap::new()),
+                                channel_list: Vec::new(),
                             },
                         );
                         info
@@ -512,6 +539,24 @@ impl Coordinator {
                 });
             }
             "FAIL" => self.error(Some(id), msg.to_string()),
+            // RPL_LIST <me> <channel> <users> :<topic>
+            "322" => {
+                let (Some(net), Some(name)) = (self.networks.get_mut(id), msg.param(1)) else {
+                    return;
+                };
+                net.channel_list.push(ChannelListing {
+                    name: name.to_owned(),
+                    users: msg.param(2).and_then(|n| n.parse().ok()).unwrap_or(0),
+                    topic: msg.param(3).unwrap_or("").to_owned(),
+                });
+                if net.channel_list.len() >= LIST_CHUNK {
+                    self.flush_channel_list(id, false);
+                }
+            }
+            // RPL_LISTEND
+            "323" => self.flush_channel_list(id, true),
+            // RPL_LISTSTART: nothing to do.
+            "321" => {}
             // RPL_TOPIC <me> <channel> :<topic>, RPL_NOTOPIC <me> <channel> :…
             "332" | "331" => {
                 if let Some(channel) = msg.param(1) {
@@ -550,6 +595,18 @@ impl Coordinator {
             }
             _ => self.live(id, msg),
         }
+    }
+
+    fn flush_channel_list(&mut self, id: &str, done: bool) {
+        let Some(net) = self.networks.get_mut(id) else {
+            return;
+        };
+        let channels = std::mem::take(&mut net.channel_list);
+        self.emit(Event::ChannelList {
+            network: id.to_owned(),
+            channels,
+            done,
+        });
     }
 
     /// Routes a chat message to its buffer and emits it.
@@ -927,6 +984,7 @@ mod tests {
         h.c.command(Command::Join {
             network: "1".into(),
             channel: "#New,#other".into(),
+            key: None,
         });
         h.line(Some("1"), ":me!u@h JOIN #new");
         let ev = h.events();
@@ -1036,6 +1094,12 @@ mod tests {
             Command::Join {
                 network: "1".into(),
                 channel: "#new".into(),
+                key: None,
+            },
+            Command::Join {
+                network: "1".into(),
+                channel: "#secret".into(),
+                key: Some("sesame".into()),
             },
             Command::Part {
                 network: "1".into(),
@@ -1067,6 +1131,7 @@ mod tests {
             [
                 "PRIVMSG #rust :hello there",
                 "JOIN #new",
+                "JOIN #secret sesame",
                 "PART #old :bye now",
                 // Clamped to ISUPPORT CHATHISTORY=100.
                 "CHATHISTORY LATEST #rust * 100",
@@ -1076,6 +1141,58 @@ mod tests {
         );
         // With echo-message, our own message arrives from the server instead.
         assert!(h.events().is_empty());
+    }
+
+    #[test]
+    fn channel_list_arrives_in_chunks() {
+        let mut h = Harness::new();
+        h.connected_network(&[]);
+        h.c.command(Command::ListChannels {
+            network: "1".into(),
+        });
+        assert_eq!(h.sent(Some("1")), ["LIST"]);
+
+        h.line(Some("1"), ":srv 321 me Channel :Users  Name");
+        for i in 0..LIST_CHUNK + 1 {
+            h.line(
+                Some("1"),
+                &format!(":srv 322 me #c{i} {i} :[+nt] topic {i}"),
+            );
+        }
+        h.line(Some("1"), ":srv 323 me :End of /LIST");
+        let ev = h.events();
+        let chunks: Vec<_> = ev
+            .iter()
+            .map(|e| match e {
+                Event::ChannelList { channels, done, .. } => (channels.len(), *done),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(chunks, [(LIST_CHUNK, false), (1, true)]);
+        let Event::ChannelList { channels, .. } = &ev[0] else {
+            unreachable!()
+        };
+        assert_eq!(
+            channels[7],
+            ChannelListing {
+                name: "#c7".into(),
+                users: 7,
+                topic: "[+nt] topic 7".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn join_rejects_spaces_in_keys() {
+        let mut h = Harness::new();
+        h.connected_network(&[]);
+        h.c.command(Command::Join {
+            network: "1".into(),
+            channel: "#c".into(),
+            key: Some("two words".into()),
+        });
+        assert!(matches!(h.events()[..], [Event::Error { .. }]));
+        assert!(h.sent(Some("1")).is_empty());
     }
 
     #[test]
@@ -1104,6 +1221,7 @@ mod tests {
         h.c.command(Command::Join {
             network: "1".into(),
             channel: "#c".into(),
+            key: None,
         });
         // Multi-line text.
         h.c.command(Command::SendMessage {
@@ -1114,6 +1232,7 @@ mod tests {
         h.c.command(Command::Join {
             network: "9".into(),
             channel: "#c".into(),
+            key: None,
         });
         let ev = h.events();
         assert_eq!(ev.len(), 3);

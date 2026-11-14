@@ -529,6 +529,7 @@ async fn live_session_talks_loads_history_and_syncs_read_markers() {
     session.send(Command::Join {
         network: dave_net.clone(),
         channel: channel.clone(),
+        key: None,
     });
     next_event(&mut events, "channel buffer", |e| {
         matches!(e, Event::BufferAdded { network, name, kind: BufferKind::Channel }

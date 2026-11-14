@@ -4,7 +4,8 @@ import Foundation
 enum ComposerAction: Equatable {
     case message(String)
     case action(String)
-    case join(String)
+    /// Channels (comma-separated) and an optional key.
+    case join(String, key: String?)
     case part(channel: String, reason: String?)
     /// Open a private conversation, optionally sending a first message.
     case query(nick: String, text: String?)
@@ -34,12 +35,11 @@ enum Composer {
         case "me":
             return rest.isEmpty ? .invalid("Usage: /me <action>") : .action(rest)
         case "join", "j":
-            guard let first else { return .invalid("Usage: /join <#channel>") }
-            // `/j foo` means #foo, as in most clients.
-            let channels = first.split(separator: ",").map { name in
-                channelPrefixes.contains(name.first!) ? String(name) : "#" + name
-            }
-            return .join(channels.joined(separator: ","))
+            guard let first else { return .invalid("Usage: /join <#channel> [key]") }
+            let channels = withHashes(first)
+            // The key is one word; anything after it is ignored.
+            let key = remainder.flatMap { splitWord($0).0 }
+            return .join(channels, key: key)
         case "part", "p", "leave":
             if let first, channelPrefixes.contains(first.first!) {
                 return .part(channel: first, reason: remainder)
@@ -61,6 +61,13 @@ enum Composer {
             // Anything else goes to the server as is: /whois, /nick, /away, …
             return .raw(rest.isEmpty ? command.uppercased() : "\(command.uppercased()) \(rest)")
         }
+    }
+
+    /// `/j foo` means #foo, as in most clients.
+    static func withHashes(_ names: String) -> String {
+        names.split(separator: ",").map { name in
+            channelPrefixes.contains(name.first!) ? String(name) : "#" + name
+        }.joined(separator: ",")
     }
 
     /// The first word and what follows it (nil if nothing does).
