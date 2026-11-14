@@ -1,8 +1,9 @@
 import BackroomCore
 import Foundation
 
-/// What a buffer's message list shows: messages, joins and parts (alone,
-/// folded into runs or hidden) and a separator where the day changes.
+/// What a buffer's message list shows: messages, joins, parts and quits
+/// (alone, folded into runs or hidden), a separator where the day changes
+/// and the New line. Ignored people's messages are left out.
 enum TimelineItem: Identifiable, Equatable {
     /// `continued`: the previous line is a message from the same sender,
     /// so the nick can be left out.
@@ -26,7 +27,7 @@ enum TimelineItem: Identifiable, Equatable {
 
     static func build(
         _ messages: [ChatMessage], presence: PresenceStyle = .fold, unreadAfter: Date? = nil,
-        calendar: Calendar = .current
+        isIgnored: (String) -> Bool = { _ in false }, calendar: Calendar = .current
     ) -> [TimelineItem] {
         var lineDue = unreadAfter != nil
         var items: [TimelineItem] = []
@@ -40,7 +41,7 @@ enum TimelineItem: Identifiable, Equatable {
             run = []
         }
 
-        for message in messages {
+        for message in messages where message.own || !isIgnored(message.sender) {
             let start = calendar.startOfDay(for: message.time)
             if start != day {
                 flush()
@@ -55,7 +56,7 @@ enum TimelineItem: Identifiable, Equatable {
                 lineDue = false
                 previous = nil
             }
-            if message.kind == .join || message.kind == .part {
+            if message.kind.isPresence {
                 switch presence {
                 case .hide: continue
                 case .fold: run.append(message)
@@ -91,7 +92,10 @@ enum TimelineItem: Identifiable, Equatable {
             return names.prefix(shown).joined(separator: ", ") + " and \(names.count - shown) others"
         }
         var parts: [String] = []
-        let joined = names(.join), left = names(.part)
+        let joined = names(.join)
+        var seen = Set<String>()
+        let left = run.filter { $0.kind == .part || $0.kind == .quit }.map(\.sender)
+            .filter { seen.insert($0.lowercased()).inserted }
         if !joined.isEmpty { parts.append("→ \(list(joined)) joined") }
         if !left.isEmpty { parts.append("← \(list(left)) left") }
         return parts.joined(separator: " · ")

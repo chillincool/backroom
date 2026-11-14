@@ -21,6 +21,8 @@ struct ContentView: View {
             }
         }
         .environment(\.theme, prefs.theme(dark: colorScheme == .dark))
+        .onChange(of: prefs.highlightWords) { model.refreshMentions() }
+        .onChange(of: prefs.ignored) { model.refreshMentions() }
     }
 }
 

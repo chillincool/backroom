@@ -27,7 +27,9 @@ use chrono::{DateTime, Utc};
 use tokio::sync::mpsc;
 
 use crate::auth::CredentialProvider;
-use crate::model::{BufferKind, ChannelListing, ChatMessage, Member, NetworkId, NetworkInfo};
+use crate::model::{
+    BufferKind, ChannelListing, ChatMessage, Member, NetworkId, NetworkInfo, WhoisInfo,
+};
 use crate::transport::Connector;
 
 #[derive(Clone)]
@@ -157,6 +159,21 @@ pub enum Event {
         network: NetworkId,
         channels: Vec<ChannelListing>,
         done: bool,
+    },
+    /// Our nick on a network: after registering and whenever it changes.
+    OwnNick {
+        network: NetworkId,
+        nick: String,
+    },
+    /// Whether we're marked away on a network (`RPL_NOWAWAY`/`RPL_UNAWAY`).
+    Away {
+        network: NetworkId,
+        away: bool,
+    },
+    /// A complete WHOIS reply.
+    Whois {
+        network: NetworkId,
+        info: WhoisInfo,
     },
     /// Something failed that the user may want to see, e.g. a `FAIL` reply
     /// or a command for a disconnected network.

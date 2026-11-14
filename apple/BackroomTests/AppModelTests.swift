@@ -321,6 +321,65 @@ let net = Network(id: "1", name: "libera", upstreamState: "connected", attribute
         #expect(model.selection == BufferID(network: "1", name: "#secret"))
     }
 
+    @Test func mentionsCountOurNickAndHighlightWords() async {
+        let (model, _) = await makeModel()
+        model.preferences.highlightWords = ["backroom"]
+        model.apply(.networkUpdated(network: net))
+        model.apply(.ownNick(network: "1", nick: "chris"))
+        for (i, text) in ["hi Chris!", "chrissy is here", "try backroom", "nothing", "@chris: ping"].enumerated() {
+            model.apply(.message(network: "1", buffer: "#b", message: msg(text, at: TimeInterval(i))))
+        }
+        let buffer = model.buffers[BufferID(network: "1", name: "#b")]!
+        #expect(buffer.unread == 5)
+        #expect(buffer.unreadMentions == 3)
+        // Private messages always count.
+        model.apply(.message(network: "1", buffer: "bob", message: msg("hey", at: 9, from: "bob")))
+        #expect(model.buffers[BufferID(network: "1", name: "bob")]?.unreadMentions == 1)
+    }
+
+    @Test func ignoredPeopleDontCount() async {
+        let (model, _) = await makeModel()
+        model.apply(.networkUpdated(network: net))
+        model.apply(.bufferAdded(network: "1", name: "*", kind: .server))
+        model.select(BufferID(network: "1", name: "*"))
+        #expect(model.send("/ignore Spammer"))
+        model.apply(.message(network: "1", buffer: "#b", message: msg("buy now", at: 1, from: "spammer")))
+        #expect(model.buffers[BufferID(network: "1", name: "#b")]?.unread == 0)
+        #expect(model.send("/unignore spammer"))
+        #expect(model.buffers[BufferID(network: "1", name: "#b")]?.unread == 1)
+    }
+
+    @Test func nickAwayAndWhoisEvents() async {
+        let (model, _) = await makeModel()
+        model.apply(.networkUpdated(network: net))
+        model.apply(.ownNick(network: "1", nick: "me"))
+        model.apply(.away(network: "1", away: true))
+        #expect(model.networks[0].nick == "me")
+        #expect(model.networks[0].away)
+        let info = WhoisInfo(
+            nick: "bob", user: nil, host: nil, realname: nil, server: nil, serverInfo: nil, account: nil,
+            channels: [], idle: nil, signon: nil, away: nil, operator: false, secure: false, other: [])
+        model.apply(.whois(network: "1", info: info))
+        #expect(model.sheet == .whois(network: "1", info: info))
+    }
+
+    @Test func composerActionsForBuffers() async {
+        let (model, client) = await makeModel()
+        model.apply(.networkUpdated(network: net))
+        model.apply(.bufferAdded(network: "1", name: "#b", kind: .channel))
+        let id = BufferID(network: "1", name: "#b")
+        model.select(id)
+        model.apply(.message(network: "1", buffer: "#b", message: msg("hi", at: 1)))
+        #expect(model.send("/clear"))
+        #expect(model.buffers[id]?.messages.isEmpty == true)
+        #expect(model.send("/list"))
+        #expect(model.sheet == .browseChannels(network: "1"))
+        #expect(model.send("/cycle"))
+        #expect(client.calls.suffix(2) == ["part 1 #b -", "join 1 #b"])
+        #expect(model.send("/op alice"))
+        #expect(client.calls.last == "raw 1 MODE #b +o alice")
+    }
+
     @Test func serverBufferRejectsMessages() async {
         let (model, client) = await makeModel()
         model.apply(.networkUpdated(network: net))
@@ -345,7 +404,7 @@ let net = Network(id: "1", name: "libera", upstreamState: "connected", attribute
         model.apply(.bufferAdded(network: "1", name: "#b", kind: .channel))
         let id = BufferID(network: "1", name: "#b")
         model.apply(.members(network: "1", channel: "#B", members: [
-            Member(nick: "op", prefix: "@"), Member(nick: "alice", prefix: ""),
+            Member(nick: "op", prefix: "@", away: false), Member(nick: "alice", prefix: "", away: false),
         ]))
         #expect(model.buffers[id]?.members.map(\.nick) == ["op", "alice"])
 
@@ -399,9 +458,117 @@ let net = Network(id: "1", name: "libera", upstreamState: "connected", attribute
         await second.start()
         second.apply(.networkUpdated(network: net))
         second.apply(.bufferAdded(network: "1", name: "#a", kind: .channel))
-        #expect(second.selection == nil)
-        second.apply(.bufferAdded(network: "1", name: "#B", kind: .channel))
+        // The pane remembers #b and shows it once it exists again.
         #expect(second.selection == BufferID(network: "1", name: "#b"))
+        #expect(second.selectedBuffer == nil)
+        second.apply(.bufferAdded(network: "1", name: "#B", kind: .channel))
+        #expect(second.selectedBuffer?.name == "#B")
+        #expect(client.calls.contains("history 1 #B latest"))
+    }
+
+    @Test func panesSplitShowAndClose() async {
+        let (model, client) = await makeModel()
+        model.apply(.networkUpdated(network: net))
+        for name in ["#a", "#b", "#c"] { model.apply(.bufferAdded(network: "1", name: name, kind: .channel)) }
+        let (a, b, c) = (BufferID(network: "1", name: "#a"), BufferID(network: "1", name: "#b"), BufferID(network: "1", name: "#c"))
+        model.select(a)
+        let first = model.layout.focused
+
+        // A split shows the same buffer until another is picked.
+        model.split(.horizontal)
+        #expect(model.layout.panes.map(\.buffer) == [a, a])
+        model.select(b)
+        #expect(model.layout.panes.map(\.buffer) == [a, b])
+        model.split(.vertical, showing: c)
+        #expect(model.layout.panes.map(\.buffer) == [a, b, c])
+        #expect(model.selection == c)
+
+        // Messages in any visible pane are read at once.
+        model.apply(.message(network: "1", buffer: "#a", message: msg("hi", at: 50)))
+        #expect(client.calls.last == "read 1 #a 50")
+
+        model.moveFocus(.up)
+        #expect(model.selection == b)
+        model.moveFocus(.left)
+        #expect(model.layout.focused == first)
+        model.moveFocus(.left)
+        #expect(model.layout.focused == first, "nothing further left")
+
+        // Leaving a channel: its pane falls back to a recent conversation.
+        model.apply(.bufferRemoved(network: "1", name: "#c"))
+        #expect(!model.layout.panes.contains { $0.buffer == c })
+
+        let focused = model.layout.focused
+        model.closeOtherPanes()
+        #expect(model.layout.panes.map(\.id) == [focused])
+        model.split(.horizontal)
+        model.closePane()
+        #expect(model.layout.panes.count == 1)
+        model.closePane()
+        #expect(model.layout.panes.count == 1, "the last pane stays")
+    }
+
+    @Test func tabsKeepTheirOwnLayouts() async {
+        let defaults = UserDefaults(suiteName: "backroom-tests-\(UUID().uuidString)")!
+        let client = FakeClient()
+        client.loggedIn = true
+        let model = AppModel(settings: .e2e, authenticator: FakeAuthenticator(), defaults: defaults, makeClient: { _ in client })
+        await model.start()
+        model.apply(.networkUpdated(network: net))
+        for name in ["#a", "#b"] { model.apply(.bufferAdded(network: "1", name: name, kind: .channel)) }
+        let (a, b) = (BufferID(network: "1", name: "#a"), BufferID(network: "1", name: "#b"))
+        model.select(a)
+        let first = model.currentTab
+
+        model.newTab()
+        #expect(model.tabs.count == 2)
+        #expect(model.selection == a, "a new tab shows the current conversation")
+        model.select(b)
+        model.split(.horizontal, showing: a)
+        #expect(model.tabTitle(model.tabs[1]) == "#b, #a")
+        model.showTab(first)
+        #expect(model.layout.panes.map(\.buffer) == [a])
+
+        // Only the current tab's panes are read; others show unread.
+        model.apply(.message(network: "1", buffer: "#b", message: msg("hi", at: 70)))
+        #expect(model.tabUnread(model.tabs[1]).all == 1)
+        model.cycleTab(by: 1)
+        #expect(model.buffers[b]?.unread == 0)
+
+        model.renameTab(model.currentTab, to: "  work ")
+        #expect(model.tabTitle(model.tabs[1]) == "work")
+
+        // Restored on the next launch.
+        let again = AppModel(settings: .e2e, authenticator: FakeAuthenticator(), defaults: defaults, makeClient: { _ in client })
+        #expect(again.tabs.map(\.name) == [nil, "work"])
+        #expect(again.currentTab == model.currentTab)
+
+        // ⌘W: panes first, then the tab, never the last tab.
+        model.closePane()
+        model.closePane()
+        #expect(model.tabs.count == 1)
+        #expect(model.currentTab == first)
+        #expect(!model.canClosePane)
+    }
+
+    @Test func layoutTreeOperations() {
+        let x = BufferID(network: "1", name: "#x")
+        var layout = PaneLayout(buffer: x)
+        let one = layout.focused
+        let two = layout.split(one, axis: .horizontal, buffer: x)
+        let three = layout.split(two, axis: .horizontal, buffer: x)
+        // Same-direction splits share one level rather than nesting.
+        guard case .split(let split) = layout.root else { Issue.record("\(layout)"); return }
+        #expect(split.children.count == 3)
+        #expect(split.fractions == [0.5, 0.25, 0.25])
+        layout.close(two)
+        guard case .split(let after) = layout.root else { Issue.record("\(layout)"); return }
+        #expect(after.fractions.reduce(0, +) == 1)
+        #expect(layout.panes.map(\.id) == [one, three])
+        layout.close(three)
+        #expect(layout.root == .pane(Pane(id: one, buffer: x)), "a split with one child collapses")
+        let data = try! JSONEncoder().encode(layout)
+        #expect(try! JSONDecoder().decode(PaneLayout.self, from: data) == layout)
     }
 
     @Test func removingANetworkDropsItsBuffers() async {

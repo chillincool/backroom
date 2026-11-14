@@ -7,18 +7,29 @@ use chrono::{DateTime, Utc};
 use tokio::sync::mpsc;
 
 use super::connection::{self, ConnId, FromConn, FromConnTx, ToConn};
-use super::members::Members;
+use super::members::{Members, WHO_TOKEN};
 use super::{Command, ConnectionState, Event, SessionConfig};
 use crate::batch::Batch;
 use crate::bouncer::{NetworkUpdate, parse_network_message};
 use crate::client::Incoming;
 use crate::model::{
     BufferKind, ChannelListing, ChatMessage, MessageKind, NetworkId, NetworkInfo, RouteContext,
-    SERVER_BUFFER, buffer_key, irc_timestamp, route,
+    SERVER_BUFFER, WhoisInfo, buffer_key, irc_timestamp, quit_or_nick, route, route_reply,
 };
 use crate::proto::Message;
 use crate::proto::message::escape_tag_value;
 use crate::session::Registered;
+
+/// Messages fetched to check whether a correspondent from TARGETS ever
+/// sent more than notices.
+const PROBE_LIMIT: usize = 50;
+
+/// A CTCP request other than ACTION (VERSION, PING, …): not conversation.
+fn is_ctcp_query(msg: &Message) -> bool {
+    msg.param(1)
+        .and_then(|t| t.strip_prefix('\u{1}'))
+        .is_some_and(|t| !t.starts_with("ACTION"))
+}
 
 /// `RPL_LIST` entries per [`Event::ChannelList`]: few enough events for
 /// a 50,000-channel network, each small enough to apply quickly.
@@ -65,6 +76,17 @@ struct Network {
     members: Members,
     /// `RPL_LIST` entries not yet sent to the front end.
     channel_list: Vec<ChannelListing>,
+    /// ISUPPORT `WHOX`: WHO can ask for just the fields we need.
+    whox: bool,
+    /// Channels (keys) we sent a WHO for on this connection, to learn who's
+    /// away, and those whose replies are still coming (not shown).
+    who_requested: HashSet<String>,
+    who_pending: HashSet<String>,
+    /// WHOIS replies being collected, by nick key.
+    whois: HashMap<String, WhoisInfo>,
+    /// Correspondents from CHATHISTORY TARGETS whose recent history we're
+    /// checking for real messages (keys).
+    probing: HashSet<String>,
 }
 
 impl Network {
@@ -79,6 +101,7 @@ impl Network {
                 self.history_max = value.and_then(|v| v.parse().ok()).filter(|&n| n > 0);
             }
             "PREFIX" | "CHANMODES" => self.members.set_isupport(key, value),
+            "WHOX" => self.whox = value.is_some(),
             _ => {}
         }
     }
@@ -390,6 +413,11 @@ impl Coordinator {
                                 requested_joins: HashSet::new(),
                                 members: Members::new(&BTreeMap::new()),
                                 channel_list: Vec::new(),
+                                whox: false,
+                                who_requested: HashSet::new(),
+                                who_pending: HashSet::new(),
+                                whois: HashMap::new(),
+                                probing: HashSet::new(),
                             },
                         );
                         info
@@ -414,6 +442,11 @@ impl Coordinator {
         net.nick = reg.nick;
         net.caps = reg.enabled_caps;
         net.members = Members::new(&reg.isupport);
+        net.who_requested.clear();
+        net.who_pending.clear();
+        net.whois.clear();
+        net.probing.clear();
+        net.whox = false;
         for (key, value) in &reg.isupport {
             net.set_isupport(key, Some(value));
         }
@@ -433,32 +466,66 @@ impl Coordinator {
         // Every network has a server buffer, even before the server says
         // anything, so front ends always have somewhere to type commands.
         self.ensure_buffer(id, SERVER_BUFFER, BufferKind::Server);
+        if let Some(net) = self.networks.get(id) {
+            self.emit(Event::OwnNick {
+                network: id.to_owned(),
+                nick: net.nick.clone(),
+            });
+        }
     }
 
     fn batch(&mut self, id: &str, batch: Batch) {
         match batch.kind.as_str() {
             "draft/chathistory-targets" => {
+                let Some(net) = self.networks.get_mut(id) else {
+                    return;
+                };
                 for msg in &batch.messages {
                     // CHATHISTORY TARGETS <target> <latest timestamp>
                     // Only private conversations: channel buffers come from
-                    // JOINs, so channels we've left don't come back.
+                    // JOINs, so channels we've left don't come back. soju
+                    // also lists everyone who only sent us notices (network
+                    // announcements, services), so check the latest messages
+                    // first; the buffer appears if there's a real one.
                     if msg.command == "CHATHISTORY"
                         && msg.param(0) == Some("TARGETS")
                         && let Some(target) = msg.param(1)
-                        && self
-                            .networks
-                            .get(id)
-                            .is_some_and(|net| !net.ctx().is_channel(target))
+                        && !net.ctx().is_channel(target)
+                        && !net.buffers.contains_key(&buffer_key(target))
+                        && net.probing.insert(buffer_key(target))
                     {
-                        self.ensure_buffer(id, target, BufferKind::Query);
+                        let probe = Message::new(
+                            "CHATHISTORY",
+                            [
+                                "LATEST".into(),
+                                target.to_owned(),
+                                "*".into(),
+                                PROBE_LIMIT.to_string(),
+                            ],
+                        );
+                        let _ = net.conn.send(ToConn::Send(probe));
                     }
                 }
             }
             "chathistory" => {
-                let Some(net) = self.networks.get(id) else {
+                let Some(target) = batch.params.first() else {
                     return;
                 };
-                let Some(target) = batch.params.first() else {
+                if self
+                    .networks
+                    .get_mut(id)
+                    .is_some_and(|net| net.probing.remove(&buffer_key(target)))
+                {
+                    let real = batch
+                        .messages
+                        .iter()
+                        .any(|m| m.command == "PRIVMSG" && !is_ctcp_query(m));
+                    if real {
+                        self.ensure_buffer(id, target, BufferKind::Query);
+                    }
+                    return;
+                }
+                let Some(net) = self.networks.get(id) else {
                     return;
                 };
                 let ctx = net.ctx();
@@ -493,9 +560,27 @@ impl Coordinator {
         let Some(net) = self.networks.get_mut(id) else {
             return;
         };
+        // Where a QUIT or NICK shows: the channels they shared with us (known
+        // only before the member lists are updated) and our conversation.
+        let fan_out = quit_or_nick(msg, &net.ctx()).map(|chat| {
+            let mut buffers = net.members.channels_of(&chat.sender);
+            if net.buffers.get(&buffer_key(&chat.sender)) == Some(&BufferKind::Query) {
+                buffers.push(chat.sender.clone());
+            }
+            (chat, buffers)
+        });
         let changed = net.members.apply(msg, &net.nick);
         let left = left_channel(msg, &net.nick);
         self.dispatch(id, msg);
+        if let Some((chat, buffers)) = fan_out {
+            for buffer in buffers {
+                self.emit(Event::Message {
+                    network: id.to_owned(),
+                    buffer,
+                    message: chat.clone(),
+                });
+            }
+        }
         for channel in changed {
             let members = match self.networks.get(id) {
                 Some(net) => net.members.list(&channel),
@@ -522,6 +607,10 @@ impl Coordinator {
                     && let Some(new) = msg.param(0)
                 {
                     net.nick = new.to_owned();
+                    self.emit(Event::OwnNick {
+                        network: id.to_owned(),
+                        nick: new.to_owned(),
+                    });
                 }
             }
             "MARKREAD" => {
@@ -557,6 +646,60 @@ impl Coordinator {
             "323" => self.flush_channel_list(id, true),
             // RPL_LISTSTART: nothing to do.
             "321" => {}
+            // Handled by the member lists, or noise after joining: names,
+            // topic setter, creation time, channel modes.
+            "353" | "333" | "329" | "324" => {}
+            // RPL_ENDOFNAMES: the list is complete; learn who's away.
+            "366" => {
+                if let Some(chan) = msg.param(1) {
+                    self.request_who(id, chan);
+                }
+            }
+            // WHO replies we asked for aren't shown.
+            "352" | "315" if self.who_pending(id, msg.param(1)) => {
+                if msg.command == "315"
+                    && let (Some(net), Some(chan)) = (self.networks.get_mut(id), msg.param(1))
+                {
+                    net.who_pending.remove(&buffer_key(chan));
+                }
+            }
+            "354" if msg.param(1) == Some(WHO_TOKEN) => {}
+            // RPL_UNAWAY, RPL_NOWAWAY
+            "305" | "306" => {
+                self.emit(Event::Away {
+                    network: id.to_owned(),
+                    away: msg.command == "306",
+                });
+                self.reply(id, msg);
+            }
+            // RPL_WHOISUSER starts a WHOIS; RPL_ENDOFWHOIS ends it.
+            "311" => {
+                if let (Some(net), Some(nick)) = (self.networks.get_mut(id), msg.param(1)) {
+                    net.whois.insert(
+                        buffer_key(nick),
+                        WhoisInfo {
+                            nick: nick.to_owned(),
+                            user: msg.param(2).map(str::to_owned),
+                            host: msg.param(3).map(str::to_owned),
+                            realname: msg.params.last().cloned(),
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+            "318" => {
+                let info = msg.param(1).and_then(|nick| {
+                    self.networks
+                        .get_mut(id)
+                        .and_then(|net| net.whois.remove(&buffer_key(nick)))
+                });
+                if let Some(info) = info {
+                    self.emit(Event::Whois {
+                        network: id.to_owned(),
+                        info,
+                    });
+                }
+            }
             // RPL_TOPIC <me> <channel> :<topic>, RPL_NOTOPIC <me> <channel> :…
             "332" | "331" => {
                 if let Some(channel) = msg.param(1) {
@@ -593,8 +736,123 @@ impl Coordinator {
                     }
                 }
             }
+            // Any other numeric: part of a WHOIS, or a reply to show.
+            code if code.len() == 3 && code.bytes().all(|b| b.is_ascii_digit()) => {
+                if !self.whois_line(id, msg) {
+                    self.reply(id, msg);
+                }
+            }
             _ => self.live(id, msg),
         }
+    }
+
+    /// Asks who's away in a channel we just joined: once per connection,
+    /// only with `away-notify` (so it stays current) and not for big
+    /// channels, where the reply would be thousands of lines.
+    fn request_who(&mut self, id: &str, chan: &str) {
+        const WHO_LIMIT: usize = 500;
+        let Some(net) = self.networks.get_mut(id) else {
+            return;
+        };
+        let key = buffer_key(chan);
+        if !net.caps.contains("away-notify")
+            || net.members.count(chan) > WHO_LIMIT
+            || !net.who_requested.insert(key.clone())
+        {
+            return;
+        }
+        net.who_pending.insert(key);
+        let msg = if net.whox {
+            Message::new("WHO", [chan.to_owned(), format!("%tcnf,{WHO_TOKEN}")])
+        } else {
+            Message::new("WHO", [chan])
+        };
+        let _ = net.conn.send(ToConn::Send(msg));
+    }
+
+    fn who_pending(&self, id: &str, chan: Option<&str>) -> bool {
+        match (self.networks.get(id), chan) {
+            (Some(net), Some(chan)) => net.who_pending.contains(&buffer_key(chan)),
+            _ => false,
+        }
+    }
+
+    /// Adds a WHOIS numeric to the reply being collected. False if there
+    /// is none for that nick (e.g. `RPL_AWAY` after messaging someone).
+    fn whois_line(&mut self, id: &str, msg: &Message) -> bool {
+        let Some(net) = self.networks.get_mut(id) else {
+            return false;
+        };
+        let Some(info) = msg.param(1).and_then(|n| net.whois.get_mut(&buffer_key(n))) else {
+            return false;
+        };
+        let last = msg.params.last().cloned().unwrap_or_default();
+        match msg.command.as_str() {
+            // <me> <nick> <server> :<info>
+            "312" => {
+                info.server = msg.param(2).map(str::to_owned);
+                info.server_info = Some(last);
+            }
+            "313" => info.operator = true,
+            // <me> <nick> <idle> <signon> :seconds idle, signon time
+            "317" => {
+                info.idle_secs = msg.param(2).and_then(|s| s.parse().ok());
+                info.signon = msg
+                    .param(3)
+                    .and_then(|s| s.parse().ok())
+                    .and_then(|t| DateTime::from_timestamp(t, 0));
+            }
+            "319" => info
+                .channels
+                .extend(last.split_whitespace().map(str::to_owned)),
+            "301" => info.away = Some(last),
+            // <me> <nick> <account> :is logged in as
+            "330" => info.account = msg.param(2).map(str::to_owned),
+            "671" => info.secure = true,
+            _ => {
+                let middle = msg
+                    .params
+                    .get(2..msg.params.len().saturating_sub(1))
+                    .unwrap_or(&[]);
+                info.other.push(if middle.is_empty() {
+                    last
+                } else {
+                    format!("{} {last}", middle.join(" "))
+                });
+            }
+        }
+        true
+    }
+
+    /// Shows a numeric reply: errors about a channel or conversation there,
+    /// `RPL_AWAY` in the conversation with that person, the rest in the
+    /// server buffer.
+    fn reply(&mut self, id: &str, msg: &Message) {
+        let Some(net) = self.networks.get(id) else {
+            return;
+        };
+        let has_buffer = |name: &str| net.buffers.get(&buffer_key(name)).copied();
+        let Some((mut buffer, mut kind, mut chat)) = route_reply(msg, has_buffer) else {
+            return;
+        };
+        // RPL_AWAY <me> <nick> :<message>, after we messaged them.
+        if msg.command == "301"
+            && let Some(nick) = msg.param(1)
+            && net.buffers.get(&buffer_key(nick)) == Some(&BufferKind::Query)
+        {
+            buffer = nick.to_owned();
+            kind = BufferKind::Query;
+            chat.text = format!(
+                "{nick} is away: {}",
+                msg.params.last().map_or("", |s| s.as_str())
+            );
+        }
+        self.ensure_buffer(id, &buffer, kind);
+        self.emit(Event::Message {
+            network: id.to_owned(),
+            buffer,
+            message: chat,
+        });
     }
 
     fn flush_channel_list(&mut self, id: &str, done: bool) {
@@ -614,9 +872,18 @@ impl Coordinator {
         let Some(net) = self.networks.get(id) else {
             return;
         };
-        let Some((buffer, kind, message)) = route(msg, &net.ctx()) else {
+        let Some((mut buffer, mut kind, message)) = route(msg, &net.ctx()) else {
             return;
         };
+        // Notices to us (network announcements, services) go to the server
+        // buffer unless we're already talking with the sender.
+        if kind == BufferKind::Query
+            && message.kind == MessageKind::Notice
+            && !net.buffers.contains_key(&buffer_key(&buffer))
+        {
+            buffer = SERVER_BUFFER.to_owned();
+            kind = BufferKind::Server;
+        }
         let replayed_join = message.own
             && message.kind == MessageKind::Join
             && !self
@@ -823,18 +1090,56 @@ mod tests {
             Some("1".into()),
             FromConn::Incoming(Incoming::Batch(batch.clone())),
         );
-        let ev = h.events();
-        // Channels come from JOINs, so ones we've left don't come back.
-        assert!(
-            !ev.iter()
-                .any(|e| matches!(e, Event::BufferAdded { name, .. } if name == "#rust"))
+        // Channels come from JOINs, so ones we've left don't come back;
+        // correspondents are checked for real messages first.
+        assert!(h.events().is_empty());
+        assert_eq!(h.sent(Some("1")), ["CHATHISTORY LATEST alice * 50"]);
+        let history = |target: &str, lines: &[&str]| Batch {
+            kind: "chathistory".into(),
+            params: vec![target.into()],
+            tags: vec![],
+            messages: lines.iter().map(|l| Message::parse(l).unwrap()).collect(),
+            children: vec![],
+        };
+        h.c.on_connection(
+            Some("1".into()),
+            FromConn::Incoming(Incoming::Batch(history(
+                "alice",
+                &[":alice!u@h NOTICE me :hi", ":alice!u@h PRIVMSG me :hello"],
+            ))),
         );
-        assert!(ev.contains(&Event::BufferAdded {
-            network: "1".into(),
-            name: "alice".into(),
-            kind: BufferKind::Query
-        }));
+        assert_eq!(
+            h.events(),
+            [Event::BufferAdded {
+                network: "1".into(),
+                name: "alice".into(),
+                kind: BufferKind::Query
+            }]
+        );
         assert_eq!(h.sent(Some("1")), ["MARKREAD alice"]);
+
+        // Someone who only ever sent notices doesn't get a buffer.
+        batch.messages = vec![
+            Message::parse("CHATHISTORY TARGETS Global timestamp=2026-10-02T00:00:00.000Z")
+                .unwrap(),
+        ];
+        h.c.on_connection(
+            Some("1".into()),
+            FromConn::Incoming(Incoming::Batch(batch.clone())),
+        );
+        h.c.on_connection(
+            Some("1".into()),
+            FromConn::Incoming(Incoming::Batch(history(
+                "Global",
+                &[":Global!s@net NOTICE me :[Logon News] donate"],
+            ))),
+        );
+        assert!(h.events().is_empty());
+        batch.messages = vec![
+            Message::parse("CHATHISTORY TARGETS #rust timestamp=2026-10-01T00:00:00.000Z").unwrap(),
+            Message::parse("CHATHISTORY TARGETS alice timestamp=2026-10-02T00:00:00.000Z").unwrap(),
+        ];
+        h.sent(Some("1"));
 
         // Known buffers aren't announced twice.
         batch.messages.truncate(1);
@@ -888,11 +1193,13 @@ mod tests {
                 members: vec![
                     Member {
                         nick: "op".into(),
-                        prefix: "@".into()
+                        prefix: "@".into(),
+                        away: false,
                     },
                     Member {
                         nick: "me".into(),
-                        prefix: String::new()
+                        prefix: String::new(),
+                        away: false,
                     },
                 ],
             }),
@@ -1141,6 +1448,226 @@ mod tests {
         );
         // With echo-message, our own message arrives from the server instead.
         assert!(h.events().is_empty());
+    }
+
+    /// Messages emitted, as (buffer, kind, sender, text).
+    fn messages(ev: &[Event]) -> Vec<(String, MessageKind, String, String)> {
+        ev.iter()
+            .filter_map(|e| match e {
+                Event::Message {
+                    buffer, message, ..
+                } => Some((
+                    buffer.clone(),
+                    message.kind,
+                    message.sender.clone(),
+                    message.text.clone(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn joined_with(h: &mut Harness, chan: &str, names: &str) {
+        h.line(Some("1"), &format!(":me!u@h JOIN {chan}"));
+        h.line(Some("1"), &format!(":srv 353 me = {chan} :{names}"));
+        h.line(Some("1"), &format!(":srv 366 me {chan} :End"));
+    }
+
+    #[test]
+    fn quits_and_nick_changes_show_where_they_matter() {
+        let mut h = Harness::new();
+        h.connected_network(&[]);
+        joined_with(&mut h, "#a", "alice bob me");
+        joined_with(&mut h, "#b", "alice me");
+        h.line(Some("1"), ":alice!u@h PRIVMSG me :hi");
+        h.events();
+
+        h.line(Some("1"), ":alice!u@h NICK alicia");
+        assert_eq!(
+            messages(&h.events()),
+            [
+                (
+                    "#a".into(),
+                    MessageKind::Nick,
+                    "alice".into(),
+                    "alicia".into()
+                ),
+                (
+                    "#b".into(),
+                    MessageKind::Nick,
+                    "alice".into(),
+                    "alicia".into()
+                ),
+                (
+                    "alice".into(),
+                    MessageKind::Nick,
+                    "alice".into(),
+                    "alicia".into()
+                ),
+            ]
+        );
+        h.line(Some("1"), ":bob!u@h QUIT :Ping timeout");
+        assert_eq!(
+            messages(&h.events()),
+            [(
+                "#a".into(),
+                MessageKind::Quit,
+                "bob".into(),
+                "Ping timeout".into()
+            )]
+        );
+        // Our own nick change is announced to the front end.
+        h.line(Some("1"), ":me!u@h NICK me2");
+        assert!(h.events().contains(&Event::OwnNick {
+            network: "1".into(),
+            nick: "me2".into()
+        }));
+    }
+
+    #[test]
+    fn replies_go_to_the_server_buffer_and_errors_to_their_channel() {
+        let mut h = Harness::new();
+        h.connected_network(&[]);
+        joined_with(&mut h, "#a", "me");
+        h.events();
+        h.line(Some("1"), ":srv 404 me #a :Cannot send to channel");
+        h.line(Some("1"), ":srv 433 me * taken :Nickname is already in use");
+        h.line(Some("1"), ":srv 306 me :You have been marked as being away");
+        let ev = h.events();
+        assert_eq!(
+            messages(&ev),
+            [
+                (
+                    "#a".into(),
+                    MessageKind::Error,
+                    "srv".into(),
+                    "Cannot send to channel".into()
+                ),
+                (
+                    "*".into(),
+                    MessageKind::Error,
+                    "srv".into(),
+                    "taken: Nickname is already in use".into()
+                ),
+                (
+                    "*".into(),
+                    MessageKind::Reply,
+                    "srv".into(),
+                    "You have been marked as being away".into()
+                ),
+            ]
+        );
+        assert!(ev.contains(&Event::Away {
+            network: "1".into(),
+            away: true
+        }));
+        // NAMES and topic details after a join aren't shown.
+        h.line(Some("1"), ":srv 333 me #a op 1700000000");
+        assert!(messages(&h.events()).is_empty());
+    }
+
+    #[test]
+    fn whois_is_collected_into_one_event() {
+        let mut h = Harness::new();
+        h.connected_network(&[]);
+        for line in [
+            ":srv 311 me Bob bob host.example * :Bob Smith",
+            ":srv 312 me Bob irc.example :Example server",
+            ":srv 319 me Bob :@#ops #general",
+            ":srv 317 me Bob 120 1700000000 :seconds idle, signon time",
+            ":srv 301 me Bob :gone fishing",
+            ":srv 330 me Bob bobby :is logged in as",
+            ":srv 671 me Bob :is using a secure connection",
+            ":srv 338 me Bob 192.0.2.1 :actually using host",
+            ":srv 318 me Bob :End of /WHOIS list.",
+        ] {
+            h.line(Some("1"), line);
+        }
+        let ev = h.events();
+        assert_eq!(ev.len(), 1, "{ev:?}");
+        let Event::Whois { info, .. } = &ev[0] else {
+            panic!("{ev:?}")
+        };
+        assert_eq!(info.nick, "Bob");
+        assert_eq!(info.host.as_deref(), Some("host.example"));
+        assert_eq!(info.realname.as_deref(), Some("Bob Smith"));
+        assert_eq!(info.server.as_deref(), Some("irc.example"));
+        assert_eq!(info.channels, ["@#ops", "#general"]);
+        assert_eq!(info.idle_secs, Some(120));
+        assert_eq!(info.signon.map(|t| t.timestamp()), Some(1_700_000_000));
+        assert_eq!(info.away.as_deref(), Some("gone fishing"));
+        assert_eq!(info.account.as_deref(), Some("bobby"));
+        assert!(info.secure && !info.operator);
+        assert_eq!(info.other, ["192.0.2.1 actually using host"]);
+
+        // RPL_AWAY outside a WHOIS goes to the conversation.
+        h.line(Some("1"), ":alice!u@h PRIVMSG me :hi");
+        h.events();
+        h.line(Some("1"), ":srv 301 me alice :lunch");
+        assert_eq!(
+            messages(&h.events()),
+            [(
+                "alice".into(),
+                MessageKind::Reply,
+                "srv".into(),
+                "alice is away: lunch".into()
+            )]
+        );
+    }
+
+    #[test]
+    fn small_channels_get_a_quiet_who() {
+        let mut h = Harness::new();
+        h.connected_network(&["away-notify"]);
+        h.c.on_connection(
+            Some("1".into()),
+            FromConn::Incoming(Incoming::Message(
+                Message::parse(":srv 005 me WHOX :are supported").unwrap(),
+            )),
+        );
+        joined_with(&mut h, "#a", "alice me");
+        assert_eq!(h.sent(Some("1")), ["WHO #a %tcnf,273"]);
+        h.events();
+        h.line(Some("1"), ":srv 354 me 273 #a alice G");
+        h.line(Some("1"), ":srv 315 me #a :End of WHO list");
+        let ev = h.events();
+        assert!(messages(&ev).is_empty(), "WHO replies aren't shown: {ev:?}");
+        assert!(
+            ev.iter().any(|e| matches!(e,
+            Event::Members { members, .. } if members.iter().any(|m| m.nick == "alice" && m.away)))
+        );
+        // Once per connection.
+        joined_with(&mut h, "#a", "alice me");
+        assert!(!h.sent(Some("1")).iter().any(|l| l.starts_with("WHO")));
+    }
+
+    #[test]
+    fn notices_to_us_go_to_the_server_buffer() {
+        let mut h = Harness::new();
+        h.connected_network(&[]);
+        h.line(
+            Some("1"),
+            ":Global!services@net NOTICE me :[Logon News] hello",
+        );
+        let ev = h.events();
+        assert!(
+            !ev.iter()
+                .any(|e| matches!(e, Event::BufferAdded { name, .. } if name == "Global"))
+        );
+        assert_eq!(
+            messages(&ev),
+            [(
+                SERVER_BUFFER.into(),
+                MessageKind::Notice,
+                "Global".into(),
+                "[Logon News] hello".into()
+            )]
+        );
+        // Once we're talking, their notices stay in the conversation.
+        h.line(Some("1"), ":bob!u@h PRIVMSG me :hi");
+        h.line(Some("1"), ":bob!u@h NOTICE me :psst");
+        let ev = h.events();
+        assert_eq!(messages(&ev)[1].0, "bob");
     }
 
     #[test]

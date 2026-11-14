@@ -1,42 +1,41 @@
+import AppKit
 import BackroomCore
 import SwiftUI
 
 /// Sidebar, conversation and member list side by side under one full-width
-/// title bar. A plain split rather than `NavigationSplitView`, whose
-/// sidebar macOS 26 draws as a floating panel around the window buttons.
+/// title bar. Not `NavigationSplitView` (macOS 26 floats its sidebar around
+/// the window buttons) nor `HSplitView` (it re-measures the side panels
+/// whenever their content changes): the side panels keep the width the user
+/// dragged them to.
 struct MainView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.theme) private var theme
     @AppStorage("showMembers") private var showMembers = true
     @AppStorage("showSidebar") private var showSidebar = true
+    @AppStorage("sidebarWidth") private var sidebarWidth = 220.0
+    @AppStorage("membersWidth") private var membersWidth = 180.0
 
     var body: some View {
         @Bindable var model = model
         // Only channels have members; elsewhere the panel stays shut
         // without forgetting that it's wanted.
         let membersShown = showMembers && model.selectedBuffer?.kind == .channel
-        HSplitView {
+        HStack(spacing: 0) {
             if showSidebar {
                 SidebarView()
-                    .frame(minWidth: 170, idealWidth: 220, maxWidth: 360)
+                    .frame(width: sidebarWidth)
+                SplitDivider(width: $sidebarWidth, range: 150...420, edge: .leading)
             }
-            Group {
-                if let id = model.selection, model.buffers[id] != nil {
-                    BufferView(id: id)
-                        .id(id)
-                } else {
-                    ContentUnavailableView("No Conversation Selected", systemImage: "bubble.left")
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .background(theme.backgroundColor)
-                }
-            }
-            .frame(minWidth: 360, maxWidth: .infinity, maxHeight: .infinity)
+            PaneTreeView(node: model.layout.root)
+                .frame(minWidth: 320, maxWidth: .infinity, maxHeight: .infinity)
             if membersShown, let buffer = model.selectedBuffer {
+                SplitDivider(width: $membersWidth, range: 120...360, edge: .trailing)
                 MemberList(buffer: buffer)
-                    .frame(minWidth: 130, idealWidth: 180, maxWidth: 300)
+                    .frame(width: membersWidth)
             }
         }
         .sheet(item: $model.sheet) { SheetContent(sheet: $0) }
+        .navigationTitle(windowTitle)
         .toolbarBackground(theme.background == nil ? AnyShapeStyle(.bar) : AnyShapeStyle(theme.surfaceColor), for: .windowToolbar)
         .toolbar {
             ToolbarItem(placement: .navigation) {
@@ -47,7 +46,15 @@ struct MainView: View {
                 }
                 .help("Show or hide the sidebar")
                 .keyboardShortcut("s", modifiers: [.command, .control])
+                .buttonStyle(.borderless)
             }
+            .withoutGlass()
+            // Tabs, left in the title bar while there are several. No item
+            // gets macOS 26's glass bubble: the title bar stays flat.
+            ToolbarItem(placement: .navigation) {
+                if model.tabs.count > 1 { TabStrip() }
+            }
+            .withoutGlass()
             ToolbarItem {
                 Button {
                     showMembers.toggle()
@@ -56,15 +63,28 @@ struct MainView: View {
                 }
                 .help("Show or hide the member list")
                 .disabled(model.selectedBuffer?.kind != .channel)
+                .buttonStyle(.borderless)
             }
+            .withoutGlass()
             ToolbarItem {
                 Menu {
                     Button("Log Out", role: .destructive) { model.logOut() }
                 } label: {
                     Label("Account", systemImage: "person.crop.circle")
                 }
+                .menuStyle(.borderlessButton)
             }
+            .withoutGlass()
         }
+    }
+}
+
+extension MainView {
+    /// The focused pane's conversation; nothing while the tabs say it.
+    private var windowTitle: String {
+        guard model.tabs.count < 2 else { return "" }
+        guard let buffer = model.selectedBuffer else { return "Backroom" }
+        return buffer.kind == .server ? model.networkName(buffer.id.network) : buffer.name
     }
 }
 
@@ -173,6 +193,9 @@ struct NetworkGroup: View {
                     BufferRow(buffer: buffer)
                         .tag(id)
                         .contextMenu {
+                            Button("Open in Split Right") { model.split(.horizontal, showing: id) }
+                            Button("Open in Split Down") { model.split(.vertical, showing: id) }
+                            Divider()
                             Button("Mark as Read") { model.markRead(id) }
                                 .disabled(buffer.unread == 0)
                             Divider()
@@ -183,10 +206,10 @@ struct NetworkGroup: View {
                 }
             }
         } label: {
-            let unread = isExpanded
-                ? server.flatMap { model.buffers[$0]?.unread } ?? 0
-                : network.buffers.reduce(0) { $0 + (model.buffers[$1]?.unread ?? 0) }
-            let row = NetworkRow(network: network, unread: unread)
+            let counted = isExpanded ? (server.map { [$0] } ?? []) : network.buffers
+            let unread = counted.reduce(0) { $0 + (model.buffers[$1]?.unread ?? 0) }
+            let mentions = counted.reduce(0) { $0 + (model.buffers[$1]?.unreadMentions ?? 0) }
+            let row = NetworkRow(network: network, unread: unread, mentions: mentions)
                 .contextMenu {
                     let connected = network.connection.isConnected
                     Button("Join Channel…") { model.sheet = .joinChannel(network: network.id) }
@@ -195,6 +218,11 @@ struct NetworkGroup: View {
                         .disabled(!connected)
                     Button("New Conversation…") { model.sheet = .newConversation(network: network.id) }
                         .disabled(!connected)
+                    Divider()
+                    Button(network.away ? "Set Back" : "Set Away") {
+                        model.setAway(network: network.id, away: !network.away)
+                    }
+                    .disabled(!connected)
                     Divider()
                     Button("Edit Network…") { editing = true }
                     Divider()
@@ -219,6 +247,7 @@ struct NetworkRow: View {
     @Environment(\.theme) private var theme
     let network: NetworkState
     let unread: Int
+    let mentions: Int
 
     var body: some View {
         HStack {
@@ -228,12 +257,17 @@ struct NetworkRow: View {
                 .fontWeight(.semibold)
                 .lineLimit(1)
             Spacer()
+            if network.away {
+                Image(systemName: "moon.fill")
+                    .foregroundStyle(theme.mutedColor)
+                    .help("You're marked away")
+            }
             if !network.connection.isConnected {
                 Image(systemName: "exclamationmark.circle")
                     .foregroundStyle(.orange)
                     .help(network.connection.summary)
             }
-            UnreadBadge(count: unread)
+            UnreadBadge(count: unread, mentions: mentions)
         }
         .help(network.connection.summary)
     }
@@ -251,14 +285,17 @@ struct BufferRow: View {
             Text(buffer.name)
                 .fontWeight(unread > 0 ? .semibold : .regular)
                 .lineLimit(1)
+                .help(buffer.name)
             Spacer()
-            UnreadBadge(count: unread)
+            UnreadBadge(count: unread, mentions: buffer.unreadMentions)
         }
     }
 }
 
+/// Unread count; red when something mentions you or is a private message.
 struct UnreadBadge: View {
     let count: Int
+    var mentions = 0
 
     var body: some View {
         if count > 0 {
@@ -266,8 +303,56 @@ struct UnreadBadge: View {
                 .font(.caption.monospacedDigit())
                 .padding(.horizontal, 6)
                 .padding(.vertical, 1)
-                .background(Capsule().fill(.tint))
+                .background(Capsule().fill(mentions > 0 ? AnyShapeStyle(Color.red) : AnyShapeStyle(.tint)))
                 .foregroundStyle(.white)
+                .help(mentions > 0 ? "\(count) unread, \(mentions) for you" : "\(count) unread")
+        }
+    }
+}
+
+/// A draggable line that sets the width of the panel on its `edge` side.
+struct SplitDivider: View {
+    @Binding var width: Double
+    let range: ClosedRange<Double>
+    /// Which side the panel is on: dragging towards it narrows it.
+    let edge: HorizontalEdge
+    @State private var start: Double?
+
+    var body: some View {
+        Rectangle()
+            .fill(Color(nsColor: .separatorColor))
+            .frame(width: 1)
+            // A wider grab area than the visible line.
+            .overlay {
+                Color.clear
+                    .frame(width: 9)
+                    .contentShape(Rectangle())
+                    .onHover { inside in
+                        if inside { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
+                    }
+                    .gesture(
+                        DragGesture(minimumDistance: 1, coordinateSpace: .global)
+                            .onChanged { drag in
+                                let base = start ?? width
+                                start = base
+                                let delta = edge == .leading ? drag.translation.width : -drag.translation.width
+                                width = min(max(base + delta, range.lowerBound), range.upperBound)
+                            }
+                            .onEnded { _ in start = nil }
+                    )
+            }
+            .zIndex(1)
+    }
+}
+
+extension ToolbarContent {
+    /// macOS 26 draws a shared glass background behind toolbar items; this
+    /// leaves the item on the plain title bar.
+    @ToolbarContentBuilder func withoutGlass() -> some ToolbarContent {
+        if #available(macOS 26, *) {
+            sharedBackgroundVisibility(.hidden)
+        } else {
+            self
         }
     }
 }

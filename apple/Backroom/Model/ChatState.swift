@@ -3,7 +3,7 @@ import Foundation
 import Observation
 
 /// A buffer is identified by its network and case-folded name.
-struct BufferID: Hashable, Sendable {
+struct BufferID: Hashable, Sendable, Codable {
     let network: String
     let key: String
 
@@ -31,16 +31,20 @@ final class BufferModel: Identifiable {
     var historyLoading = false
     /// The server has no older messages.
     var historyExhausted = false
+    /// The user cleared the buffer (`/clear`); older history isn't loaded.
+    var cleared = false
     /// Channel topic, mIRC formatting included; nil if none.
     var topic: String?
-    /// The topic the user closed the banner on; it returns if the topic changes.
-    var dismissedTopic: String?
     /// Channel members, highest rank first.
     var members: [Member] = [] {
         didSet { prefixByNick = Dictionary(members.map { ($0.nick.lowercased(), $0.prefix) }) { a, _ in a } }
     }
     /// Membership prefix by case-folded nick, for colouring senders.
     private(set) var prefixByNick: [String: String] = [:]
+    /// Finds mentions of our nick and highlight words; set by `AppModel`.
+    var mentions = MentionMatcher()
+    /// Lines sent from this buffer's composer, oldest first, for ↑/↓.
+    @ObservationIgnored var sentHistory: [String] = []
 
     @ObservationIgnored private var knownIDs: Set<String> = []
 
@@ -51,13 +55,42 @@ final class BufferModel: Identifiable {
     }
 
     /// Messages from others after the read marker.
-    var unread: Int {
-        var count = 0
+    var unread: Int { unreadCounts.all }
+
+    /// Unread messages that mention us (every unread message in a private
+    /// conversation does).
+    var unreadMentions: Int { unreadCounts.mentions }
+
+    private var unreadCounts: (all: Int, mentions: Int) {
+        var all = 0, mentioned = 0
         for m in messages.reversed() {
             if let marker = readMarker, m.time <= marker { break }
-            if !m.own && m.kind.isChat { count += 1 }
+            guard !m.own, isChat(m), !mentions.isIgnored(m.sender) else { continue }
+            all += 1
+            if kind == .query || isMention(m) { mentioned += 1 }
         }
-        return count
+        return (all, mentioned)
+    }
+
+    /// Counts towards unread: chat, and invitations to us.
+    func isChat(_ m: ChatMessage) -> Bool {
+        m.kind.isChat || (m.kind == .invite && kind == .server)
+    }
+
+    /// Mentions our nick or a highlight word, or invites us.
+    func isMention(_ m: ChatMessage) -> Bool {
+        guard !m.own else { return false }
+        switch m.kind {
+        case .privmsg, .notice, .action: return mentions.matches(m.text)
+        case .invite: return kind == .server
+        default: return false
+        }
+    }
+
+    /// Forgets the messages shown so far, on this device only.
+    func clear() {
+        messages = []
+        cleared = true
     }
 
     /// Adds messages, skipping ones already present (history and live
@@ -80,6 +113,10 @@ struct NetworkState: Identifiable {
     var connection: ConnectionState = .connecting
     /// Buffer keys in the order they appeared; the server buffer first.
     var buffers: [BufferID] = []
+    /// Our nick there, once registered.
+    var nick: String?
+    /// We're marked away there.
+    var away = false
 }
 
 extension MessageKind {
@@ -87,9 +124,12 @@ extension MessageKind {
     var isChat: Bool {
         switch self {
         case .privmsg, .notice, .action: true
-        case .join, .part, .kick, .topic: false
+        case .join, .part, .kick, .topic, .quit, .nick, .mode, .invite, .reply, .error: false
         }
     }
+
+    /// Comings and goings, folded into one line when the user wants.
+    var isPresence: Bool { self == .join || self == .part || self == .quit }
 }
 
 extension ConnectionState {

@@ -29,7 +29,26 @@ final class AppModel {
     /// Changes only when buffers come and go; each buffer is observed on
     /// its own.
     private(set) var buffers: [BufferID: BufferModel] = [:]
-    private(set) var selection: BufferID?
+    /// The chat area's panes and which one has the focus. Kept across
+    /// reconnects and launches; panes show their buffer once it exists.
+    /// Tabs, each with its own pane layout; saved on every change.
+    private(set) var tabs: [WorkspaceTab] {
+        didSet { if tabs != oldValue { saveLayout() } }
+    }
+    private(set) var currentTab: WorkspaceTab.ID {
+        didSet { if currentTab != oldValue { saveLayout() } }
+    }
+    /// The current tab's panes.
+    private(set) var layout: PaneLayout {
+        get { tabs.first { $0.id == currentTab }?.layout ?? tabs[0].layout }
+        set {
+            let i = tabs.firstIndex { $0.id == currentTab } ?? 0
+            tabs[i].layout = newValue
+        }
+    }
+    /// The focused pane's buffer: what the member list, window title and
+    /// sidebar highlight follow.
+    var selection: BufferID? { layout.focusedPane?.buffer }
     /// The latest error worth showing; the view clears it.
     var notice: String?
     /// A sheet to show over the main window (from menus and the sidebar).
@@ -41,12 +60,14 @@ final class AppModel {
         case joinChannel(network: String)
         case browseChannels(network: String)
         case newConversation(network: String)
+        case whois(network: String, info: WhoisInfo)
 
         var id: String {
             switch self {
             case .joinChannel(let n): "join-\(n)"
             case .browseChannels(let n): "browse-\(n)"
             case .newConversation(let n): "query-\(n)"
+            case .whois(let n, let info): "whois-\(n)-\(info.nick)"
             }
         }
     }
@@ -65,7 +86,12 @@ final class AppModel {
     /// A channel the user just /joined; selected once it exists.
     @ObservationIgnored private var pendingSelection: BufferID?
     @ObservationIgnored private let defaults: UserDefaults
+    /// Highlight words and the ignore list come from here.
+    @ObservationIgnored let preferences: Preferences
+    /// Before panes: the one buffer that was open.
     private static let lastBufferKey = "lastBuffer"
+    private static let layoutKey = "paneLayout"
+    private static let tabsKey = "tabs"
 
     @ObservationIgnored private var client: (any BackroomClientProtocol)?
     @ObservationIgnored private var eventTask: Task<Void, Never>?
@@ -74,17 +100,39 @@ final class AppModel {
     /// Whether the app is frontmost; buffers are only marked read then.
     @ObservationIgnored var isActive = true {
         didSet {
-            guard isActive, let selection else { return }
-            // Coming back to the app: mark where the unseen messages start.
-            if let buffer = buffers[selection], buffer.unread > 0 { buffer.unreadLine = buffer.readMarker }
-            markRead(selection)
+            guard isActive else { return }
+            for id in layout.visibleBuffers {
+                // Coming back to the app: mark where the unseen messages start.
+                if let buffer = buffers[id], buffer.unread > 0 { buffer.unreadLine = buffer.readMarker }
+                markRead(id)
+            }
         }
     }
 
     init(settings: ServerSettings, authenticator: any WebAuthenticator,
-         defaults: UserDefaults = .standard, makeClient: @escaping ClientFactory) {
+         defaults: UserDefaults = .standard, preferences: Preferences? = nil,
+         makeClient: @escaping ClientFactory) {
         self.settings = settings
         self.defaults = defaults
+        self.preferences = preferences ?? Preferences(defaults: defaults)
+        let saved: (tabs: [WorkspaceTab], current: UUID)? = defaults.data(forKey: Self.tabsKey)
+            .flatMap { try? JSONDecoder().decode(SavedTabs.self, from: $0) }
+            .flatMap { $0.tabs.isEmpty ? nil : ($0.tabs, $0.current) }
+        if let saved {
+            tabs = saved.tabs
+            currentTab = saved.tabs.contains { $0.id == saved.current } ? saved.current : saved.tabs[0].id
+        } else {
+            // Earlier versions: one layout, or before that one buffer.
+            let layout = defaults.data(forKey: Self.layoutKey)
+                .flatMap { try? JSONDecoder().decode(PaneLayout.self, from: $0) }
+                ?? defaults.stringArray(forKey: Self.lastBufferKey).flatMap { last in
+                    last.count == 2 ? PaneLayout(buffer: BufferID(network: last[0], name: last[1])) : nil
+                }
+                ?? PaneLayout()
+            let tab = WorkspaceTab(layout: layout)
+            tabs = [tab]
+            currentTab = tab.id
+        }
         self.authenticator = authenticator
         self.makeClient = makeClient
     }
@@ -176,7 +224,6 @@ final class AppModel {
         control = nil
         networks = []
         buffers = [:]
-        selection = nil
         recent = []
         sheet = nil
         channelLists = [:]
@@ -206,7 +253,11 @@ final class AppModel {
             networks.removeAll { $0.id == id }
             buffers = buffers.filter { $0.key.network != id }
             recent.removeAll { $0.network == id }
-            if selection?.network == id { selection = nil }
+            for t in tabs.indices {
+                for pane in tabs[t].layout.panes where pane.buffer?.network == id {
+                    tabs[t].layout.show(nil, in: pane.id)
+                }
+            }
         case .bufferAdded(let network, let name, let kind):
             ensureBuffer(network: network, name: name, kind: kind)
         case .bufferRemoved(let network, let name):
@@ -214,14 +265,18 @@ final class AppModel {
             buffers[id] = nil
             recent.removeAll { $0 == id }
             if let i = networkIndex(network) { networks[i].buffers.removeAll { $0 == id } }
-            if selection == id {
-                // Back to the previous conversation, else the network's server buffer.
-                let fallback = recent.first { buffers[$0] != nil }
-                    ?? networkIndex(network).flatMap { i in
-                        networks[i].buffers.first { buffers[$0]?.kind == .server }
-                    }
-                select(fallback)
+            // Panes showing it go back to the previous conversation, else
+            // the network's server buffer.
+            let fallback = recent.first { buffers[$0] != nil }
+                ?? networkIndex(network).flatMap { i in
+                    networks[i].buffers.first { buffers[$0]?.kind == .server }
+                }
+            for t in tabs.indices {
+                for pane in tabs[t].layout.panes where pane.buffer == id {
+                    tabs[t].layout.show(fallback, in: pane.id)
+                }
             }
+            if let fallback, layout.visibleBuffers.contains(fallback) { activate(fallback) }
         case .topic(let network, let channel, let topic):
             buffers[BufferID(network: network, name: channel)]?.topic = topic
         case .members(let network, let channel, let list):
@@ -229,7 +284,7 @@ final class AppModel {
         case .message(let network, let name, let message):
             let id = ensureBuffer(network: network, name: name, kind: nil)
             buffers[id]?.merge([message])
-            if id == selection { markRead(id) }
+            if layout.visibleBuffers.contains(id) { markRead(id) }
         // History and read markers only update buffers that still exist:
         // they can arrive after we left a channel, and mustn't bring it back.
         case .history(let network, let name, let messages):
@@ -238,7 +293,7 @@ final class AppModel {
             buffer.merge(messages)
             buffer.historyLoading = false
             if messages.count < Self.historyPage { buffer.historyExhausted = true }
-            if id == selection { markRead(id) }
+            if layout.visibleBuffers.contains(id) { markRead(id) }
         case .readMarker(let network, let name, let time):
             // Markers only move forward: soju's reply to the initial query
             // can arrive after this device already marked the buffer read.
@@ -251,6 +306,15 @@ final class AppModel {
             guard channelLists[network] != nil else { return }
             channelLists[network]?.channels.append(contentsOf: channels)
             if done { channelLists[network]?.loading = false }
+        case .ownNick(let network, let nick):
+            if let i = networkIndex(network) {
+                networks[i].nick = nick
+                refreshMentions(network: network)
+            }
+        case .away(let network, let away):
+            if let i = networkIndex(network) { networks[i].away = away }
+        case .whois(let network, let info):
+            sheet = .whois(network: network, info: info)
         case .error(_, let message):
             notice = message
         case .stopped:
@@ -263,7 +327,9 @@ final class AppModel {
         let id = BufferID(network: network, name: name)
         if buffers[id] == nil {
             let kind = kind ?? Self.guessKind(name)
-            buffers[id] = BufferModel(id: id, name: name, kind: kind)
+            let buffer = BufferModel(id: id, name: name, kind: kind)
+            buffer.mentions = mentionMatcher(network: network)
+            buffers[id] = buffer
             if let i = networkIndex(network) {
                 // The server buffer goes first.
                 if kind == .server {
@@ -275,9 +341,9 @@ final class AppModel {
             if id == pendingSelection {
                 pendingSelection = nil
                 select(id)
-            } else if selection == nil, id == savedSelection {
-                // Reopen what was open last time, once it exists again.
-                select(id)
+            } else if layout.visibleBuffers.contains(id) {
+                // A pane from last time shows it again.
+                activate(id)
             }
         } else if let kind {
             buffers[id]?.kind = kind
@@ -296,12 +362,17 @@ final class AppModel {
 
     // MARK: Actions
 
+    /// Shows a buffer in the focused pane.
     func select(_ id: BufferID?) {
-        selection = id
-        guard let id, let buffer = buffers[id], let client else { return }
+        layout.show(id, in: layout.focused)
+        if let id { activate(id) }
+    }
+
+    /// A buffer came into view: load its history and mark it read.
+    private func activate(_ id: BufferID) {
+        guard let buffer = buffers[id], let client else { return }
         recent.removeAll { $0 == id }
         recent.insert(id, at: 0)
-        defaults.set([id.network, id.key], forKey: Self.lastBufferKey)
         // Before marking read: the line shows where this visit's news starts.
         buffer.unreadLine = buffer.readMarker
         if !buffer.historyRequested {
@@ -312,9 +383,125 @@ final class AppModel {
         markRead(id)
     }
 
-    private var savedSelection: BufferID? {
-        guard let saved = defaults.stringArray(forKey: Self.lastBufferKey), saved.count == 2 else { return nil }
-        return BufferID(network: saved[0], name: saved[1])
+    private func saveLayout() {
+        let saved = SavedTabs(tabs: tabs, current: currentTab)
+        if let data = try? JSONEncoder().encode(saved) { defaults.set(data, forKey: Self.tabsKey) }
+    }
+
+    private struct SavedTabs: Codable {
+        var tabs: [WorkspaceTab]
+        var current: UUID
+    }
+
+    // MARK: Tabs
+
+    /// A new tab showing the current conversation, after the current tab.
+    func newTab() {
+        let tab = WorkspaceTab(layout: PaneLayout(buffer: selection))
+        let i = tabs.firstIndex { $0.id == currentTab } ?? tabs.count - 1
+        tabs.insert(tab, at: i + 1)
+        showTab(tab.id)
+    }
+
+    func showTab(_ id: WorkspaceTab.ID) {
+        guard tabs.contains(where: { $0.id == id }) else { return }
+        currentTab = id
+        // Its panes come into view: load and mark read.
+        for buffer in layout.visibleBuffers { activate(buffer) }
+    }
+
+    /// The tab `offset` places away from the current one, wrapping around.
+    func cycleTab(by offset: Int) {
+        guard let i = tabs.firstIndex(where: { $0.id == currentTab }) else { return }
+        showTab(tabs[(i + offset + tabs.count) % tabs.count].id)
+    }
+
+    /// Tab number `n` (from 1), as ⌘1–9 do; ⌘9 is the last tab.
+    func showTab(number n: Int) {
+        guard !tabs.isEmpty else { return }
+        showTab(tabs[n == 9 ? tabs.count - 1 : min(n - 1, tabs.count - 1)].id)
+    }
+
+    /// Closes a tab (never the last one); its neighbour is shown.
+    func closeTab(_ id: WorkspaceTab.ID) {
+        guard tabs.count > 1, let i = tabs.firstIndex(where: { $0.id == id }) else { return }
+        let wasCurrent = id == currentTab
+        tabs.remove(at: i)
+        if wasCurrent { showTab(tabs[min(i, tabs.count - 1)].id) }
+    }
+
+    func renameTab(_ id: WorkspaceTab.ID, to name: String) {
+        guard let i = tabs.firstIndex(where: { $0.id == id }) else { return }
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        tabs[i].name = trimmed.isEmpty ? nil : trimmed
+    }
+
+    /// Moves a tab to where `target` is.
+    func moveTab(_ id: WorkspaceTab.ID, to target: WorkspaceTab.ID) {
+        guard let from = tabs.firstIndex(where: { $0.id == id }),
+            let to = tabs.firstIndex(where: { $0.id == target }), from != to
+        else { return }
+        let tab = tabs.remove(at: from)
+        tabs.insert(tab, at: to)
+    }
+
+    /// The tab's name, or its conversations' names.
+    func tabTitle(_ tab: WorkspaceTab) -> String {
+        if let name = tab.name { return name }
+        let names = tab.layout.panes.compactMap(\.buffer).compactMap { id -> String? in
+            guard let buffer = buffers[id] else { return id.key }
+            return buffer.kind == .server ? networkName(id.network) : buffer.name
+        }
+        var seen = Set<String>()
+        let unique = names.filter { seen.insert($0.lowercased()).inserted }
+        return unique.isEmpty ? "Empty" : unique.joined(separator: ", ")
+    }
+
+    /// Unread and mention counts for a tab's conversations.
+    func tabUnread(_ tab: WorkspaceTab) -> (all: Int, mentions: Int) {
+        tab.layout.visibleBuffers.reduce((0, 0)) { sum, id in
+            guard let buffer = buffers[id] else { return sum }
+            return (sum.0 + buffer.unread, sum.1 + buffer.unreadMentions)
+        }
+    }
+
+    /// ⌘W: the focused pane; the tab when it's down to one pane.
+    var canClosePane: Bool { layout.panes.count > 1 || tabs.count > 1 }
+
+    // MARK: Panes
+
+    func focus(_ pane: Pane.ID) {
+        guard layout.focused != pane, layout.pane(pane) != nil else { return }
+        layout.focused = pane
+    }
+
+    /// Splits the focused pane; the new pane shows `buffer` (by default the
+    /// same buffer) and gets the focus.
+    func split(_ axis: SplitAxis, showing buffer: BufferID? = nil) {
+        let shown = buffer ?? selection
+        layout.split(layout.focused, axis: axis, buffer: shown)
+        if let shown { activate(shown) }
+    }
+
+    /// Closes a pane (the focused one by default); never the last.
+    func closePane(_ pane: Pane.ID? = nil) {
+        if layout.panes.count == 1 {
+            closeTab(currentTab)
+        } else {
+            layout.close(pane ?? layout.focused)
+        }
+    }
+
+    func closeOtherPanes() {
+        layout.closeOthers()
+    }
+
+    func moveFocus(_ direction: PaneDirection) {
+        if let next = layout.neighbour(direction) { layout.focused = next }
+    }
+
+    func resizeSplit(_ split: UUID, fractions: [Double]) {
+        layout.resize(split: split, fractions: fractions)
     }
 
     var selectedBuffer: BufferModel? { selection.flatMap { buffers[$0] } }
@@ -323,6 +510,46 @@ final class AppModel {
     func openQuery(network: String, nick: String) {
         let id = ensureBuffer(network: network, name: nick, kind: .query)
         select(id)
+    }
+
+    // MARK: Mentions and ignores
+
+    private func mentionMatcher(network: String) -> MentionMatcher {
+        MentionMatcher(
+            nick: networkIndex(network).flatMap { networks[$0].nick },
+            words: preferences.highlightWords, ignored: preferences.ignored)
+    }
+
+    /// Rebuilds mention matching after our nick, the highlight words or the
+    /// ignore list changed (`network` nil: everywhere).
+    func refreshMentions(network: String? = nil) {
+        for (id, buffer) in buffers where network == nil || id.network == network {
+            let matcher = mentionMatcher(network: id.network)
+            if buffer.mentions != matcher { buffer.mentions = matcher }
+        }
+    }
+
+    // MARK: IRC actions
+
+    /// Sends a raw line on a network.
+    @discardableResult
+    func sendRaw(network: String, _ line: String) -> Bool {
+        guard let client else { return false }
+        return run { try client.sendRaw(network: network, line: line) }
+    }
+
+    func setAway(network: String, away: Bool) {
+        sendRaw(network: network, away ? "AWAY :Away" : "AWAY")
+    }
+
+    /// Our nick on a network, once known.
+    func ownNick(network: String) -> String? {
+        networkIndex(network).flatMap { networks[$0].nick }
+    }
+
+    /// Our membership prefix in a channel ("" if none, nil if unknown).
+    func ownPrefix(in buffer: BufferModel) -> String? {
+        ownNick(network: buffer.id.network).flatMap { buffer.prefixByNick[$0.lowercased()] }
     }
 
     /// The network menu commands act on: the selected buffer's, else the first.
@@ -379,7 +606,7 @@ final class AppModel {
     /// Asks for the page before the oldest loaded message.
     func loadOlder(_ id: BufferID) {
         guard let buffer = buffers[id], let client, !buffer.historyLoading,
-            !buffer.historyExhausted, let oldest = buffer.messages.first
+            !buffer.historyExhausted, !buffer.cleared, let oldest = buffer.messages.first
         else { return }
         buffers[id]?.historyLoading = true
         run {
@@ -420,6 +647,34 @@ final class AppModel {
             return run { try client.sendMessage(network: id.network, target: nick, text: text) }
         case .raw(let line):
             return run { try client.sendRaw(network: id.network, line: line) }
+        case .cycle(let channel):
+            pendingSelection = id
+            return run {
+                try client.part(network: id.network, channel: channel, reason: nil)
+                try client.join(network: id.network, channel: channel, key: nil)
+            }
+        case .listChannels:
+            sheet = .browseChannels(network: id.network)
+            return true
+        case .clear:
+            buffer.clear()
+            return true
+        case .close:
+            if buffer.kind == .server {
+                notice = "The server buffer can't be closed."
+                return false
+            }
+            close(id)
+            return true
+        case .ignore(let nick):
+            preferences.ignore(nick)
+            refreshMentions()
+            notice = "Ignoring \(nick). /unignore \(nick) undoes it."
+            return true
+        case .unignore(let nick):
+            preferences.unignore(nick)
+            refreshMentions()
+            return true
         case .invalid(let message):
             notice = message
             return false
