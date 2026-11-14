@@ -9,3 +9,7 @@
 /apple/BackroomCore/Sources/BackroomCore/backroom_ffi.swift
 .build/
 .swiftpm/
+/apple/Backroom.xcodeproj/
+/apple/Backroom/Info.plist
+/apple/build/
+/apple/Signing.local.xcconfig

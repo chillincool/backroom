@@ -98,7 +98,7 @@ impl BackroomClient {
         Ok(Arc::new(BackroomClient {
             runtime,
             config,
-            store: Arc::new(ForeignTokenStore(secret_store)),
+            store: Arc::new(ForeignTokenStore::new(secret_store)),
             oidc: tokio::sync::Mutex::new(None),
             pending: Mutex::new(None),
             session: Mutex::new(None),

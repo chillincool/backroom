@@ -1,0 +1,62 @@
+# XcodeGen spec for the macOS app. `mise run apple:app` regenerates
+# Backroom.xcodeproj (git-ignored) and builds; open the project in Xcode to run.
+name: Backroom
+options:
+  bundleIdPrefix: net.chillincool
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+# Signing (no paid developer account): see Signing.xcconfig.
+configFiles:
+  Debug: Signing.xcconfig
+  Release: Signing.xcconfig
+packages:
+  BackroomCore:
+    path: BackroomCore
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+targets:
+  Backroom:
+    type: application
+    platform: macOS
+    sources: [Backroom]
+    dependencies:
+      - package: BackroomCore
+    info:
+      path: Backroom/Info.plist
+      properties:
+        CFBundleDisplayName: Backroom
+        LSApplicationCategoryType: public.app-category.social-networking
+        NSHumanReadableCopyright: MIT License
+        # Login redirect: backroom://oauth/callback
+        CFBundleURLTypes:
+          - CFBundleURLName: net.chillincool.backroom.login
+            CFBundleURLSchemes: [backroom]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: net.chillincool.backroom
+        ENABLE_HARDENED_RUNTIME: NO
+        GENERATE_INFOPLIST_FILE: NO
+  BackroomTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources: [BackroomTests]
+    dependencies:
+      - target: Backroom
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: net.chillincool.backroom.tests
+        TEST_HOST: $(BUILT_PRODUCTS_DIR)/Backroom.app/Contents/MacOS/Backroom
+        BUNDLE_LOADER: $(TEST_HOST)
+        GENERATE_INFOPLIST_FILE: YES
+schemes:
+  Backroom:
+    build:
+      targets:
+        Backroom: all
+        BackroomTests: [test]
+    test:
+      targets: [BackroomTests]
