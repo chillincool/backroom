@@ -13,12 +13,12 @@ struct AccountSettings: View {
                     Text("Username & password").tag(ServerSettings.Login.password)
                     Text("Single sign-on (OIDC)").tag(ServerSettings.Login.singleSignOn)
                 }
-                switch draft.login {
-                case .password:
+                if draft.login == .password {
                     TextField("Username", text: $draft.username, prompt: Text("Your soju username"))
-                case .singleSignOn:
-                    TextField("Login issuer", text: $draft.issuer, prompt: Text("https://login.example.net/realms/main"))
                 }
+                TextField("Single sign-on issuer", text: $draft.issuer,
+                          prompt: Text(draft.login == .password ? "Optional: https://login.example.net/realms/main"
+                                                                 : "https://login.example.net/realms/main"))
                 TextField("Nick", text: $draft.nick, prompt: Text(draft.login == .password ? "Same as username" : ""))
                 HStack {
                     Menu("Use Local Test Stack") {
@@ -55,7 +55,7 @@ struct AccountSettings: View {
             } header: {
                 Text("Login")
             } footer: {
-                Text("Changing the server signs you in again; each server keeps its own login.")
+                Text("Changing the server signs you in again; each server keeps its own login. The issuer is your OIDC provider (Keycloak realm, Authentik, …), for a soju using `auth oauth2`.")
                     .foregroundStyle(.secondary)
             }
         }
