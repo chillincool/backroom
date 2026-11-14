@@ -92,4 +92,12 @@ import Testing
         #expect(NickColor.paletteIndex("Alice", count: 8) == NickColor.paletteIndex("alice", count: 8))
         #expect((0..<8).contains(NickColor.paletteIndex("bob", count: 8)))
     }
+
+    @Test func nerdFontsAreRecognised() {
+        #expect(FontMenu.isNerdFont("JetBrainsMono Nerd Font"))
+        #expect(FontMenu.isNerdFont("MesloLGS NF"))
+        #expect(FontMenu.isNerdFont("Hack NFM"))
+        #expect(!FontMenu.isNerdFont("Menlo"))
+        #expect(!FontMenu.isNerdFont("NFL Sans"))
+    }
 }

@@ -25,7 +25,7 @@ struct SettingsView: View {
                 .tabItem { Label("Messages", systemImage: "text.bubble") }
                 .tag(Tab.messages)
         }
-        .frame(width: 560)
+        .frame(width: 640)
         .environment(\.theme, prefs.theme(dark: colorScheme == .dark))
     }
 }
