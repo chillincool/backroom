@@ -57,6 +57,20 @@ struct ServerSettings: Codable, Equatable, Sendable {
     static let e2ePassword = ServerSettings(
         serverURL: "ws://127.0.0.1:28081/", login: .password, username: "dave", nick: "dave")
 
+    /// This preset with another account's username kept.
+    func keeping(username: String) -> ServerSettings {
+        var copy = self
+        copy.username = username
+        return copy
+    }
+
+    /// This preset with another account's issuer kept.
+    func keeping(issuer: String) -> ServerSettings {
+        var copy = self
+        copy.issuer = issuer
+        return copy
+    }
+
     /// Whether the fields the login method needs are filled in.
     var isComplete: Bool {
         guard !serverURL.isEmpty else { return false }

@@ -185,6 +185,9 @@ let net = Network(id: "1", name: "libera", upstreamState: "connected", attribute
         #expect(!noNick.isComplete)
         #expect(noNick.clientConfig.nick == "backroom")
         #expect(!ServerSettings.blank.isComplete)
+        // Switching presets keeps the other method's field.
+        #expect(ServerSettings.e2ePassword.keeping(issuer: "https://id.example").issuer == "https://id.example")
+        #expect(ServerSettings.e2e.keeping(username: "dave").username == "dave")
     }
 
     @Test func settingsSavedBeforePasswordsAreSingleSignOn() throws {

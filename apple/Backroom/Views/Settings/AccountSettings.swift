@@ -22,8 +22,10 @@ struct AccountSettings: View {
                 TextField("Nick", text: $draft.nick, prompt: Text(draft.login == .password ? "Same as username" : ""))
                 HStack {
                     Menu("Use Local Test Stack") {
-                        Button("Single sign-on (alice)") { draft = .e2e }
-                        Button("Password (dave)") { draft = .e2ePassword }
+                        // Only the fields that preset needs; the other login
+                        // method's field (username or issuer) stays.
+                        Button("Single sign-on (alice)") { draft = .e2e.keeping(username: draft.username) }
+                        Button("Password (dave)") { draft = .e2ePassword.keeping(issuer: draft.issuer) }
                     }
                     .fixedSize()
                     Spacer()
