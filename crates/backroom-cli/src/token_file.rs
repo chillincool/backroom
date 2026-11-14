@@ -7,31 +7,11 @@ use std::io::Write as _;
 use std::path::PathBuf;
 
 use backroom_core::auth::{StoreError, TokenSet, TokenStore};
-use chrono::DateTime;
-use secrecy::{ExposeSecret, SecretString};
-use serde::{Deserialize, Serialize};
+use secrecy::ExposeSecret;
 use zeroize::Zeroize;
 
 pub struct TokenFile {
     path: PathBuf,
-}
-
-#[derive(Serialize, Deserialize)]
-struct OnDisk {
-    access_token: String,
-    refresh_token: Option<String>,
-    /// Unix seconds.
-    expires_at: Option<i64>,
-    scope: Option<String>,
-}
-
-impl Drop for OnDisk {
-    fn drop(&mut self) {
-        self.access_token.zeroize();
-        if let Some(t) = &mut self.refresh_token {
-            t.zeroize();
-        }
-    }
 }
 
 impl TokenFile {
@@ -67,15 +47,13 @@ impl TokenStore for TokenFile {
                 tracing::warn!("{} is readable by other users", self.path.display());
             }
         }
-        let parsed: Result<OnDisk, _> = serde_json::from_slice(&bytes);
+        let parsed = std::str::from_utf8(&bytes)
+            .map_err(|_| err("stored tokens are not UTF-8"))
+            .and_then(TokenSet::from_json);
         bytes.zeroize();
-        let disk = parsed.map_err(|e| err(format!("{}: {e}", self.path.display())))?;
-        Ok(Some(TokenSet {
-            access_token: SecretString::from(disk.access_token.clone()),
-            refresh_token: disk.refresh_token.clone().map(SecretString::from),
-            expires_at: disk.expires_at.and_then(|t| DateTime::from_timestamp(t, 0)),
-            scope: disk.scope.clone(),
-        }))
+        parsed
+            .map(Some)
+            .map_err(|e| err(format!("{}: {}", self.path.display(), e.0)))
     }
 
     fn save(&self, tokens: &TokenSet) -> Result<(), StoreError> {
@@ -89,16 +67,7 @@ impl TokenStore for TokenFile {
         }
         builder.create(dir).map_err(err)?;
 
-        let disk = OnDisk {
-            access_token: tokens.access_token.expose_secret().to_owned(),
-            refresh_token: tokens
-                .refresh_token
-                .as_ref()
-                .map(|t| t.expose_secret().to_owned()),
-            expires_at: tokens.expires_at.map(|t| t.timestamp()),
-            scope: tokens.scope.clone(),
-        };
-        let mut json = serde_json::to_vec_pretty(&disk).map_err(err)?;
+        let json = tokens.to_json();
 
         let tmp = self.path.with_extension("json.tmp");
         let mut opts = fs::OpenOptions::new();
@@ -110,9 +79,11 @@ impl TokenStore for TokenFile {
         }
         let result = opts
             .open(&tmp)
-            .and_then(|mut f| f.write_all(&json).and_then(|()| f.sync_all()))
+            .and_then(|mut f| {
+                f.write_all(json.expose_secret().as_bytes())
+                    .and_then(|()| f.sync_all())
+            })
             .and_then(|()| fs::rename(&tmp, &self.path));
-        json.zeroize();
         result.map_err(|e| err(format!("{}: {e}", self.path.display())))
     }
 

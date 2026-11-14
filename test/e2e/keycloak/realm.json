@@ -1809,7 +1809,8 @@
       "protocol": "openid-connect",
       "publicClient": true,
       "redirectUris": [
-        "http://127.0.0.1:47615/callback"
+        "http://127.0.0.1:47615/callback",
+        "backroom://oauth/callback"
       ],
       "serviceAccountsEnabled": false,
       "standardFlowEnabled": true,

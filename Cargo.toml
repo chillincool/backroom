@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/backroom-core", "crates/backroom-cli"]
+members = ["crates/backroom-core", "crates/backroom-cli", "crates/backroom-ffi"]
 
 [workspace.package]
 version = "0.1.0"
@@ -33,6 +33,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake", "__rustls-tls"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uniffi = "0.32.2"
 url = "2"
 webpki-roots = "1"
 zeroize = "1"

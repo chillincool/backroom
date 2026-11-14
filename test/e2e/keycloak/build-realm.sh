@@ -75,7 +75,7 @@ kc create "client-scopes/$SCOPE/scope-mappings/clients/$SOJU" -r $R -b "[{\"id\"
 # Clients that get tokens for soju
 kc create clients -r $R -s clientId=backroom -s publicClient=true -s standardFlowEnabled=true \
 	-s directAccessGrantsEnabled=false -s fullScopeAllowed=false \
-	-s 'redirectUris=["http://127.0.0.1:47615/callback"]' -s 'attributes."pkce.code.challenge.method"=S256'
+	-s 'redirectUris=["http://127.0.0.1:47615/callback","backroom://oauth/callback"]' -s 'attributes."pkce.code.challenge.method"=S256'
 kc create clients -r $R -s clientId=e2e-direct -s publicClient=true -s standardFlowEnabled=false \
 	-s directAccessGrantsEnabled=true -s fullScopeAllowed=false
 for client in backroom e2e-direct; do
