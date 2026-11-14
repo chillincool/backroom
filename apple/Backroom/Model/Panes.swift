@@ -64,6 +64,14 @@ struct PaneLayout: Codable, Equatable {
     }
 }
 
+/// A tab in the title bar: its own pane layout, and a name if the user
+/// gave it one.
+struct WorkspaceTab: Codable, Equatable, Identifiable {
+    var id = UUID()
+    var name: String?
+    var layout: PaneLayout
+}
+
 struct Pane: Codable, Equatable, Identifiable {
     var id = UUID()
     var buffer: BufferID?

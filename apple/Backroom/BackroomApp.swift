@@ -74,6 +74,23 @@ struct ChatCommands: Commands {
                 .keyboardShortcut("j", modifiers: [.command, .shift])
                 .disabled(network == nil)
             Divider()
+            Button("New Tab") { model.newTab() }
+                .keyboardShortcut("t")
+                .disabled(model.phase != .online)
+            Button("Next Tab") { model.cycleTab(by: 1) }
+                .keyboardShortcut("]", modifiers: [.command, .shift])
+                .disabled(model.tabs.count < 2)
+            Button("Previous Tab") { model.cycleTab(by: -1) }
+                .keyboardShortcut("[", modifiers: [.command, .shift])
+                .disabled(model.tabs.count < 2)
+            Menu("Go to Tab") {
+                ForEach(Array(model.tabs.prefix(9).enumerated()), id: \.element.id) { i, tab in
+                    Button(model.tabTitle(tab)) { model.showTab(number: i + 1) }
+                        .keyboardShortcut(KeyEquivalent(Character(String(i == 8 ? 9 : i + 1))))
+                }
+            }
+            .disabled(model.tabs.count < 2)
+            Divider()
             // Panes. Close Pane comes before the window's Close, so ⌘W closes
             // a pane while there are several and the window after that.
             let online = model.phase == .online
@@ -83,9 +100,9 @@ struct ChatCommands: Commands {
             Button("Split Down") { model.split(.vertical) }
                 .keyboardShortcut("d", modifiers: [.command, .shift])
                 .disabled(!online)
-            Button("Close Pane") { model.closePane() }
+            Button(model.layout.panes.count > 1 ? "Close Pane" : "Close Tab") { model.closePane() }
                 .keyboardShortcut("w")
-                .disabled(model.layout.panes.count < 2)
+                .disabled(!model.canClosePane)
             Button("Close Other Panes") { model.closeOtherPanes() }
                 .keyboardShortcut("w", modifiers: [.command, .option])
                 .disabled(model.layout.panes.count < 2)

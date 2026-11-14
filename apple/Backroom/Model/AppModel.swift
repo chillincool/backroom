@@ -31,8 +31,20 @@ final class AppModel {
     private(set) var buffers: [BufferID: BufferModel] = [:]
     /// The chat area's panes and which one has the focus. Kept across
     /// reconnects and launches; panes show their buffer once it exists.
+    /// Tabs, each with its own pane layout; saved on every change.
+    private(set) var tabs: [WorkspaceTab] {
+        didSet { if tabs != oldValue { saveLayout() } }
+    }
+    private(set) var currentTab: WorkspaceTab.ID {
+        didSet { if currentTab != oldValue { saveLayout() } }
+    }
+    /// The current tab's panes.
     private(set) var layout: PaneLayout {
-        didSet { if layout != oldValue { saveLayout() } }
+        get { tabs.first { $0.id == currentTab }?.layout ?? tabs[0].layout }
+        set {
+            let i = tabs.firstIndex { $0.id == currentTab } ?? 0
+            tabs[i].layout = newValue
+        }
     }
     /// The focused pane's buffer: what the member list, window title and
     /// sidebar highlight follow.
@@ -79,6 +91,7 @@ final class AppModel {
     /// Before panes: the one buffer that was open.
     private static let lastBufferKey = "lastBuffer"
     private static let layoutKey = "paneLayout"
+    private static let tabsKey = "tabs"
 
     @ObservationIgnored private var client: (any BackroomClientProtocol)?
     @ObservationIgnored private var eventTask: Task<Void, Never>?
@@ -102,13 +115,23 @@ final class AppModel {
         self.settings = settings
         self.defaults = defaults
         self.preferences = preferences ?? Preferences(defaults: defaults)
-        if let data = defaults.data(forKey: Self.layoutKey),
-            let saved = try? JSONDecoder().decode(PaneLayout.self, from: data) {
-            layout = saved
-        } else if let last = defaults.stringArray(forKey: Self.lastBufferKey), last.count == 2 {
-            layout = PaneLayout(buffer: BufferID(network: last[0], name: last[1]))
+        let saved: (tabs: [WorkspaceTab], current: UUID)? = defaults.data(forKey: Self.tabsKey)
+            .flatMap { try? JSONDecoder().decode(SavedTabs.self, from: $0) }
+            .flatMap { $0.tabs.isEmpty ? nil : ($0.tabs, $0.current) }
+        if let saved {
+            tabs = saved.tabs
+            currentTab = saved.tabs.contains { $0.id == saved.current } ? saved.current : saved.tabs[0].id
         } else {
-            layout = PaneLayout()
+            // Earlier versions: one layout, or before that one buffer.
+            let layout = defaults.data(forKey: Self.layoutKey)
+                .flatMap { try? JSONDecoder().decode(PaneLayout.self, from: $0) }
+                ?? defaults.stringArray(forKey: Self.lastBufferKey).flatMap { last in
+                    last.count == 2 ? PaneLayout(buffer: BufferID(network: last[0], name: last[1])) : nil
+                }
+                ?? PaneLayout()
+            let tab = WorkspaceTab(layout: layout)
+            tabs = [tab]
+            currentTab = tab.id
         }
         self.authenticator = authenticator
         self.makeClient = makeClient
@@ -230,7 +253,11 @@ final class AppModel {
             networks.removeAll { $0.id == id }
             buffers = buffers.filter { $0.key.network != id }
             recent.removeAll { $0.network == id }
-            for pane in layout.panes where pane.buffer?.network == id { layout.show(nil, in: pane.id) }
+            for t in tabs.indices {
+                for pane in tabs[t].layout.panes where pane.buffer?.network == id {
+                    tabs[t].layout.show(nil, in: pane.id)
+                }
+            }
         case .bufferAdded(let network, let name, let kind):
             ensureBuffer(network: network, name: name, kind: kind)
         case .bufferRemoved(let network, let name):
@@ -244,10 +271,12 @@ final class AppModel {
                 ?? networkIndex(network).flatMap { i in
                     networks[i].buffers.first { buffers[$0]?.kind == .server }
                 }
-            for pane in layout.panes where pane.buffer == id {
-                layout.show(fallback, in: pane.id)
-                if let fallback { activate(fallback) }
+            for t in tabs.indices {
+                for pane in tabs[t].layout.panes where pane.buffer == id {
+                    tabs[t].layout.show(fallback, in: pane.id)
+                }
             }
+            if let fallback, layout.visibleBuffers.contains(fallback) { activate(fallback) }
         case .topic(let network, let channel, let topic):
             buffers[BufferID(network: network, name: channel)]?.topic = topic
         case .members(let network, let channel, let list):
@@ -355,8 +384,89 @@ final class AppModel {
     }
 
     private func saveLayout() {
-        if let data = try? JSONEncoder().encode(layout) { defaults.set(data, forKey: Self.layoutKey) }
+        let saved = SavedTabs(tabs: tabs, current: currentTab)
+        if let data = try? JSONEncoder().encode(saved) { defaults.set(data, forKey: Self.tabsKey) }
     }
+
+    private struct SavedTabs: Codable {
+        var tabs: [WorkspaceTab]
+        var current: UUID
+    }
+
+    // MARK: Tabs
+
+    /// A new tab showing the current conversation, after the current tab.
+    func newTab() {
+        let tab = WorkspaceTab(layout: PaneLayout(buffer: selection))
+        let i = tabs.firstIndex { $0.id == currentTab } ?? tabs.count - 1
+        tabs.insert(tab, at: i + 1)
+        showTab(tab.id)
+    }
+
+    func showTab(_ id: WorkspaceTab.ID) {
+        guard tabs.contains(where: { $0.id == id }) else { return }
+        currentTab = id
+        // Its panes come into view: load and mark read.
+        for buffer in layout.visibleBuffers { activate(buffer) }
+    }
+
+    /// The tab `offset` places away from the current one, wrapping around.
+    func cycleTab(by offset: Int) {
+        guard let i = tabs.firstIndex(where: { $0.id == currentTab }) else { return }
+        showTab(tabs[(i + offset + tabs.count) % tabs.count].id)
+    }
+
+    /// Tab number `n` (from 1), as ⌘1–9 do; ⌘9 is the last tab.
+    func showTab(number n: Int) {
+        guard !tabs.isEmpty else { return }
+        showTab(tabs[n == 9 ? tabs.count - 1 : min(n - 1, tabs.count - 1)].id)
+    }
+
+    /// Closes a tab (never the last one); its neighbour is shown.
+    func closeTab(_ id: WorkspaceTab.ID) {
+        guard tabs.count > 1, let i = tabs.firstIndex(where: { $0.id == id }) else { return }
+        let wasCurrent = id == currentTab
+        tabs.remove(at: i)
+        if wasCurrent { showTab(tabs[min(i, tabs.count - 1)].id) }
+    }
+
+    func renameTab(_ id: WorkspaceTab.ID, to name: String) {
+        guard let i = tabs.firstIndex(where: { $0.id == id }) else { return }
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        tabs[i].name = trimmed.isEmpty ? nil : trimmed
+    }
+
+    /// Moves a tab to where `target` is.
+    func moveTab(_ id: WorkspaceTab.ID, to target: WorkspaceTab.ID) {
+        guard let from = tabs.firstIndex(where: { $0.id == id }),
+            let to = tabs.firstIndex(where: { $0.id == target }), from != to
+        else { return }
+        let tab = tabs.remove(at: from)
+        tabs.insert(tab, at: to)
+    }
+
+    /// The tab's name, or its conversations' names.
+    func tabTitle(_ tab: WorkspaceTab) -> String {
+        if let name = tab.name { return name }
+        let names = tab.layout.panes.compactMap(\.buffer).compactMap { id -> String? in
+            guard let buffer = buffers[id] else { return id.key }
+            return buffer.kind == .server ? networkName(id.network) : buffer.name
+        }
+        var seen = Set<String>()
+        let unique = names.filter { seen.insert($0.lowercased()).inserted }
+        return unique.isEmpty ? "Empty" : unique.joined(separator: ", ")
+    }
+
+    /// Unread and mention counts for a tab's conversations.
+    func tabUnread(_ tab: WorkspaceTab) -> (all: Int, mentions: Int) {
+        tab.layout.visibleBuffers.reduce((0, 0)) { sum, id in
+            guard let buffer = buffers[id] else { return sum }
+            return (sum.0 + buffer.unread, sum.1 + buffer.unreadMentions)
+        }
+    }
+
+    /// ⌘W: the focused pane; the tab when it's down to one pane.
+    var canClosePane: Bool { layout.panes.count > 1 || tabs.count > 1 }
 
     // MARK: Panes
 
@@ -375,7 +485,11 @@ final class AppModel {
 
     /// Closes a pane (the focused one by default); never the last.
     func closePane(_ pane: Pane.ID? = nil) {
-        layout.close(pane ?? layout.focused)
+        if layout.panes.count == 1 {
+            closeTab(currentTab)
+        } else {
+            layout.close(pane ?? layout.focused)
+        }
     }
 
     func closeOtherPanes() {

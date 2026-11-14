@@ -47,6 +47,10 @@ struct MainView: View {
                 .help("Show or hide the sidebar")
                 .keyboardShortcut("s", modifiers: [.command, .control])
             }
+            // Tabs, in the title bar while there are several.
+            ToolbarItem(placement: .principal) {
+                if model.tabs.count > 1 { TabStrip() }
+            }
             ToolbarItem {
                 Button {
                     showMembers.toggle()
@@ -68,8 +72,9 @@ struct MainView: View {
 }
 
 extension MainView {
-    /// The focused pane's conversation.
+    /// The focused pane's conversation; nothing while the tabs say it.
     private var windowTitle: String {
+        guard model.tabs.count < 2 else { return "" }
         guard let buffer = model.selectedBuffer else { return "Backroom" }
         return buffer.kind == .server ? model.networkName(buffer.id.network) : buffer.name
     }
