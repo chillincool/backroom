@@ -49,6 +49,7 @@ struct NoticeBar: View {
 
 struct LoginView: View {
     @Environment(AppModel.self) private var model
+    @State private var password = ""
 
     var body: some View {
         VStack(spacing: 16) {
@@ -68,23 +69,9 @@ struct LoginView: View {
                 Button("Try Again") { Task { await model.start() } }
             }
 
-            Button {
-                Task { await model.logIn() }
-            } label: {
-                if model.phase == .loggingIn {
-                    ProgressView().controlSize(.small)
-                } else {
-                    Text("Log In")
-                }
-            }
-            .keyboardShortcut(.defaultAction)
-            .controlSize(.large)
-            .disabled(model.phase == .loggingIn)
-
-            if model.phase == .loggingIn {
-                Text("Finish logging in in your browser.")
-                    .foregroundStyle(.secondary)
-                Button("Cancel") { model.cancelLogin() }
+            switch model.settings.login {
+            case .password: passwordLogin
+            case .singleSignOn: singleSignOn
             }
 
             SettingsLink { Text("Server Settings…") }
@@ -92,5 +79,51 @@ struct LoginView: View {
         }
         .padding(40)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    @ViewBuilder private var passwordLogin: some View {
+        if model.settings.username.isEmpty {
+            Text("Set your soju username in Server Settings.")
+                .foregroundStyle(.secondary)
+        } else {
+            Form {
+                LabeledContent("Username", value: model.settings.username)
+                SecureField("Password", text: $password)
+                    .onSubmit(logIn)
+            }
+            .frame(maxWidth: 300)
+            .fixedSize(horizontal: false, vertical: true)
+            Button("Log In", action: logIn)
+                .keyboardShortcut(.defaultAction)
+                .controlSize(.large)
+                .disabled(password.isEmpty)
+        }
+    }
+
+    private func logIn() {
+        let entered = password
+        password = ""
+        Task { await model.logIn(password: entered) }
+    }
+
+    @ViewBuilder private var singleSignOn: some View {
+        Button {
+            Task { await model.logIn() }
+        } label: {
+            if model.phase == .loggingIn {
+                ProgressView().controlSize(.small)
+            } else {
+                Text("Log In")
+            }
+        }
+        .keyboardShortcut(.defaultAction)
+        .controlSize(.large)
+        .disabled(model.phase == .loggingIn)
+
+        if model.phase == .loggingIn {
+            Text("Finish logging in in your browser.")
+                .foregroundStyle(.secondary)
+            Button("Cancel") { model.cancelLogin() }
+        }
     }
 }

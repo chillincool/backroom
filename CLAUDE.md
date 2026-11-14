@@ -38,9 +38,11 @@ services. Owner: chillincool. Public repo: github.com/chillincool/backroom.
   - `model.rs` chat model: `route` (message → buffer), `route_reply`
     (numerics), `quit_or_nick`, `WhoisInfo`, `ChannelListing`, `BanEntry`
 - `crates/backroom-ffi`: UniFFI 0.32 bindings. One `BackroomClient` object
-  (owns a tokio runtime; async methods spawn onto it). Swift implements
-  `SecretStore` (`#[uniffi::export(foreign)]`): one opaque Keychain value,
-  the token JSON from `TokenSet::to_json`. FFI copies of model/events use
+  (owns a tokio runtime; async methods spawn onto it). `ClientConfig.login`
+  is a `LoginMethod`: `Oidc` (browser login, OAUTHBEARER) or `Password`
+  (soju's own accounts, SASL PLAIN; `login_with_password`). Swift implements
+  `SecretStore` (`#[uniffi::export(foreign)]`): one opaque Keychain value per
+  login, the token JSON from `TokenSet::to_json` or the password. FFI copies of model/events use
   `SystemTime`/`Duration`. `--features bindgen` builds `uniffi-bindgen`.
 - `apple/BackroomCore`: Swift package (XCFramework + generated bindings, both
   git-ignored, from `scripts/build-apple.sh`) plus `KeychainSecretStore`.
@@ -81,7 +83,9 @@ mise run apple:app  # generate apple/Backroom.xcodeproj (XcodeGen), build, unit 
 ```
 
 Run the app: `open apple/build/Build/Products/Debug/Backroom.app`. Against the
-e2e stack, log in as alice/alice; give her a network with
+e2e stack, log in as alice/alice (single sign-on), or with a password as
+dave/dave-secret on soju-internal (`ws://127.0.0.1:28081/`; Settings →
+Account → Use Local Test Stack); give her a network with
 `docker compose -p backroom-e2e exec -T soju-oauth2 sojuctl -config /soju-config user run alice network create -addr irc+insecure://ergo:6667 -name ergo-test`
 (after her first login).
 
@@ -183,9 +187,14 @@ and stops after a rejected login (`ConnectionState::AuthFailed`).
 
 ## Pick up here (2026-11-14)
 
-- All of the owner's four asks (GUI join, Settings, themes/interface, broad
-  IRC support) are done in PRs #12–#14. #14 (PR 3) was auto-merging when
-  this was written; check `gh pr view 14`. Next: ask the owner.
+- PRs #12–#14 merged (the owner's first four asks). Roadmap agreed with the
+  owner: **PR A** soju password login (branch `feat/password-login`), then
+  **standalone mode** (no bouncer: networks stored locally, direct
+  connections, SASL/NickServ, rejoin; local history in SQLite via
+  `rusqlite` bundled, plus an optional "also write plain-text logs" setting,
+  per channel per day), then ZNC (low priority). One account per client:
+  the owner sees no use for several accounts at once. A soju installer was
+  rejected (standalone mode lowers the entry bar more cheaply).
 - Dev setup: e2e stack up (`mise run e2e:up`); soju-oauth2 data lives on
   volume `soju-oauth2-data` (survives recreation; `e2e.sh down` deletes it,
   so warn first). alice has networks libera (nick backroom-dev),
@@ -198,7 +207,7 @@ and stops after a rejected login (`ConnectionState::AuthFailed`).
 - Ideas not planned: UI polish (owner isn't fully happy with the look but
   wants to come back to it later), production use (add
   `backroom://oauth/callback` to production Keycloak's `backroom` client;
-  confirm its `offline_access` optional scope), multiple accounts, offline
+  confirm its `offline_access` optional scope), offline
   start without Keycloak, reactions, redaction, a CTCP off switch, `macos`
   as a required check (deferred by owner).
 

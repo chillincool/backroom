@@ -186,6 +186,21 @@ final class AppModel {
         }
     }
 
+    /// Saves the password of a password account and connects; soju checks
+    /// it, and a wrong one comes back as `authFailed`.
+    func logIn(password: String) async {
+        guard let client, phase != .loggingIn, !password.isEmpty else { return }
+        do {
+            try client.loginWithPassword(password: password)
+        } catch {
+            notice = "Login failed: \(Self.describe(error))"
+            return
+        }
+        await connect()
+    }
+
+    /// Single sign-on: opens the login page in the browser and connects
+    /// once it redirects back.
     func logIn() async {
         guard let client, phase != .loggingIn else { return }
         phase = .loggingIn
@@ -269,7 +284,9 @@ final class AppModel {
                 client?.disconnect()
                 resetChat()
                 phase = .loggedOut
-                notice = "Your login was rejected (\(reason)). Log in again."
+                notice = settings.login == .password
+                    ? "soju rejected the password (\(reason)). Check it and log in again."
+                    : "Your login was rejected (\(reason)). Log in again."
             }
         case .connection(let id?, let state):
             if let i = networkIndex(id) { networks[i].connection = state }

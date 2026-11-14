@@ -21,6 +21,10 @@ final class FakeClient: BackroomClientProtocol, @unchecked Sendable {
     }
     func disconnect() { calls.append("disconnect") }
     func hasLogin() throws -> Bool { loggedIn }
+    func loginWithPassword(password: String) throws {
+        calls.append("password \(password.count) chars")
+        loggedIn = true
+    }
     func join(network: String, channel: String, key: String?) throws {
         calls.append("join \(network) \(channel)" + (key.map { " key=\($0)" } ?? ""))
     }
@@ -69,13 +73,14 @@ struct FakeAuthenticator: WebAuthenticator {
 }
 
 @MainActor
-func makeModel(loggedIn: Bool = true, authenticator: FakeAuthenticator = FakeAuthenticator()) async
+func makeModel(loggedIn: Bool = true, settings: ServerSettings = .e2e,
+               authenticator: FakeAuthenticator = FakeAuthenticator()) async
     -> (AppModel, FakeClient)
 {
     let client = FakeClient()
     client.loggedIn = loggedIn
     let defaults = UserDefaults(suiteName: "backroom-tests-\(UUID().uuidString)")!
-    let model = AppModel(settings: .e2e, authenticator: authenticator, defaults: defaults, makeClient: { _ in client })
+    let model = AppModel(settings: settings, authenticator: authenticator, defaults: defaults, makeClient: { _ in client })
     await model.start()
     return (model, client)
 }
@@ -107,6 +112,46 @@ let net = Network(id: "1", name: "libera", upstreamState: "connected", attribute
         #expect(client.calls.contains("complete backroom://oauth/callback?code=c&state=s"))
         #expect(client.calls.last == "connect")
         #expect(model.phase == .online)
+    }
+
+    @Test func passwordLoginSavesAndConnects() async {
+        let (model, client) = await makeModel(loggedIn: false, settings: .e2ePassword)
+        #expect(model.phase == .loggedOut)
+        await model.logIn(password: "")
+        #expect(client.calls.isEmpty)
+        await model.logIn(password: "dave-secret")
+        #expect(client.calls == ["password 11 chars", "connect"])
+        #expect(model.phase == .online)
+    }
+
+    @Test func rejectedPasswordLogsOut() async {
+        let (model, _) = await makeModel(settings: .e2ePassword)
+        model.apply(.connection(network: nil, state: .authFailed(reason: "invalid credentials")))
+        #expect(model.phase == .loggedOut)
+        #expect(model.notice?.contains("password") == true)
+    }
+
+    @Test func passwordSettings() throws {
+        let settings = ServerSettings.e2ePassword
+        #expect(settings.keychainAccount == "password dave ws://127.0.0.1:28081/")
+        #expect(ServerSettings.e2e.keychainAccount == "http://localhost:18080/realms/e2e ws://127.0.0.1:18081/")
+        guard case .password(let username) = settings.clientConfig.login else {
+            Issue.record("not a password login"); return
+        }
+        #expect(username == "dave")
+        var noNick = settings
+        noNick.nick = ""
+        #expect(noNick.clientConfig.nick == "dave")
+        noNick.username = ""
+        #expect(!noNick.isComplete)
+    }
+
+    @Test func settingsSavedBeforePasswordsAreSingleSignOn() throws {
+        let old = #"{"serverURL":"wss://irc.example.net/socket","issuer":"https://id.example.net/realms/main","nick":"me"}"#
+        let settings = try JSONDecoder().decode(ServerSettings.self, from: Data(old.utf8))
+        #expect(settings.login == .singleSignOn)
+        #expect(settings.issuer == "https://id.example.net/realms/main")
+        #expect(settings.keychainAccount == "https://id.example.net/realms/main wss://irc.example.net/socket")
     }
 
     @Test func cancelledLoginIsQuiet() async {
