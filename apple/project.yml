@@ -29,6 +29,8 @@ targets:
       path: Backroom/Info.plist
       properties:
         CFBundleDisplayName: Backroom
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         LSApplicationCategoryType: public.app-category.social-networking
         NSHumanReadableCopyright: MIT License
         # Login redirect: backroom://oauth/callback
