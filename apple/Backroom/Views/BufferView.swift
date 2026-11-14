@@ -7,6 +7,8 @@ struct BufferView: View {
     @Environment(Preferences.self) private var prefs
     @Environment(\.theme) private var theme
     let id: BufferID
+    /// The pane showing this buffer.
+    let pane: Pane.ID
     @State private var draft = ""
     @FocusState private var composerFocused: Bool
     @State private var completion: Completion?
@@ -17,10 +19,6 @@ struct BufferView: View {
         let buffer = model.buffers[id]
         let style = ChatStyle(prefs: prefs, theme: theme)
         VStack(spacing: 0) {
-            if let buffer, let topic = buffer.topic, topic != buffer.dismissedTopic {
-                TopicBanner(topic: topic, formatting: prefs.showFormatting) { buffer.dismissedTopic = topic }
-                Divider()
-            }
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     HistoryHeader(buffer: buffer) { model.loadOlder(id) }
@@ -74,8 +72,14 @@ struct BufferView: View {
             model.join(network: id.network, channel: channel)
             return .handled
         })
-        .navigationTitle(title(buffer))
-        .onAppear { composerFocused = true }
+        // Typing goes to the focused pane; clicking into a composer focuses its pane.
+        .onAppear { composerFocused = model.layout.focused == pane }
+        .onChange(of: model.layout.focused) { _, focused in
+            if focused == pane { composerFocused = true }
+        }
+        .onChange(of: composerFocused) { _, focused in
+            if focused { model.focus(pane) }
+        }
     }
 
     private func submit(_ buffer: BufferModel?) {
@@ -129,12 +133,6 @@ struct BufferView: View {
             draft = history[next]
         }
         return true
-    }
-
-    private func title(_ buffer: BufferModel?) -> String {
-        guard let buffer else { return "" }
-        guard buffer.kind == .server else { return buffer.name }
-        return model.networks.first { $0.id == id.network }?.network.name ?? "Server"
     }
 
     private func placeholder(_ buffer: BufferModel?) -> String {
@@ -402,36 +400,6 @@ struct MessageRow: View {
         default: ""
         }
         return Text(style.layout == .columns ? line : arrow + line).foregroundColor(theme.mutedColor)
-    }
-}
-
-/// The channel topic, closable; it comes back when the topic changes.
-struct TopicBanner: View {
-    @Environment(\.theme) private var theme
-    let topic: String
-    let formatting: Bool
-    let close: () -> Void
-
-    var body: some View {
-        let text = stripFormatting(text: topic)
-        HStack(alignment: .top, spacing: 8) {
-            Image(systemName: "text.quote").foregroundStyle(theme.mutedColor)
-            Text(MessageText.attributed(topic, formatting: formatting, theme: theme))
-                .foregroundStyle(theme.textColor)
-                .lineLimit(2)
-                .textSelection(.enabled)
-                .help(text)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            Button(action: close) {
-                Image(systemName: "xmark")
-            }
-            .buttonStyle(.borderless)
-            .help("Hide the topic until it changes")
-        }
-        .font(.callout)
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(theme.surfaceColor)
     }
 }
 

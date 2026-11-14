@@ -73,6 +73,30 @@ struct ChatCommands: Commands {
             Button("Browse Channels…") { network.map { model.sheet = .browseChannels(network: $0) } }
                 .keyboardShortcut("j", modifiers: [.command, .shift])
                 .disabled(network == nil)
+            Divider()
+            // Panes. Close Pane comes before the window's Close, so ⌘W closes
+            // a pane while there are several and the window after that.
+            let online = model.phase == .online
+            Button("Split Right") { model.split(.horizontal) }
+                .keyboardShortcut("d")
+                .disabled(!online)
+            Button("Split Down") { model.split(.vertical) }
+                .keyboardShortcut("d", modifiers: [.command, .shift])
+                .disabled(!online)
+            Button("Close Pane") { model.closePane() }
+                .keyboardShortcut("w")
+                .disabled(model.layout.panes.count < 2)
+            Menu("Move Focus") {
+                Button("Left") { model.moveFocus(.left) }
+                    .keyboardShortcut(.leftArrow, modifiers: [.command, .option])
+                Button("Right") { model.moveFocus(.right) }
+                    .keyboardShortcut(.rightArrow, modifiers: [.command, .option])
+                Button("Up") { model.moveFocus(.up) }
+                    .keyboardShortcut(.upArrow, modifiers: [.command, .option])
+                Button("Down") { model.moveFocus(.down) }
+                    .keyboardShortcut(.downArrow, modifiers: [.command, .option])
+            }
+            .disabled(model.layout.panes.count < 2)
         }
     }
 }

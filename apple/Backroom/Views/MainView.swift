@@ -26,17 +26,8 @@ struct MainView: View {
                     .frame(width: sidebarWidth)
                 SplitDivider(width: $sidebarWidth, range: 150...420, edge: .leading)
             }
-            Group {
-                if let id = model.selection, model.buffers[id] != nil {
-                    BufferView(id: id)
-                        .id(id)
-                } else {
-                    ContentUnavailableView("No Conversation Selected", systemImage: "bubble.left")
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .background(theme.backgroundColor)
-                }
-            }
-            .frame(minWidth: 320, maxWidth: .infinity, maxHeight: .infinity)
+            PaneTreeView(node: model.layout.root)
+                .frame(minWidth: 320, maxWidth: .infinity, maxHeight: .infinity)
             if membersShown, let buffer = model.selectedBuffer {
                 SplitDivider(width: $membersWidth, range: 120...360, edge: .trailing)
                 MemberList(buffer: buffer)
@@ -44,6 +35,7 @@ struct MainView: View {
             }
         }
         .sheet(item: $model.sheet) { SheetContent(sheet: $0) }
+        .navigationTitle(windowTitle)
         .toolbarBackground(theme.background == nil ? AnyShapeStyle(.bar) : AnyShapeStyle(theme.surfaceColor), for: .windowToolbar)
         .toolbar {
             ToolbarItem(placement: .navigation) {
@@ -72,6 +64,14 @@ struct MainView: View {
                 }
             }
         }
+    }
+}
+
+extension MainView {
+    /// The focused pane's conversation.
+    private var windowTitle: String {
+        guard let buffer = model.selectedBuffer else { return "Backroom" }
+        return buffer.kind == .server ? model.networkName(buffer.id.network) : buffer.name
     }
 }
 
@@ -180,6 +180,9 @@ struct NetworkGroup: View {
                     BufferRow(buffer: buffer)
                         .tag(id)
                         .contextMenu {
+                            Button("Open in Split Right") { model.split(.horizontal, showing: id) }
+                            Button("Open in Split Down") { model.split(.vertical, showing: id) }
+                            Divider()
                             Button("Mark as Read") { model.markRead(id) }
                                 .disabled(buffer.unread == 0)
                             Divider()

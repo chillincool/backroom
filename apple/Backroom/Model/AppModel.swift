@@ -29,7 +29,14 @@ final class AppModel {
     /// Changes only when buffers come and go; each buffer is observed on
     /// its own.
     private(set) var buffers: [BufferID: BufferModel] = [:]
-    private(set) var selection: BufferID?
+    /// The chat area's panes and which one has the focus. Kept across
+    /// reconnects and launches; panes show their buffer once it exists.
+    private(set) var layout: PaneLayout {
+        didSet { if layout != oldValue { saveLayout() } }
+    }
+    /// The focused pane's buffer: what the member list, window title and
+    /// sidebar highlight follow.
+    var selection: BufferID? { layout.focusedPane?.buffer }
     /// The latest error worth showing; the view clears it.
     var notice: String?
     /// A sheet to show over the main window (from menus and the sidebar).
@@ -69,7 +76,9 @@ final class AppModel {
     @ObservationIgnored private let defaults: UserDefaults
     /// Highlight words and the ignore list come from here.
     @ObservationIgnored let preferences: Preferences
+    /// Before panes: the one buffer that was open.
     private static let lastBufferKey = "lastBuffer"
+    private static let layoutKey = "paneLayout"
 
     @ObservationIgnored private var client: (any BackroomClientProtocol)?
     @ObservationIgnored private var eventTask: Task<Void, Never>?
@@ -78,10 +87,12 @@ final class AppModel {
     /// Whether the app is frontmost; buffers are only marked read then.
     @ObservationIgnored var isActive = true {
         didSet {
-            guard isActive, let selection else { return }
-            // Coming back to the app: mark where the unseen messages start.
-            if let buffer = buffers[selection], buffer.unread > 0 { buffer.unreadLine = buffer.readMarker }
-            markRead(selection)
+            guard isActive else { return }
+            for id in layout.visibleBuffers {
+                // Coming back to the app: mark where the unseen messages start.
+                if let buffer = buffers[id], buffer.unread > 0 { buffer.unreadLine = buffer.readMarker }
+                markRead(id)
+            }
         }
     }
 
@@ -91,6 +102,14 @@ final class AppModel {
         self.settings = settings
         self.defaults = defaults
         self.preferences = preferences ?? Preferences(defaults: defaults)
+        if let data = defaults.data(forKey: Self.layoutKey),
+            let saved = try? JSONDecoder().decode(PaneLayout.self, from: data) {
+            layout = saved
+        } else if let last = defaults.stringArray(forKey: Self.lastBufferKey), last.count == 2 {
+            layout = PaneLayout(buffer: BufferID(network: last[0], name: last[1]))
+        } else {
+            layout = PaneLayout()
+        }
         self.authenticator = authenticator
         self.makeClient = makeClient
     }
@@ -182,7 +201,6 @@ final class AppModel {
         control = nil
         networks = []
         buffers = [:]
-        selection = nil
         recent = []
         sheet = nil
         channelLists = [:]
@@ -212,7 +230,7 @@ final class AppModel {
             networks.removeAll { $0.id == id }
             buffers = buffers.filter { $0.key.network != id }
             recent.removeAll { $0.network == id }
-            if selection?.network == id { selection = nil }
+            for pane in layout.panes where pane.buffer?.network == id { layout.show(nil, in: pane.id) }
         case .bufferAdded(let network, let name, let kind):
             ensureBuffer(network: network, name: name, kind: kind)
         case .bufferRemoved(let network, let name):
@@ -220,13 +238,15 @@ final class AppModel {
             buffers[id] = nil
             recent.removeAll { $0 == id }
             if let i = networkIndex(network) { networks[i].buffers.removeAll { $0 == id } }
-            if selection == id {
-                // Back to the previous conversation, else the network's server buffer.
-                let fallback = recent.first { buffers[$0] != nil }
-                    ?? networkIndex(network).flatMap { i in
-                        networks[i].buffers.first { buffers[$0]?.kind == .server }
-                    }
-                select(fallback)
+            // Panes showing it go back to the previous conversation, else
+            // the network's server buffer.
+            let fallback = recent.first { buffers[$0] != nil }
+                ?? networkIndex(network).flatMap { i in
+                    networks[i].buffers.first { buffers[$0]?.kind == .server }
+                }
+            for pane in layout.panes where pane.buffer == id {
+                layout.show(fallback, in: pane.id)
+                if let fallback { activate(fallback) }
             }
         case .topic(let network, let channel, let topic):
             buffers[BufferID(network: network, name: channel)]?.topic = topic
@@ -235,7 +255,7 @@ final class AppModel {
         case .message(let network, let name, let message):
             let id = ensureBuffer(network: network, name: name, kind: nil)
             buffers[id]?.merge([message])
-            if id == selection { markRead(id) }
+            if layout.visibleBuffers.contains(id) { markRead(id) }
         // History and read markers only update buffers that still exist:
         // they can arrive after we left a channel, and mustn't bring it back.
         case .history(let network, let name, let messages):
@@ -244,7 +264,7 @@ final class AppModel {
             buffer.merge(messages)
             buffer.historyLoading = false
             if messages.count < Self.historyPage { buffer.historyExhausted = true }
-            if id == selection { markRead(id) }
+            if layout.visibleBuffers.contains(id) { markRead(id) }
         case .readMarker(let network, let name, let time):
             // Markers only move forward: soju's reply to the initial query
             // can arrive after this device already marked the buffer read.
@@ -292,9 +312,9 @@ final class AppModel {
             if id == pendingSelection {
                 pendingSelection = nil
                 select(id)
-            } else if selection == nil, id == savedSelection {
-                // Reopen what was open last time, once it exists again.
-                select(id)
+            } else if layout.visibleBuffers.contains(id) {
+                // A pane from last time shows it again.
+                activate(id)
             }
         } else if let kind {
             buffers[id]?.kind = kind
@@ -313,12 +333,17 @@ final class AppModel {
 
     // MARK: Actions
 
+    /// Shows a buffer in the focused pane.
     func select(_ id: BufferID?) {
-        selection = id
-        guard let id, let buffer = buffers[id], let client else { return }
+        layout.show(id, in: layout.focused)
+        if let id { activate(id) }
+    }
+
+    /// A buffer came into view: load its history and mark it read.
+    private func activate(_ id: BufferID) {
+        guard let buffer = buffers[id], let client else { return }
         recent.removeAll { $0 == id }
         recent.insert(id, at: 0)
-        defaults.set([id.network, id.key], forKey: Self.lastBufferKey)
         // Before marking read: the line shows where this visit's news starts.
         buffer.unreadLine = buffer.readMarker
         if !buffer.historyRequested {
@@ -329,9 +354,36 @@ final class AppModel {
         markRead(id)
     }
 
-    private var savedSelection: BufferID? {
-        guard let saved = defaults.stringArray(forKey: Self.lastBufferKey), saved.count == 2 else { return nil }
-        return BufferID(network: saved[0], name: saved[1])
+    private func saveLayout() {
+        if let data = try? JSONEncoder().encode(layout) { defaults.set(data, forKey: Self.layoutKey) }
+    }
+
+    // MARK: Panes
+
+    func focus(_ pane: Pane.ID) {
+        guard layout.focused != pane, layout.pane(pane) != nil else { return }
+        layout.focused = pane
+    }
+
+    /// Splits the focused pane; the new pane shows `buffer` (by default the
+    /// same buffer) and gets the focus.
+    func split(_ axis: SplitAxis, showing buffer: BufferID? = nil) {
+        let shown = buffer ?? selection
+        layout.split(layout.focused, axis: axis, buffer: shown)
+        if let shown { activate(shown) }
+    }
+
+    /// Closes a pane (the focused one by default); never the last.
+    func closePane(_ pane: Pane.ID? = nil) {
+        layout.close(pane ?? layout.focused)
+    }
+
+    func moveFocus(_ direction: PaneDirection) {
+        if let next = layout.neighbour(direction) { layout.focused = next }
+    }
+
+    func resizeSplit(_ split: UUID, fractions: [Double]) {
+        layout.resize(split: split, fractions: fractions)
     }
 
     var selectedBuffer: BufferModel? { selection.flatMap { buffers[$0] } }

@@ -458,9 +458,71 @@ let net = Network(id: "1", name: "libera", upstreamState: "connected", attribute
         await second.start()
         second.apply(.networkUpdated(network: net))
         second.apply(.bufferAdded(network: "1", name: "#a", kind: .channel))
-        #expect(second.selection == nil)
-        second.apply(.bufferAdded(network: "1", name: "#B", kind: .channel))
+        // The pane remembers #b and shows it once it exists again.
         #expect(second.selection == BufferID(network: "1", name: "#b"))
+        #expect(second.selectedBuffer == nil)
+        second.apply(.bufferAdded(network: "1", name: "#B", kind: .channel))
+        #expect(second.selectedBuffer?.name == "#B")
+        #expect(client.calls.contains("history 1 #B latest"))
+    }
+
+    @Test func panesSplitShowAndClose() async {
+        let (model, client) = await makeModel()
+        model.apply(.networkUpdated(network: net))
+        for name in ["#a", "#b", "#c"] { model.apply(.bufferAdded(network: "1", name: name, kind: .channel)) }
+        let (a, b, c) = (BufferID(network: "1", name: "#a"), BufferID(network: "1", name: "#b"), BufferID(network: "1", name: "#c"))
+        model.select(a)
+        let first = model.layout.focused
+
+        // A split shows the same buffer until another is picked.
+        model.split(.horizontal)
+        #expect(model.layout.panes.map(\.buffer) == [a, a])
+        model.select(b)
+        #expect(model.layout.panes.map(\.buffer) == [a, b])
+        model.split(.vertical, showing: c)
+        #expect(model.layout.panes.map(\.buffer) == [a, b, c])
+        #expect(model.selection == c)
+
+        // Messages in any visible pane are read at once.
+        model.apply(.message(network: "1", buffer: "#a", message: msg("hi", at: 50)))
+        #expect(client.calls.last == "read 1 #a 50")
+
+        model.moveFocus(.up)
+        #expect(model.selection == b)
+        model.moveFocus(.left)
+        #expect(model.layout.focused == first)
+        model.moveFocus(.left)
+        #expect(model.layout.focused == first, "nothing further left")
+
+        // Leaving a channel: its pane falls back to a recent conversation.
+        model.apply(.bufferRemoved(network: "1", name: "#c"))
+        #expect(!model.layout.panes.contains { $0.buffer == c })
+
+        model.closePane()
+        model.closePane()
+        #expect(model.layout.panes.count == 1)
+        model.closePane()
+        #expect(model.layout.panes.count == 1, "the last pane stays")
+    }
+
+    @Test func layoutTreeOperations() {
+        let x = BufferID(network: "1", name: "#x")
+        var layout = PaneLayout(buffer: x)
+        let one = layout.focused
+        let two = layout.split(one, axis: .horizontal, buffer: x)
+        let three = layout.split(two, axis: .horizontal, buffer: x)
+        // Same-direction splits share one level rather than nesting.
+        guard case .split(let split) = layout.root else { Issue.record("\(layout)"); return }
+        #expect(split.children.count == 3)
+        #expect(split.fractions == [0.5, 0.25, 0.25])
+        layout.close(two)
+        guard case .split(let after) = layout.root else { Issue.record("\(layout)"); return }
+        #expect(after.fractions.reduce(0, +) == 1)
+        #expect(layout.panes.map(\.id) == [one, three])
+        layout.close(three)
+        #expect(layout.root == .pane(Pane(id: one, buffer: x)), "a split with one child collapses")
+        let data = try! JSONEncoder().encode(layout)
+        #expect(try! JSONDecoder().decode(PaneLayout.self, from: data) == layout)
     }
 
     @Test func removingANetworkDropsItsBuffers() async {

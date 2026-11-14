@@ -3,7 +3,7 @@ import Foundation
 import Observation
 
 /// A buffer is identified by its network and case-folded name.
-struct BufferID: Hashable, Sendable {
+struct BufferID: Hashable, Sendable, Codable {
     let network: String
     let key: String
 
@@ -35,8 +35,6 @@ final class BufferModel: Identifiable {
     var cleared = false
     /// Channel topic, mIRC formatting included; nil if none.
     var topic: String?
-    /// The topic the user closed the banner on; it returns if the topic changes.
-    var dismissedTopic: String?
     /// Channel members, highest rank first.
     var members: [Member] = [] {
         didSet { prefixByNick = Dictionary(members.map { ($0.nick.lowercased(), $0.prefix) }) { a, _ in a } }
