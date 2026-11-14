@@ -12,7 +12,8 @@ use crate::batch::Batch;
 use crate::bouncer::{NetworkUpdate, parse_network_message};
 use crate::client::Incoming;
 use crate::model::{
-    BufferKind, ChatMessage, NetworkId, NetworkInfo, RouteContext, buffer_key, irc_timestamp, route,
+    BufferKind, ChatMessage, NetworkId, NetworkInfo, RouteContext, SERVER_BUFFER, buffer_key,
+    irc_timestamp, route,
 };
 use crate::proto::Message;
 use crate::session::Registered;
@@ -326,6 +327,9 @@ impl Coordinator {
             );
             let _ = net.conn.send(ToConn::Send(msg));
         }
+        // Every network has a server buffer, even before the server says
+        // anything, so front ends always have somewhere to type commands.
+        self.ensure_buffer(id, SERVER_BUFFER, BufferKind::Server);
     }
 
     fn batch(&mut self, id: &str, batch: Batch) {
@@ -562,6 +566,12 @@ mod tests {
             sent[0].starts_with("CHATHISTORY TARGETS timestamp="),
             "{sent:?}"
         );
+        assert_eq!(sent.len(), 1, "no MARKREAD for the server buffer: {sent:?}");
+        assert!(h.events().contains(&Event::BufferAdded {
+            network: "1".into(),
+            name: SERVER_BUFFER.into(),
+            kind: BufferKind::Server
+        }));
 
         let mut batch = Batch {
             kind: "draft/chathistory-targets".into(),

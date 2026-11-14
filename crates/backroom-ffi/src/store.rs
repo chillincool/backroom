@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use backroom_core::auth::{StoreError, TokenSet, TokenStore};
 use secrecy::{ExposeSecret, SecretString};
@@ -17,8 +17,27 @@ pub trait SecretStore: Send + Sync {
     fn clear(&self) -> Result<(), BackroomError>;
 }
 
-/// Adapts a foreign [`SecretStore`] to the core's [`TokenStore`].
-pub(crate) struct ForeignTokenStore(pub Arc<dyn SecretStore>);
+/// Adapts a foreign [`SecretStore`] to the core's [`TokenStore`], keeping
+/// the tokens in memory after the first read: each Keychain read can prompt
+/// the user, and the core loads tokens for every connection.
+pub(crate) struct ForeignTokenStore {
+    store: Arc<dyn SecretStore>,
+    /// `None`: not read yet. `Some(None)`: read, nothing stored.
+    cache: Mutex<Option<Option<TokenSet>>>,
+}
+
+impl ForeignTokenStore {
+    pub(crate) fn new(store: Arc<dyn SecretStore>) -> Self {
+        ForeignTokenStore {
+            store,
+            cache: Mutex::new(None),
+        }
+    }
+
+    fn cache(&self) -> MutexGuard<'_, Option<Option<TokenSet>>> {
+        self.cache.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
 fn store_error(e: BackroomError) -> StoreError {
     match e {
@@ -29,21 +48,35 @@ fn store_error(e: BackroomError) -> StoreError {
 
 impl TokenStore for ForeignTokenStore {
     fn load(&self) -> Result<Option<TokenSet>, StoreError> {
-        let Some(value) = self.0.load().map_err(store_error)? else {
-            return Ok(None);
+        let mut cache = self.cache();
+        if let Some(cached) = cache.as_ref() {
+            return Ok(cached.clone());
+        }
+        let tokens = match self.store.load().map_err(store_error)? {
+            Some(value) => {
+                let value = SecretString::from(value);
+                Some(TokenSet::from_json(value.expose_secret())?)
+            }
+            None => None,
         };
-        let value = SecretString::from(value);
-        TokenSet::from_json(value.expose_secret()).map(Some)
+        *cache = Some(tokens.clone());
+        Ok(tokens)
     }
 
     fn save(&self, tokens: &TokenSet) -> Result<(), StoreError> {
-        self.0
+        let mut cache = self.cache();
+        self.store
             .save(tokens.to_json().expose_secret().to_owned())
-            .map_err(store_error)
+            .map_err(store_error)?;
+        *cache = Some(Some(tokens.clone()));
+        Ok(())
     }
 
     fn clear(&self) -> Result<(), StoreError> {
-        self.0.clear().map_err(store_error)
+        let mut cache = self.cache();
+        self.store.clear().map_err(store_error)?;
+        *cache = Some(None);
+        Ok(())
     }
 }
 
@@ -98,7 +131,7 @@ pub(crate) mod tests {
 
     #[test]
     fn round_trip_through_foreign_store() {
-        let store = ForeignTokenStore(Arc::new(MemoryStore::default()));
+        let store = ForeignTokenStore::new(Arc::new(MemoryStore::default()));
         assert!(store.load().unwrap().is_none());
         store.save(&tokens()).unwrap();
         let loaded = store.load().unwrap().unwrap();
@@ -107,9 +140,47 @@ pub(crate) mod tests {
         assert!(store.load().unwrap().is_none());
     }
 
+    /// Counts reads, like Keychain prompts.
+    #[derive(Default)]
+    struct CountingStore {
+        inner: MemoryStore,
+        loads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SecretStore for CountingStore {
+        fn load(&self) -> Result<Option<String>, BackroomError> {
+            self.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.load()
+        }
+        fn save(&self, value: String) -> Result<(), BackroomError> {
+            self.inner.save(value)
+        }
+        fn clear(&self) -> Result<(), BackroomError> {
+            self.inner.clear()
+        }
+    }
+
+    #[test]
+    fn reads_the_foreign_store_once() {
+        let counting = Arc::new(CountingStore::default());
+        counting
+            .inner
+            .save(tokens().to_json().expose_secret().to_owned())
+            .unwrap();
+        let store = ForeignTokenStore::new(counting.clone());
+        for _ in 0..5 {
+            assert!(store.load().unwrap().is_some());
+        }
+        store.save(&tokens()).unwrap();
+        assert!(store.load().unwrap().is_some());
+        store.clear().unwrap();
+        assert!(store.load().unwrap().is_none());
+        assert_eq!(counting.loads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn foreign_errors_pass_through() {
-        let store = ForeignTokenStore(Arc::new(FailingStore));
+        let store = ForeignTokenStore::new(Arc::new(FailingStore));
         assert_eq!(store.load().unwrap_err().0, "keychain locked");
         assert_eq!(store.save(&tokens()).unwrap_err().0, "keychain locked");
     }
@@ -117,7 +188,7 @@ pub(crate) mod tests {
     #[test]
     fn corrupt_value_is_a_store_error() {
         let memory = Arc::new(MemoryStore(Mutex::new(Some("not json".into()))));
-        let store = ForeignTokenStore(memory);
+        let store = ForeignTokenStore::new(memory);
         assert!(store.load().is_err());
     }
 }

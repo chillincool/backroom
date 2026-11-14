@@ -1,0 +1,9 @@
+// Code signing. Default: ad hoc ("Sign to Run Locally"), which works
+// anywhere but changes on every build, so the Keychain asks again after
+// each rebuild. For a stable identity, create a self-signed code-signing
+// certificate and name it in Signing.local.xcconfig (git-ignored):
+//   CODE_SIGN_IDENTITY = Backroom Development
+CODE_SIGN_IDENTITY = -
+CODE_SIGN_STYLE = Manual
+DEVELOPMENT_TEAM =
+#include? "Signing.local.xcconfig"

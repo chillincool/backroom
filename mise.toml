@@ -6,6 +6,8 @@
 [tools]
 rust = { version = "1.93.0", components = "clippy,rustfmt" }
 "aqua:EmbarkStudios/cargo-deny" = "0.20.2"
+# Generates apple/Backroom.xcodeproj from apple/project.yml; macOS only.
+xcodegen = { version = "2.46.0", os = ["macos"] }
 
 [tasks.fmt]
 description = "Fail if any Rust file needs rustfmt"
@@ -50,3 +52,12 @@ run = "scripts/e2e.sh realm"
 [tasks."apple:core"]
 description = "Build backroom-ffi and regenerate apple/BackroomCore (needs Xcode)"
 run = "scripts/build-apple.sh"
+
+[tasks."apple:project"]
+description = "Generate apple/Backroom.xcodeproj from apple/project.yml"
+run = "xcodegen generate --spec apple/project.yml --quiet"
+
+[tasks."apple:app"]
+description = "Build the macOS app and run its tests (after apple:core)"
+depends = ["apple:project"]
+run = "xcodebuild -project apple/Backroom.xcodeproj -scheme Backroom -destination 'platform=macOS' -derivedDataPath apple/build -quiet test"
