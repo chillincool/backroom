@@ -49,6 +49,10 @@ if $universal; then
 	targets=(x86_64-apple-darwin aarch64-apple-darwin)
 fi
 
+# Match Package.swift's `platforms`; without this, C/assembly in ring is
+# built for the running macOS and the linker warns (and older Macs may fail).
+export MACOSX_DEPLOYMENT_TARGET=14.0
+
 cargo_flags=(--locked -p backroom-ffi)
 [[ $profile == release ]] && cargo_flags+=(--release)
 
