@@ -80,7 +80,8 @@ func makeModel(loggedIn: Bool = true, settings: ServerSettings = .e2e,
     let client = FakeClient()
     client.loggedIn = loggedIn
     let defaults = UserDefaults(suiteName: "backroom-tests-\(UUID().uuidString)")!
-    let model = AppModel(settings: settings, authenticator: authenticator, defaults: defaults, makeClient: { _ in client })
+    let model = AppModel(servers: ServerList(servers: [settings]), authenticator: authenticator, defaults: defaults,
+                         makeClient: { _ in client })
     await model.start()
     return (model, client)
 }
@@ -127,40 +128,56 @@ let net = Network(id: "1", name: "libera", upstreamState: "connected", attribute
     @Test func newInstallStartsAtTheLoginScreen() async {
         var made = 0
         let defaults = UserDefaults(suiteName: "backroom-tests-\(UUID().uuidString)")!
-        let model = AppModel(settings: .blank, authenticator: FakeAuthenticator(), defaults: defaults,
+        let model = AppModel(servers: ServerList(), authenticator: FakeAuthenticator(), defaults: defaults,
                              makeClient: { _ in made += 1; return FakeClient() })
         await model.start()
         #expect(model.phase == .loggedOut)
         #expect(made == 0)
     }
 
-    @Test func loginScreenSavesSettingsThenLogsIn() async {
+    @Test func firstSavedServerIsUsed() async {
         let client = FakeClient()
         let defaults = UserDefaults(suiteName: "backroom-tests-\(UUID().uuidString)")!
-        var configs: [ServerSettings] = []
-        let model = AppModel(settings: .blank, authenticator: FakeAuthenticator(), defaults: defaults,
-                             makeClient: { configs.append($0); return client })
+        var made: [String] = []
+        let model = AppModel(servers: ServerList(), authenticator: FakeAuthenticator(), defaults: defaults,
+                             makeClient: { made.append($0.displayName); return client })
         await model.start()
-        await model.logIn(.e2ePassword, password: "dave-secret")
-        #expect(configs == [.e2ePassword])
+        await model.save(server: .e2ePassword)
+        #expect(model.settings == .e2ePassword)
+        #expect(made == ["Test stack (dave, password)"])
+        await model.logIn(password: "dave-secret")
         #expect(client.calls == ["password 11 chars", "connect"])
         #expect(model.phase == .online)
-        #expect(ServerSettings.load(from: defaults) == .e2ePassword)
+        #expect(ServerList.load(from: defaults).current == .e2ePassword)
 
-        // Same settings again (after a wrong password): no new client.
-        await model.logIn(.e2ePassword, password: "again")
-        #expect(configs.count == 1)
+        // Adding another server doesn't switch to it; renaming the one in
+        // use doesn't reconnect.
+        await model.save(server: .e2e)
+        var renamed = ServerSettings.e2ePassword
+        renamed.name = "dave"
+        await model.save(server: renamed)
+        #expect(made.count == 1)
+        #expect(model.phase == .online)
     }
 
-    @Test func loginScreenSingleSignOn() async {
+    @Test func switchingServers() async {
         let client = FakeClient()
+        client.loggedIn = true
         let defaults = UserDefaults(suiteName: "backroom-tests-\(UUID().uuidString)")!
-        let model = AppModel(settings: .blank, authenticator: FakeAuthenticator(), defaults: defaults,
-                             makeClient: { _ in client })
+        var made: [UUID] = []
+        let model = AppModel(servers: ServerList(servers: [.e2e, .e2ePassword]), authenticator: FakeAuthenticator(),
+                             defaults: defaults, makeClient: { made.append($0.id); return client })
         await model.start()
-        await model.logIn(.e2e)
-        #expect(client.calls.last == "connect")
+        await model.select(server: ServerSettings.e2ePassword.id)
+        #expect(made == [ServerSettings.e2e.id, ServerSettings.e2ePassword.id])
+        #expect(model.settings == .e2ePassword)
+        #expect(ServerList.load(from: defaults).selected == ServerSettings.e2ePassword.id)
+
+        // Removing the server in use deletes its login and falls back.
+        await model.remove(server: ServerSettings.e2ePassword.id)
+        #expect(model.servers.servers == [.e2e])
         #expect(model.settings == .e2e)
+        #expect(client.calls.contains("logout"))
     }
 
     @Test func rejectedPasswordLogsOut() async {
@@ -194,14 +211,17 @@ let net = Network(id: "1", name: "libera", upstreamState: "connected", attribute
         #expect(!noNick.isComplete)
         #expect(noNick.clientConfig.nick == "backroom")
         #expect(!ServerSettings.blank.isComplete)
-        // Switching presets keeps the other method's field.
-        #expect(ServerSettings.e2ePassword.keeping(issuer: "https://id.example").issuer == "https://id.example")
-        #expect(ServerSettings.e2e.keeping(username: "dave").username == "dave")
+        #expect(ServerSettings(serverURL: "wss://irc.example.net/socket", login: .password, nick: "").displayName
+                == "irc.example.net")
     }
 
     @Test func settingsSavedBeforePasswordsAreSingleSignOn() throws {
         let old = #"{"serverURL":"wss://irc.example.net/socket","issuer":"https://id.example.net/realms/main","nick":"me"}"#
-        let settings = try JSONDecoder().decode(ServerSettings.self, from: Data(old.utf8))
+        let defaults = UserDefaults(suiteName: "backroom-tests-\(UUID().uuidString)")!
+        defaults.set(Data(old.utf8), forKey: "serverSettings")
+        let list = ServerList.load(from: defaults)
+        #expect(list.servers.count == 1)
+        let settings = try #require(list.current)
         #expect(settings.login == .singleSignOn)
         #expect(settings.issuer == "https://id.example.net/realms/main")
         #expect(settings.keychainAccount == "https://id.example.net/realms/main wss://irc.example.net/socket")
@@ -555,13 +575,13 @@ let net = Network(id: "1", name: "libera", upstreamState: "connected", attribute
         let defaults = UserDefaults(suiteName: "backroom-tests-\(UUID().uuidString)")!
         let client = FakeClient()
         client.loggedIn = true
-        let first = AppModel(settings: .e2e, authenticator: FakeAuthenticator(), defaults: defaults, makeClient: { _ in client })
+        let first = AppModel(servers: ServerList(servers: [.e2e]), authenticator: FakeAuthenticator(), defaults: defaults, makeClient: { _ in client })
         await first.start()
         first.apply(.networkUpdated(network: net))
         first.apply(.bufferAdded(network: "1", name: "#b", kind: .channel))
         first.select(BufferID(network: "1", name: "#b"))
 
-        let second = AppModel(settings: .e2e, authenticator: FakeAuthenticator(), defaults: defaults, makeClient: { _ in client })
+        let second = AppModel(servers: ServerList(servers: [.e2e]), authenticator: FakeAuthenticator(), defaults: defaults, makeClient: { _ in client })
         await second.start()
         second.apply(.networkUpdated(network: net))
         second.apply(.bufferAdded(network: "1", name: "#a", kind: .channel))
@@ -619,7 +639,7 @@ let net = Network(id: "1", name: "libera", upstreamState: "connected", attribute
         let defaults = UserDefaults(suiteName: "backroom-tests-\(UUID().uuidString)")!
         let client = FakeClient()
         client.loggedIn = true
-        let model = AppModel(settings: .e2e, authenticator: FakeAuthenticator(), defaults: defaults, makeClient: { _ in client })
+        let model = AppModel(servers: ServerList(servers: [.e2e]), authenticator: FakeAuthenticator(), defaults: defaults, makeClient: { _ in client })
         await model.start()
         model.apply(.networkUpdated(network: net))
         for name in ["#a", "#b"] { model.apply(.bufferAdded(network: "1", name: name, kind: .channel)) }
@@ -646,7 +666,7 @@ let net = Network(id: "1", name: "libera", upstreamState: "connected", attribute
         #expect(model.tabTitle(model.tabs[1]) == "work")
 
         // Restored on the next launch.
-        let again = AppModel(settings: .e2e, authenticator: FakeAuthenticator(), defaults: defaults, makeClient: { _ in client })
+        let again = AppModel(servers: ServerList(servers: [.e2e]), authenticator: FakeAuthenticator(), defaults: defaults, makeClient: { _ in client })
         #expect(again.tabs.map(\.name) == [nil, "work"])
         #expect(again.currentTab == model.currentTab)
 

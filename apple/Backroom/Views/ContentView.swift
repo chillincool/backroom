@@ -47,16 +47,16 @@ struct NoticeBar: View {
     }
 }
 
-/// The first screen: which soju, and the login. A username and password by
-/// default; single sign-on (OIDC, for `auth oauth2`) with the issuer set in
+/// The first screen: pick a saved server and log in the way it's set up
+/// (a password, or single sign-on). Servers are added and edited in
 /// Settings → Account.
 struct LoginView: View {
     @Environment(AppModel.self) private var model
-    @State private var draft = ServerSettings.blank
+    @Environment(\.openSettings) private var openSettings
     @State private var password = ""
-    @FocusState private var focus: Field?
+    @FocusState private var passwordFocused: Bool
 
-    private enum Field { case server, username, password }
+    private var server: ServerSettings { model.settings }
 
     var body: some View {
         VStack(spacing: 20) {
@@ -65,76 +65,80 @@ struct LoginView: View {
                     .font(.system(size: 48))
                     .foregroundStyle(.secondary)
                 Text("Backroom").font(.largeTitle.bold())
-                Text("Log in to your soju bouncer").foregroundStyle(.secondary)
             }
 
-            if case .failed(let message) = model.phase {
-                Text("Couldn't connect: \(message)")
-                    .foregroundStyle(.red)
-                    .multilineTextAlignment(.center)
-                    .frame(maxWidth: 420)
-            }
-
-            Form {
-                TextField("Server", text: $draft.serverURL, prompt: Text("wss://irc.example.net/socket"))
-                    .focused($focus, equals: .server)
-                if draft.login == .password {
-                    TextField("Username", text: $draft.username)
-                        .textContentType(.username)
-                        .focused($focus, equals: .username)
-                    SecureField("Password", text: $password)
-                        .textContentType(.password)
-                        .focused($focus, equals: .password)
-                        .onSubmit(logIn)
+            if model.servers.servers.isEmpty {
+                Text("Add your soju server to get started.")
+                    .foregroundStyle(.secondary)
+                Button("Add Server…", action: addServer)
+                    .keyboardShortcut(.defaultAction)
+                    .controlSize(.large)
+            } else {
+                if case .failed(let message) = model.phase {
+                    Text("Couldn't connect: \(message)")
+                        .foregroundStyle(.red)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 420)
                 }
-            }
-            .frame(width: 360)
-            .fixedSize(horizontal: false, vertical: true)
-            .disabled(model.phase == .loggingIn)
+                Form {
+                    Picker("Server", selection: serverSelection) {
+                        ForEach(model.servers.servers) { Text($0.displayName).tag($0.id) }
+                    }
+                    if server.login == .password && server.isComplete {
+                        LabeledContent("Username", value: server.username)
+                        SecureField("Password", text: $password)
+                            .textContentType(.password)
+                            .focused($passwordFocused)
+                            .onSubmit(logIn)
+                    }
+                }
+                .frame(width: 360)
+                .fixedSize(horizontal: false, vertical: true)
+                .disabled(model.phase == .loggingIn)
 
-            switch draft.login {
-            case .password: passwordButtons
-            case .singleSignOn: singleSignOnButtons
+                loginButtons
+
+                Button("Add Server…", action: addServer)
+                    .buttonStyle(.link)
             }
         }
         .padding(40)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .onAppear {
-            draft = model.settings
-            focus = draft.serverURL.isEmpty ? .server
-                : draft.login == .password ? (draft.username.isEmpty ? .username : .password) : nil
+        .onAppear { passwordFocused = true }
+        .onChange(of: server.id) {
+            password = ""
+            passwordFocused = true
         }
     }
 
-    /// The issuer comes from Settings → Account, read when it's used (the
-    /// Settings window can change it while this screen is open).
-    private var issuer: String { model.settings.issuer }
+    private var serverSelection: Binding<UUID> {
+        Binding(get: { server.id }, set: { id in Task { await model.select(server: id) } })
+    }
 
-    @ViewBuilder private var passwordButtons: some View {
-        Button("Log In", action: logIn)
-            .keyboardShortcut(.defaultAction)
-            .controlSize(.large)
-            .disabled(!draft.isComplete || password.isEmpty)
-
-        VStack(spacing: 8) {
-            HStack {
-                VStack { Divider() }
-                Text("or").foregroundStyle(.secondary)
-                VStack { Divider() }
-            }
-            .frame(width: 260)
-            if issuer.isEmpty {
-                SettingsLink { Text("Set Up Single Sign-On…") }
-                Text("OIDC (Keycloak, Authentik, …), in Settings → Account")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            } else {
-                Button("Log In with Single Sign-On") {
-                    draft.login = .singleSignOn
-                    logIn()
-                }
-                .disabled(draft.serverURL.isEmpty)
-                Text(issuer)
+    @ViewBuilder private var loginButtons: some View {
+        if !server.isComplete {
+            Text(server.login == .password
+                 ? "This server needs a username."
+                 : "This server needs a single sign-on issuer.")
+                .foregroundStyle(.secondary)
+            Button("Edit Server…", action: editServer)
+        } else if model.phase == .loggingIn {
+            ProgressView().controlSize(.small)
+            Text("Finish logging in in your browser.")
+                .foregroundStyle(.secondary)
+            Button("Cancel") { model.cancelLogin() }
+        } else {
+            switch server.login {
+            case .password:
+                Button("Log In", action: logIn)
+                    .keyboardShortcut(.defaultAction)
+                    .controlSize(.large)
+                    .disabled(password.isEmpty)
+            case .singleSignOn:
+                Button("Log In with Single Sign-On", action: logIn)
+                    .keyboardShortcut(.defaultAction)
+                    .controlSize(.large)
+                Text(server.issuer)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
@@ -142,42 +146,25 @@ struct LoginView: View {
         }
     }
 
-    @ViewBuilder private var singleSignOnButtons: some View {
-        if model.phase == .loggingIn {
-            ProgressView().controlSize(.small)
-            Text("Finish logging in in your browser.")
-                .foregroundStyle(.secondary)
-            Button("Cancel") { model.cancelLogin() }
-        } else {
-            if issuer.isEmpty {
-                SettingsLink { Text("Set Up Single Sign-On…") }
-                    .controlSize(.large)
-            } else {
-                Button("Log In with Single Sign-On", action: logIn)
-                    .keyboardShortcut(.defaultAction)
-                    .controlSize(.large)
-                    .disabled(draft.serverURL.isEmpty)
-            }
-            Button("Use a Username and Password Instead") {
-                draft.login = .password
-                focus = draft.username.isEmpty ? .username : .password
-            }
-            .buttonStyle(.link)
-        }
-    }
-
     private func logIn() {
-        draft.serverURL = draft.serverURL.trimmingCharacters(in: .whitespaces)
-        draft.issuer = issuer
-        guard draft.isComplete else { return }
-        switch draft.login {
+        switch server.login {
         case .password:
             guard !password.isEmpty else { return }
             let entered = password
             password = ""
-            Task { await model.logIn(draft, password: entered) }
+            Task { await model.logIn(password: entered) }
         case .singleSignOn:
-            Task { await model.logIn(draft) }
+            Task { await model.logIn() }
         }
+    }
+
+    private func addServer() { open(.blank) }
+    private func editServer() { open(server) }
+
+    /// Opens Settings → Account with `server` in the editor.
+    private func open(_ server: ServerSettings) {
+        model.serverToEdit = server
+        UserDefaults.standard.set(SettingsView.Tab.account.rawValue, forKey: "settingsTab")
+        openSettings()
     }
 }

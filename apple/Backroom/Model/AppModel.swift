@@ -22,7 +22,13 @@ final class AppModel {
     }
 
     private(set) var phase: Phase = .loggedOut
-    private(set) var settings: ServerSettings
+    /// The saved servers; the session uses `settings`, the selected one.
+    private(set) var servers: ServerList
+    /// The server in use; blank when none is saved.
+    var settings: ServerSettings { servers.current ?? .blank }
+    /// Set by the login screen ("Add Server…", "Edit Server…"): Settings →
+    /// Account opens this server in its editor and clears it.
+    var serverToEdit: ServerSettings?
     /// The control connection's state.
     private(set) var control: ConnectionState?
     private(set) var networks: [NetworkState] = []
@@ -139,10 +145,10 @@ final class AppModel {
         }
     }
 
-    init(settings: ServerSettings, authenticator: any WebAuthenticator,
+    init(servers: ServerList, authenticator: any WebAuthenticator,
          defaults: UserDefaults = .standard, preferences: Preferences? = nil,
          makeClient: @escaping ClientFactory) {
-        self.settings = settings
+        self.servers = servers
         self.defaults = defaults
         self.preferences = preferences ?? Preferences(defaults: defaults)
         let saved: (tabs: [WorkspaceTab], current: UUID)? = defaults.data(forKey: Self.tabsKey)
@@ -190,26 +196,34 @@ final class AppModel {
         }
     }
 
-    /// Switches to `new` without connecting, ready to log in.
-    private func use(_ new: ServerSettings) async {
-        guard new != settings || client == nil else { return }
-        settings = new
-        new.save(to: defaults)
-        await start(connect: false)
+    /// Switches to another saved server and connects if it has a login.
+    func select(server id: UUID) async {
+        guard id != servers.current?.id, servers.servers.contains(where: { $0.id == id }) else { return }
+        servers.selected = id
+        servers.save(to: defaults)
+        await start()
     }
 
-    /// The login screen: saves `new` and logs in with a password.
-    func logIn(_ new: ServerSettings, password: String) async {
-        guard phase != .loggingIn, new.login == .password, new.isComplete, !password.isEmpty else { return }
-        await use(new)
-        await logIn(password: password)
+    /// Adds a server or saves changes to one. Changing the server in use
+    /// starts over with it; the first one saved becomes the one in use.
+    func save(server: ServerSettings) async {
+        let before = servers.current
+        servers.save(server)
+        servers.save(to: defaults)
+        if servers.current?.connectsLike(before) != true { await start() }
     }
 
-    /// The login screen: saves `new` and logs in with single sign-on.
-    func logIn(_ new: ServerSettings) async {
-        guard phase != .loggingIn, new.login == .singleSignOn, new.isComplete else { return }
-        await use(new)
-        await logIn()
+    /// Forgets a server and its stored login.
+    func remove(server id: UUID) async {
+        guard let server = servers.servers.first(where: { $0.id == id }) else { return }
+        let inUse = id == servers.current?.id
+        if inUse { stopSession() }
+        if server.isComplete {
+            do { try makeClient(server).logout() } catch { notice = Self.describe(error) }
+        }
+        servers.remove(id)
+        servers.save(to: defaults)
+        if inUse { await start() }
     }
 
     /// Saves the password of a password account and connects; soju checks
@@ -256,13 +270,6 @@ final class AppModel {
         eventTask = nil
         resetChat()
         phase = .loggedOut
-    }
-
-    /// Saves new settings and starts over with them.
-    func apply(settings new: ServerSettings) async {
-        settings = new
-        new.save(to: defaults)
-        await start()
     }
 
     private func connect() async {

@@ -1,8 +1,9 @@
 import BackroomCore
 import Foundation
 
-/// Which soju to use and how to log in. Not secret; kept in UserDefaults.
-struct ServerSettings: Codable, Equatable, Sendable {
+/// One saved soju server and how to log in to it. Not secret; kept in
+/// UserDefaults as part of a `ServerList`.
+struct ServerSettings: Codable, Equatable, Identifiable, Sendable {
     enum Login: String, Codable, CaseIterable, Sendable {
         /// soju's own accounts (`auth internal`): username and password.
         case password
@@ -10,6 +11,9 @@ struct ServerSettings: Codable, Equatable, Sendable {
         case singleSignOn
     }
 
+    var id: UUID
+    /// Shown in the server menu; the host when empty.
+    var name: String
     var serverURL: String
     var login: Login
     /// The soju username, for `.password`.
@@ -18,7 +22,10 @@ struct ServerSettings: Codable, Equatable, Sendable {
     var issuer: String
     var nick: String
 
-    init(serverURL: String, login: Login, username: String = "", issuer: String = "", nick: String) {
+    init(id: UUID = UUID(), name: String = "", serverURL: String, login: Login,
+         username: String = "", issuer: String = "", nick: String) {
+        self.id = id
+        self.name = name
         self.serverURL = serverURL
         self.login = login
         self.username = username
@@ -29,6 +36,8 @@ struct ServerSettings: Codable, Equatable, Sendable {
     /// Settings saved before password logins existed were single sign-on.
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
         serverURL = try c.decode(String.self, forKey: .serverURL)
         login = try c.decodeIfPresent(Login.self, forKey: .login) ?? .singleSignOn
         username = try c.decodeIfPresent(String.self, forKey: .username) ?? ""
@@ -45,30 +54,31 @@ struct ServerSettings: Codable, Equatable, Sendable {
     /// doesn't log you out.
     static let scopes = ["soju_roles", "offline_access"]
 
-    /// A new install: the login screen asks for the rest.
-    static let blank = ServerSettings(serverURL: "", login: .password, nick: "")
+    /// What "Add Server" starts from.
+    static var blank: ServerSettings { ServerSettings(serverURL: "", login: .password, nick: "") }
 
     /// The local e2e stack (`mise run e2e:up`), log in as alice / alice.
     static let e2e = ServerSettings(
+        id: UUID(uuidString: "E2E00000-0000-0000-0000-000000000001")!, name: "Test stack (alice, SSO)",
         serverURL: "ws://127.0.0.1:18081/", login: .singleSignOn,
         issuer: "http://localhost:18080/realms/e2e", nick: "alice")
 
     /// The e2e stack's soju with its own accounts: dave / dave-secret.
     static let e2ePassword = ServerSettings(
+        id: UUID(uuidString: "E2E00000-0000-0000-0000-000000000002")!, name: "Test stack (dave, password)",
         serverURL: "ws://127.0.0.1:28081/", login: .password, username: "dave", nick: "dave")
 
-    /// This preset with another account's username kept.
-    func keeping(username: String) -> ServerSettings {
-        var copy = self
-        copy.username = username
-        return copy
+    /// Same server, login and nick as `other`: only the name differs.
+    func connectsLike(_ other: ServerSettings?) -> Bool {
+        guard var other else { return false }
+        other.name = name
+        return other == self
     }
 
-    /// This preset with another account's issuer kept.
-    func keeping(issuer: String) -> ServerSettings {
-        var copy = self
-        copy.issuer = issuer
-        return copy
+    /// The name, or else the server's host.
+    var displayName: String {
+        if !name.isEmpty { return name }
+        return URLComponents(string: serverURL)?.host ?? serverURL
     }
 
     /// Whether the fields the login method needs are filled in.
@@ -106,14 +116,53 @@ struct ServerSettings: Codable, Equatable, Sendable {
         case .password: "password \(username) \(serverURL)"
         }
     }
+}
 
-    private static let key = "serverSettings"
+/// The saved servers and which one the app uses. One session at a time;
+/// each server keeps its own Keychain login.
+struct ServerList: Codable, Equatable, Sendable {
+    var servers: [ServerSettings] = []
+    var selected: UUID?
 
-    static func load(from defaults: UserDefaults = .standard) -> ServerSettings {
-        guard let data = defaults.data(forKey: key),
-            let settings = try? JSONDecoder().decode(ServerSettings.self, from: data)
-        else { return .blank }
-        return settings
+    init(servers: [ServerSettings] = [], selected: UUID? = nil) {
+        self.servers = servers
+        self.selected = selected ?? servers.first?.id
+    }
+
+    /// The selected server, or the first.
+    var current: ServerSettings? { servers.first { $0.id == selected } ?? servers.first }
+
+    /// Adds `server`, or replaces the saved one with its id.
+    mutating func save(_ server: ServerSettings) {
+        if let i = servers.firstIndex(where: { $0.id == server.id }) {
+            servers[i] = server
+        } else {
+            servers.append(server)
+        }
+        if current == nil || selected == nil { selected = server.id }
+    }
+
+    mutating func remove(_ id: UUID) {
+        servers.removeAll { $0.id == id }
+        if selected == id { selected = servers.first?.id }
+    }
+
+    private static let key = "servers"
+    /// Before saved servers: one `ServerSettings`.
+    private static let legacyKey = "serverSettings"
+
+    static func load(from defaults: UserDefaults = .standard) -> ServerList {
+        if let data = defaults.data(forKey: key),
+            let list = try? JSONDecoder().decode(ServerList.self, from: data)
+        {
+            return list
+        }
+        if let data = defaults.data(forKey: legacyKey),
+            let old = try? JSONDecoder().decode(ServerSettings.self, from: data)
+        {
+            return ServerList(servers: [old])
+        }
+        return ServerList()
     }
 
     func save(to defaults: UserDefaults) {

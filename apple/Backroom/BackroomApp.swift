@@ -14,7 +14,7 @@ struct BackroomApp: App {
         let prefs = Preferences()
         _prefs = State(initialValue: prefs)
         let model = AppModel(
-            settings: ServerSettings.load(),
+            servers: ServerList.load(),
             authenticator: Self.login,
             preferences: prefs,
             makeClient: { settings in
