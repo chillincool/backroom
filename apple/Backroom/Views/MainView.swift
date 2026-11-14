@@ -46,11 +46,15 @@ struct MainView: View {
                 }
                 .help("Show or hide the sidebar")
                 .keyboardShortcut("s", modifiers: [.command, .control])
+                .buttonStyle(.borderless)
             }
-            // Tabs, in the title bar while there are several.
-            ToolbarItem(placement: .principal) {
+            .withoutGlass()
+            // Tabs, left in the title bar while there are several. No item
+            // gets macOS 26's glass bubble: the title bar stays flat.
+            ToolbarItem(placement: .navigation) {
                 if model.tabs.count > 1 { TabStrip() }
             }
+            .withoutGlass()
             ToolbarItem {
                 Button {
                     showMembers.toggle()
@@ -59,14 +63,18 @@ struct MainView: View {
                 }
                 .help("Show or hide the member list")
                 .disabled(model.selectedBuffer?.kind != .channel)
+                .buttonStyle(.borderless)
             }
+            .withoutGlass()
             ToolbarItem {
                 Menu {
                     Button("Log Out", role: .destructive) { model.logOut() }
                 } label: {
                     Label("Account", systemImage: "person.crop.circle")
                 }
+                .menuStyle(.borderlessButton)
             }
+            .withoutGlass()
         }
     }
 }
@@ -334,5 +342,17 @@ struct SplitDivider: View {
                     )
             }
             .zIndex(1)
+    }
+}
+
+extension ToolbarContent {
+    /// macOS 26 draws a shared glass background behind toolbar items; this
+    /// leaves the item on the plain title bar.
+    @ToolbarContentBuilder func withoutGlass() -> some ToolbarContent {
+        if #available(macOS 26, *) {
+            sharedBackgroundVisibility(.hidden)
+        } else {
+            self
+        }
     }
 }
