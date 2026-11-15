@@ -175,10 +175,19 @@ server that doesn't offer our SASL mechanism. Each connection gets a
   server buffer, WHOIS card, away, more caps, mIRC spans, commands, Tab
   completion, mentions/highlights/ignore, moderation menu, split panes and
   title-bar tabs.
-- PR 3 (branch `feat/notifications-search`): macOS notifications (mentions,
+- Merged PR 3 (#14): macOS notifications (mentions,
   PMs, optionally all; click opens; Dock badge), `soju.im/search` (⌘F),
   channel settings sheet (modes, key, limit, bans), `+typing` both ways,
   MONITOR online dots, CTCP VERSION/PING/TIME/CLIENTINFO answered.
+- Merged #15: soju password logins (`auth internal`) and saved servers
+  (login screen server menu, Settings → Account editor).
+- Merged #16 + #17: standalone mode ("No bouncer"): core `local/`, FFI
+  `LoginMethod::Standalone`, app entry with Connect, network login section
+  (SASL / server password / NickServ), optional plain-text logs. Owner
+  tested it against ergo: works. Database
+  `~/Library/Application Support/Backroom/standalone.sqlite`, logs default
+  to `…/Backroom/logs`; "No bouncer" reconnects at launch only if it was
+  connected at quit (UserDefaults `standaloneConnected`).
 - Verified soju v0.11.1 facts: SEARCH needs `in=` (max 100 results, batch
   `soju.im/search`); soju forwards CTCP to every client and answers none
   (two clients both answering means duplicate replies); TAGMSG reaches only
@@ -214,25 +223,16 @@ server that doesn't offer our SASL mechanism. Each connection gets a
 
 ## Pick up here (2026-11-14)
 
-- PRs #12–#16 merged (#15: soju password login + saved servers; #16:
-  standalone mode in the core). **PR C** (branch `feat/standalone-app`):
-  `LoginMethod::Standalone`, "No bouncer" in the login menu with Connect
-  (reconnects at launch only if it was connected when the app quit;
-  UserDefaults `standaloneConnected`), network form login section,
-  Settings → Account "Without a Bouncer" text log toggle/folder/Show in
-  Finder. Database: `~/Library/Application Support/Backroom/standalone.sqlite`;
-  logs default to `…/Backroom/logs`. Roadmap agreed with the owner:
-  **standalone mode** (no bouncer: networks stored locally, direct
-  connections, SASL/NickServ, rejoin; local history in SQLite via
-  `rusqlite` bundled, plus an optional "also write plain-text logs" setting,
-  per channel per day), then ZNC (low priority). One account per client:
-  the owner sees no use for several accounts at once. A soju installer was
-  rejected (standalone mode lowers the entry bar more cheaply).
+- All of the owner's latest asks are done (#15 soju password login, #16/#17
+  standalone mode). **Next work is the owner's call.** Remaining roadmap:
+  ZNC support (low priority; bigger than standalone). One account per
+  client: the owner sees no use for several accounts at once. A soju
+  installer was rejected (standalone mode lowers the entry bar instead).
 - A soju uses one login method (`auth internal`: `sasl=PLAIN`; `auth
   oauth2`: `sasl=PLAIN,OAUTHBEARER`, PLAIN taking a token). The method and
   issuer are set per saved server; no detection. Login screen: server menu,
-  then that server's form; "Add Server…" opens Settings → Account. Standalone
-  mode will be another entry in that menu with a Connect button.
+  then that server's form ("Add soju Server…" opens Settings → Account);
+  "No bouncer" is always the last entry, with a Connect button.
 - Local stack quirk: soju-internal's dave/erin have piled up ergo networks
   from test runs, so ergo answers "Too many clients from your network" and
   `history_round_trip_through_ergo` / `live_session_…` fail locally (fine on
@@ -243,7 +243,13 @@ server that doesn't offer our SASL mechanism. Each connection gets a
   so warn first). alice has networks libera (nick backroom-dev),
   P2P-Network (nick chillin-dev) and ergo-test (no nick set, so IRC nick
   `alice`, the soju username; re-added 2026-11-14).
-- Test user "bob" on ergo (ergo isn't exposed to the host; 16667 is soju):
+- ergo on `127.0.0.1:46667`: `compose.yaml` publishes it, but the running
+  local stack predates that, so the port is closed until ergo is recreated.
+  Without recreating (ergo state survives), forward it temporarily:
+  `docker run -d --rm --name backroom-ergo-forward --network backroom-e2e_default -p 127.0.0.1:46667:6667 alpine/socat:1.8.0.3 tcp-listen:6667,fork,reuseaddr tcp-connect:ergo:6667`
+  (remove with `docker rm -f backroom-ergo-forward`). In the app: No
+  bouncer → Connect → add network `127.0.0.1`, port 46667, TLS off.
+- Test user "bob" on ergo (16667 is soju, not ergo):
   `docker run --rm -i --network backroom-e2e_default python:3.13-alpine`
   with a small socket script (stdin lines sent raw; the last one lived in
   the session scratchpad and is gone after it). Run it in a free Rex pane.
