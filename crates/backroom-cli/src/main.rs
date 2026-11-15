@@ -130,6 +130,8 @@ enum Command {
         #[arg(long, short = 'n', default_value_t = 50)]
         limit: usize,
     },
+    /// Fetch a link preview the way the app does (title, description, image).
+    Preview { url: String },
 }
 
 #[tokio::main]
@@ -174,6 +176,12 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             println!("Removed {}", store.path().display());
         }
         Command::Token => show_token(&store)?,
+        Command::Preview { url } => {
+            let preview = backroom_core::preview::Previewer::new()?
+                .preview(url)
+                .await?;
+            println!("{preview:#?}");
+        }
         Command::Networks => {
             let auth = Auth::new(&cli, store).await?;
             let mut client = match connect(&cli, &auth, None).await? {

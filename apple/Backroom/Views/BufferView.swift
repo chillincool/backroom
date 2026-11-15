@@ -240,6 +240,12 @@ struct ChatStyle {
     let theme: Theme
     let layout: MessageLayout
     let font: Font
+    /// The chat font for AppKit message text, and where its first baseline sits.
+    let nsFont: NSFont
+    let baseline: CGFloat
+    /// Preview cards' small text.
+    let smallFont: Font
+    let linkPreviews: Bool
     let timeFont: Font
     let timestamps: TimestampStyle
     let coloring: NickColoring
@@ -254,6 +260,10 @@ struct ChatStyle {
         self.theme = theme
         layout = prefs.layout
         font = prefs.chatFont()
+        nsFont = prefs.nsFont()
+        baseline = NSLayoutManager().defaultBaselineOffset(for: nsFont)
+        smallFont = prefs.chatFont(scale: 0.9)
+        linkPreviews = prefs.linkPreviews
         timeFont = prefs.chatFont(scale: 0.85).monospacedDigit()
         timestamps = prefs.timestamps
         coloring = prefs.nickColoring
@@ -284,6 +294,15 @@ struct ChatStyle {
 
     func nickColor(_ message: ChatMessage, prefix: String?) -> Color {
         message.own ? theme.accentColor : NickColor.color(nick: message.sender, prefix: prefix, theme: theme, coloring: coloring)
+    }
+
+    func nsNickColor(_ message: ChatMessage, prefix: String?) -> NSColor {
+        let color = nickColor(message, prefix: prefix)
+        return switch color {
+        case theme.textColor: theme.nsTextColor
+        case theme.accentColor: theme.nsAccentColor
+        default: NSColor(color)
+        }
     }
 
     /// The timestamp, or nothing when hidden.
@@ -325,6 +344,8 @@ struct HistoryHeader: View {
 
 struct MessageRow: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.openURL) private var openURL
+    @Environment(\.linkPreviews) private var previews
     let message: ChatMessage
     let continued: Bool
     /// Read here, not by the list, so member changes only redraw visible rows.
@@ -361,9 +382,33 @@ struct MessageRow: View {
             .foregroundColor(style.nickColor(message, prefix: prefix))
     }
 
-    /// The message text with formatting and links.
-    private var body_: Text {
-        Text(MessageText.attributed(message.text, formatting: style.formatting, theme: theme))
+    /// The message text with formatting and links, after `prefix`.
+    private func line(
+        _ prefix: [NSAttributedString] = [], color: NSColor? = nil, italic: Bool = false
+    ) -> some View {
+        let text = NSMutableAttributedString()
+        prefix.forEach(text.append)
+        text.append(MessageText.nsAttributed(
+            message.text, formatting: style.formatting, theme: theme, font: style.nsFont,
+            color: color ?? theme.nsTextColor, italic: italic))
+        let preview: ((URL) -> NSViewController)? = if style.linkPreviews, let previews {
+            { [style] url in LinkPreviewCard.controller(url: url, previews: previews, style: style) }
+        } else {
+            nil
+        }
+        return ChatTextView(text: text, accent: theme.nsAccentColor, preview: preview) { openURL($0) }
+            .alignmentGuide(.firstTextBaseline) { _ in style.baseline }
+    }
+
+    /// Plain runs before the message text.
+    private func run(_ text: String, color: NSColor? = nil, italic: Bool = false) -> NSAttributedString {
+        MessageText.run(text, font: style.nsFont, color: color ?? theme.nsTextColor, italic: italic)
+    }
+
+    private func nickRun(italic: Bool = false) -> NSAttributedString {
+        MessageText.run(
+            NickColor.label(message.sender, prefix: prefix), font: style.nsFont,
+            color: style.nsNickColor(message, prefix: prefix), bold: true, italic: italic)
     }
 
     private var plain: String { stripFormatting(text: message.text) }
@@ -405,9 +450,9 @@ struct MessageRow: View {
 
     @ViewBuilder private var columnText: some View {
         switch message.kind {
-        case .privmsg, .notice, .reply: body_.foregroundStyle(theme.textColor)
-        case .error: body_.foregroundStyle(.red)
-        case .action: Text("\(nick) \(body_)").italic().foregroundStyle(theme.textColor)
+        case .privmsg, .notice, .reply: line()
+        case .error: line(color: .systemRed)
+        case .action: line([nickRun(italic: true), run(" ", italic: true)], italic: true)
         default: eventLine
         }
     }
@@ -425,15 +470,14 @@ struct MessageRow: View {
         switch message.kind {
         case .privmsg:
             if hidesNick {
-                body_.foregroundStyle(theme.textColor)
-                    .padding(.leading, style.nickWidth / 2)
+                line().padding(.leading, style.nickWidth / 2)
             } else {
-                Text("\(nick)  \(body_)").foregroundStyle(theme.textColor)
+                line([nickRun(), run("  ")])
             }
-        case .notice: Text("-\(nick)-  \(body_)").foregroundStyle(theme.textColor)
-        case .action: Text("* \(nick) \(body_)").italic().foregroundStyle(theme.textColor)
-        case .reply: body_.foregroundStyle(theme.textColor)
-        case .error: Text("! \(body_)").foregroundStyle(.red)
+        case .notice: line([run("-"), nickRun(), run("-  ")])
+        case .action: line([run("* ", italic: true), nickRun(italic: true), run(" ", italic: true)], italic: true)
+        case .reply: line()
+        case .error: line([run("! ", color: .systemRed)], color: .systemRed)
         default: eventLine
         }
     }
@@ -450,7 +494,7 @@ struct MessageRow: View {
                     }
                     .padding(.top, 6)
                 }
-                body_.foregroundStyle(theme.textColor)
+                line()
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
         } else {

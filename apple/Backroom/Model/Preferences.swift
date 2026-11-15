@@ -124,6 +124,9 @@ final class Preferences {
     var notifyAllMessages: Bool { didSet { set(notifyAllMessages, "notifyAllMessages") } }
     /// Let others see when we're typing.
     var sendTyping: Bool { didSet { set(sendTyping, "sendTyping") } }
+    /// A preview when the mouse rests on a link (fetching the link reveals
+    /// our address to its site, so only hovered links are fetched).
+    var linkPreviews: Bool { didSet { set(linkPreviews, "linkPreviews") } }
     /// Without a bouncer: also write plain-text logs, one file per
     /// conversation per day.
     var textLogs: Bool { didSet { set(textLogs, "textLogs") } }
@@ -183,6 +186,7 @@ final class Preferences {
         notificationSound = defaults.object(forKey: Self.prefix + "notificationSound") as? Bool ?? true
         notifyAllMessages = defaults.bool(forKey: Self.prefix + "notifyAllMessages")
         sendTyping = defaults.object(forKey: Self.prefix + "sendTyping") as? Bool ?? true
+        linkPreviews = defaults.object(forKey: Self.prefix + "linkPreviews") as? Bool ?? true
         textLogs = defaults.bool(forKey: Self.prefix + "textLogs")
         textLogFolder = string("textLogFolder") ?? ""
     }

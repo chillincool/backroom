@@ -145,6 +145,15 @@ struct PaneHeader: View {
                     }
                 }
                 .foregroundStyle(theme.mutedColor)
+                // Links look like the rest of the topic; ⌘-click opens them.
+                .tint(theme.mutedColor)
+                .environment(\.openURL, OpenURLAction { url in
+                    guard NSEvent.modifierFlags.contains(.command) else { return .handled }
+                    guard let channel = MessageText.channel(from: url), let network = buffer?.id.network
+                    else { return .systemAction }
+                    model.join(network: network, channel: channel)
+                    return .handled
+                })
                 .lineLimit(expanded ? nil : 1)
                 .fixedSize(horizontal: false, vertical: expanded)
                 .frame(maxWidth: .infinity, alignment: .leading)

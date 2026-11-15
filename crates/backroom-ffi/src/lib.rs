@@ -7,11 +7,13 @@
 
 mod client;
 mod error;
+mod preview;
 mod store;
 mod types;
 
 pub use client::{BackroomClient, ClientConfig, LoginMethod};
 pub use error::BackroomError;
+pub use preview::{LinkPreview, LinkPreviewer, PreviewKind};
 pub use store::SecretStore;
 pub use types::{
     BanEntry, BufferKind, ChannelListing, ChatMessage, ConnectionState, FormattedSpan, Member,

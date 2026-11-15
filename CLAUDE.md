@@ -39,6 +39,12 @@ services. Owner: chillincool. Public repo: github.com/chillincool/backroom.
     `rusqlite` bundled: networks, channels, messages, read markers),
     `NetworkConfig` (network attributes → connection), `SecretVault` trait
     (passwords; front end implements), `TextLog` (optional plain-text logs)
+  - `preview.rs` link previews (`Previewer`): OpenGraph/`<title>` via
+    `scraper`, or the image itself; http(s) only, 5 s, ≤5 redirects, page
+    read to `</head>` (≤1 MB), images ≤5 MB, no private/loopback/link-local
+    addresses (resolver + redirect policy), `Accept: */*` (imgur redirects
+    image links to a page when HTML is accepted). `backroom preview <url>`
+    in the CLI
   - `model.rs` chat model: `route` (message → buffer), `route_reply`
     (numerics), `quit_or_nick`, `WhoisInfo`, `ChannelListing`, `BanEntry`
 - `crates/backroom-ffi`: UniFFI 0.32 bindings. One `BackroomClient` object
@@ -51,7 +57,8 @@ services. Owner: chillincool. Public repo: github.com/chillincool/backroom.
   token JSON from `TokenSet::to_json` or the password; standalone keeps all
   network passwords and channel keys as one JSON object in one item
   (`ForeignVault`, account `standalone`), so at most one Keychain prompt. FFI copies of model/events use
-  `SystemTime`/`Duration`. `--features bindgen` builds `uniffi-bindgen`.
+  `SystemTime`/`Duration`. `LinkPreviewer` (own small runtime, no login)
+  fetches previews. `--features bindgen` builds `uniffi-bindgen`.
 - `apple/BackroomCore`: Swift package (XCFramework + generated bindings, both
   git-ignored, from `scripts/build-apple.sh`) plus `KeychainSecretStore`.
   Its tests use Swift Testing, which needs Xcode (not in the CLT).
@@ -65,11 +72,16 @@ services. Owner: chillincool. Public repo: github.com/chillincool/backroom.
   each a password or single sign-on login with its own Keychain item, plus
   the built-in "No bouncer" entry, always last; `NetworkLogin` for
   standalone networks' SASL / server password / NickServ),
-  `Timeline` (folding, day separators, New line), `Panes`
+  `Timeline` (folding, day separators, New line), `LinkPreviews`
+  (per-URL `Entry`, kept for the session), `Panes`
   (`PaneLayout` split tree, `WorkspaceTab`), `Mentions`, `Notifier`,
   `Preferences`, `Theme`. `Views/`: `MainView` (sidebar | panes | members,
   fixed widths via `SplitDivider`), `PaneViews`, `BufferView` (rows,
-  composer, typing), `TabStrip`, sheets (`JoinViews`, `SearchView`,
+  composer, typing), `ChatTextView` (message text is an AppKit
+  `NSTextView`: links carry `.chatLink`, not `.link`, so they look like
+  text; ⌘-hover underlines one with a hand cursor, ⌘-click opens; resting
+  the mouse on a web link pops up `LinkPreviewCard`, the only time a link
+  is fetched; owner asked for no automatic inline previews), `TabStrip`, sheets (`JoinViews`, `SearchView`,
   `ChannelSettingsView`, `WhoisView`), `Settings/` (one file per tab).
   Login opens the default browser and receives
   `backroom://oauth/callback` via `onOpenURL` (`BrowserLogin`), not
@@ -188,6 +200,10 @@ server that doesn't offer our SASL mechanism. Each connection gets a
   `~/Library/Application Support/Backroom/standalone.sqlite`, logs default
   to `…/Backroom/logs`; "No bouncer" reconnects at launch only if it was
   connected at quit (UserDefaults `standaloneConnected`).
+- Link previews (this PR): hover popover only, never automatic inline
+  cards (owner: fetching every link leaks your IP); links look like text,
+  ⌘-hover/⌘-click. Owner tested and liked it. DCC and scripting were
+  discussed and skipped; soju file upload (`file-upload`) declined.
 - Verified soju v0.11.1 facts: SEARCH needs `in=` (max 100 results, batch
   `soju.im/search`); soju forwards CTCP to every client and answers none
   (two clients both answering means duplicate replies); TAGMSG reaches only
