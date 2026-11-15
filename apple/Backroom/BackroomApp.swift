@@ -7,6 +7,9 @@ import UserNotifications
 struct BackroomApp: App {
     private static let login = BrowserLogin()
     private static let notifier = Notifier()
+    private static let previews = LinkPreviews(
+        previewer: ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil
+            ? try? LinkPreviewer() : nil)
     @State private var prefs: Preferences
     @State private var model: AppModel
 
@@ -43,6 +46,7 @@ struct BackroomApp: App {
             ContentView()
                 .environment(model)
                 .environment(prefs)
+                .environment(\.linkPreviews, Self.previews)
                 .task {
                     prefs.applyAppearance()
                     // Unit tests run inside the app; don't touch the Keychain

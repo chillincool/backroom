@@ -38,6 +38,11 @@ exceptions = [
   { crate = "uniffi_macros", allow = ["MPL-2.0"] },
   { crate = "uniffi_meta", allow = ["MPL-2.0"] },
   { crate = "uniffi_pipeline", allow = ["MPL-2.0"] },
+  # Servo's CSS selector crates, via scraper (link previews); same terms.
+  { crate = "cssparser", allow = ["MPL-2.0"] },
+  { crate = "cssparser-macros", allow = ["MPL-2.0"] },
+  { crate = "dtoa-short", allow = ["MPL-2.0"] },
+  { crate = "selectors", allow = ["MPL-2.0"] },
 ]
 
 [bans]

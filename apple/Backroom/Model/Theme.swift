@@ -48,6 +48,11 @@ struct Theme: Codable, Identifiable, Hashable, Sendable {
     var textColor: Color { Color(hex: text) ?? .primary }
     var mutedColor: Color { Color(hex: muted) ?? .secondary }
     var accentColor: Color { Color(hex: accent) ?? .accentColor }
+    /// AppKit versions, for message text; system colours stay dynamic.
+    var nsBackgroundColor: NSColor { Color(hex: background).map { NSColor($0) } ?? .textBackgroundColor }
+    var nsTextColor: NSColor { Color(hex: text).map { NSColor($0) } ?? .labelColor }
+    var nsMutedColor: NSColor { Color(hex: muted).map { NSColor($0) } ?? .secondaryLabelColor }
+    var nsAccentColor: NSColor { Color(hex: accent).map { NSColor($0) } ?? .controlAccentColor }
 
     func rankColor(_ symbol: Character?) -> Color {
         switch symbol {

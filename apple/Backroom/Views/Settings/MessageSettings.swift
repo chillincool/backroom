@@ -39,6 +39,8 @@ struct MessageSettings: View {
                 Toggle("Let others see when I'm typing", isOn: $prefs.sendTyping)
                 Toggle("mIRC colours and formatting", isOn: $prefs.showFormatting)
                     .help("Bold, italics and colours people put in their messages. Off shows plain text.")
+                Toggle("Preview links on hover", isOn: $prefs.linkPreviews)
+                    .help("Rest the mouse on a link to see the page's title and image, or the image itself. Only links you hover are loaded; loading one lets the linked site see your IP address.")
             }
         }
         .formStyle(.grouped)

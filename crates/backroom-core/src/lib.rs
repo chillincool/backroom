@@ -9,6 +9,7 @@ pub mod client;
 pub mod live;
 pub mod local;
 pub mod model;
+pub mod preview;
 pub mod proto;
 pub mod sasl;
 pub mod session;

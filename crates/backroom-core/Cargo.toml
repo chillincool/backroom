@@ -13,8 +13,10 @@ base64.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
 oauth2.workspace = true
+reqwest.workspace = true
 rusqlite.workspace = true
 rustls.workspace = true
+scraper.workspace = true
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -28,8 +30,8 @@ webpki-roots.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
-# Same reqwest major as oauth2 uses; cookies for the Keycloak login form.
-reqwest = { version = "0.12", default-features = false, features = ["cookies", "json"] }
+# Cookies for the Keycloak login form.
+reqwest = { workspace = true, features = ["cookies", "json"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 
