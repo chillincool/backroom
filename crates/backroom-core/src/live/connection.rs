@@ -2,15 +2,19 @@
 //! coordinator, keep the connection alive, and reconnect with backoff.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio::time::{Instant, MissedTickBehavior};
 
-use super::{ConnectionState, SessionConfig};
+use super::{Backoff, ConnectionState};
+use crate::auth::CredentialProvider;
 use crate::client::{Client, ClientError, ConnectOptions, Incoming};
 use crate::model::NetworkId;
 use crate::proto::Message;
+use crate::sasl::SaslCredentials;
 use crate::session::{Registered, RegistrationError};
+use crate::transport::Connector;
 
 /// `None` for the control connection, else the bound network.
 pub(super) type ConnId = Option<NetworkId>;
@@ -30,13 +34,57 @@ pub(super) enum FromConn {
 
 pub(super) type FromConnTx = mpsc::UnboundedSender<(ConnId, FromConn)>;
 
+/// How a connection logs in.
+pub(super) enum Login {
+    /// soju: credentials fetched (and refreshed) for each attempt; SASL
+    /// required.
+    Provider(Arc<dyn CredentialProvider>),
+    /// A network without a bouncer: SASL if configured.
+    Sasl(Option<SaslCredentials>),
+}
+
+/// Everything one connection task needs.
+pub(super) struct ConnSpec {
+    pub connector: Arc<dyn Connector>,
+    pub login: Login,
+    pub opts: ConnectOptions,
+    pub backoff: Backoff,
+    pub keepalive: Duration,
+}
+
+impl ConnSpec {
+    /// A connection to soju: the control connection (`id` is `None`), or
+    /// one bound to network `id`.
+    pub(super) fn bouncer(
+        connector: Arc<dyn Connector>,
+        credentials: Arc<dyn CredentialProvider>,
+        id: &ConnId,
+        config: &super::SessionConfig,
+    ) -> Self {
+        let mut opts = ConnectOptions::new(config.nick.clone());
+        opts.bind_network = id.clone();
+        if id.is_none() {
+            // Live network updates on the control connection.
+            opts.wanted_caps
+                .push("soju.im/bouncer-networks-notify".into());
+        }
+        ConnSpec {
+            connector,
+            login: Login::Provider(credentials),
+            opts,
+            backoff: config.backoff,
+            keepalive: config.keepalive,
+        }
+    }
+}
+
 pub(super) fn spawn(
     id: ConnId,
-    config: Arc<SessionConfig>,
+    spec: Arc<ConnSpec>,
     events: FromConnTx,
 ) -> mpsc::UnboundedSender<ToConn> {
     let (tx, rx) = mpsc::unbounded_channel();
-    tokio::spawn(run(id, config, rx, events));
+    tokio::spawn(run(id, spec, rx, events));
     tx
 }
 
@@ -47,7 +95,7 @@ enum Ended {
 
 async fn run(
     id: ConnId,
-    config: Arc<SessionConfig>,
+    spec: Arc<ConnSpec>,
     mut rx: mpsc::UnboundedReceiver<ToConn>,
     events: FromConnTx,
 ) {
@@ -58,16 +106,20 @@ async fn run(
 
     loop {
         emit(FromConn::State(ConnectionState::Connecting));
-        let mut opts = ConnectOptions::new(config.nick.clone());
-        opts.bind_network = id.clone();
-        if id.is_none() {
-            // Live network updates on the control connection.
-            opts.wanted_caps
-                .push("soju.im/bouncer-networks-notify".into());
-        }
+        let opts = spec.opts.clone();
+        let connect = async {
+            match &spec.login {
+                Login::Provider(credentials) => {
+                    Client::connect(spec.connector.as_ref(), credentials.as_ref(), opts).await
+                }
+                Login::Sasl(sasl) => {
+                    Client::connect_with(spec.connector.as_ref(), sasl.clone(), opts).await
+                }
+            }
+        };
 
         let connected = tokio::select! {
-            r = Client::connect(config.connector.as_ref(), config.credentials.as_ref(), opts) => r,
+            r = connect => r,
             () = until_stopped(&mut rx) => return,
         };
 
@@ -76,7 +128,7 @@ async fn run(
                 attempt = 0;
                 emit(FromConn::Registered(Box::new(client.info().clone())));
                 emit(FromConn::State(ConnectionState::Connected));
-                match serve(&mut client, &mut rx, &emit, &config).await {
+                match serve(&mut client, &mut rx, &emit, spec.keepalive).await {
                     Ended::Stop => {
                         client.quit().await.ok();
                         return;
@@ -114,7 +166,7 @@ async fn run(
             Err(e) => e.to_string(),
         };
 
-        let delay = config.backoff.delay(attempt);
+        let delay = spec.backoff.delay(attempt);
         attempt = attempt.saturating_add(1);
         tracing::debug!(network = ?id, %error, ?delay, "connection lost");
         emit(FromConn::State(ConnectionState::Disconnected {
@@ -146,9 +198,8 @@ async fn serve(
     client: &mut Client,
     rx: &mut mpsc::UnboundedReceiver<ToConn>,
     emit: &impl Fn(FromConn),
-    config: &SessionConfig,
+    keepalive: Duration,
 ) -> Ended {
-    let keepalive = config.keepalive;
     let mut last_traffic = Instant::now();
     let mut pinged = false;
     let mut tick = tokio::time::interval(keepalive / 4);
@@ -219,7 +270,7 @@ mod tests {
 
     use super::*;
     use crate::auth::StaticCredentials;
-    use crate::live::Backoff;
+    use crate::live::{Backoff, SessionConfig};
     use crate::sasl::SaslCredentials;
     use crate::transport::mock::{MockConnector, Step, expect, server};
     use crate::transport::{Connector, Transport, TransportError};
@@ -241,17 +292,18 @@ mod tests {
         }
     }
 
-    fn config(connector: Arc<dyn Connector>) -> Arc<SessionConfig> {
-        let creds = StaticCredentials(SaslCredentials::Plain {
+    /// A soju connection: `id` `None` for the control connection.
+    fn spec(connector: Arc<dyn Connector>, id: &ConnId) -> Arc<ConnSpec> {
+        let creds = Arc::new(StaticCredentials(SaslCredentials::Plain {
             username: "dave".into(),
             password: SecretString::from("pw"),
-        });
-        let mut c = SessionConfig::new(connector, Arc::new(creds), "dave");
+        }));
+        let mut c = SessionConfig::new(connector.clone(), creds.clone(), "dave");
         c.backoff = Backoff {
             initial: Duration::from_secs(1),
             max: Duration::from_secs(8),
         };
-        Arc::new(c)
+        Arc::new(ConnSpec::bouncer(connector, creds, id, &c))
     }
 
     fn registration(fail_sasl: bool) -> Vec<Step> {
@@ -310,7 +362,7 @@ mod tests {
             then: MockConnector::new(script),
         });
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let conn = spawn(None, config(flaky.clone()), tx);
+        let conn = spawn(None, spec(flaky.clone(), &None), tx);
 
         let seen = collect(&mut rx, |e| matches!(e, FromConn::Incoming(_))).await;
         assert_eq!(seen[0], "Connecting");
@@ -332,7 +384,7 @@ mod tests {
     async fn rejected_login_stops_reconnecting() {
         let mock = MockConnector::new(registration(true));
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let _conn = spawn(None, config(Arc::new(mock)), tx);
+        let _conn = spawn(None, spec(Arc::new(mock), &None), tx);
         let seen = collect(&mut rx, |e| {
             matches!(e, FromConn::State(ConnectionState::AuthFailed { .. }))
         })
@@ -351,7 +403,7 @@ mod tests {
             server(":soju CAP * LS :sasl=OAUTHBEARER batch"),
         ]);
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let _conn = spawn(None, config(Arc::new(mock)), tx);
+        let _conn = spawn(None, spec(Arc::new(mock), &None), tx);
         let seen = collect(&mut rx, |e| {
             matches!(e, FromConn::State(ConnectionState::AuthFailed { .. }))
         })
@@ -375,7 +427,11 @@ mod tests {
         ]);
         let mock = MockConnector::concurrent(script);
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let conn = spawn(Some("1".into()), config(Arc::new(mock.clone())), tx);
+        let conn = spawn(
+            Some("1".into()),
+            spec(Arc::new(mock.clone()), &Some("1".into())),
+            tx,
+        );
         collect(&mut rx, |e| matches!(e, FromConn::Incoming(_))).await;
         conn.send(ToConn::Send(Message::new("PRIVMSG", ["alice", "hello"])))
             .unwrap();

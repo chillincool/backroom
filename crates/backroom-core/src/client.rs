@@ -2,7 +2,8 @@
 //! request/response helpers on top of batches.
 //!
 //! Raw traffic is traced at `TRACE` on target `backroom_core::raw`, with
-//! `AUTHENTICATE` arguments redacted.
+//! passwords redacted: `AUTHENTICATE` and `PASS` arguments, channel keys and
+//! NickServ `IDENTIFY`.
 
 use std::time::Duration;
 
@@ -15,6 +16,7 @@ use crate::batch::{Batch, BatchCollector, Feed};
 use crate::bouncer::{Network, NetworkUpdate, parse_network_message};
 use crate::proto::caps::WANTED_CAPS;
 use crate::proto::{Message, ParseError};
+use crate::sasl::SaslCredentials;
 use crate::session::{Outgoing, Registered, Registration, RegistrationConfig, RegistrationError};
 use crate::transport::{Connector, Transport, TransportError};
 
@@ -27,6 +29,8 @@ pub struct ConnectOptions {
     pub realname: String,
     pub bind_network: Option<String>,
     pub wanted_caps: Vec<String>,
+    /// Server password (`PASS`).
+    pub password: Option<SecretString>,
     /// Applies to registration and to each request.
     pub timeout: Duration,
 }
@@ -39,6 +43,7 @@ impl ConnectOptions {
             nick,
             realname: "Backroom".into(),
             bind_network: None,
+            password: None,
             wanted_caps: WANTED_CAPS.iter().map(|s| s.to_string()).collect(),
             timeout: Duration::from_secs(30),
         }
@@ -89,6 +94,16 @@ impl Client {
     ) -> Result<Client, ClientError> {
         // Fetch (and maybe refresh) credentials before opening the socket.
         let sasl = credentials.credentials().await?;
+        Self::connect_with(connector, Some(sasl), opts).await
+    }
+
+    /// Like [`Client::connect`], with SASL optional: networks without an
+    /// account, or with a server password or NickServ instead.
+    pub async fn connect_with(
+        connector: &dyn Connector,
+        sasl: Option<SaslCredentials>,
+        opts: ConnectOptions,
+    ) -> Result<Client, ClientError> {
         let mut transport = connector.connect().await?;
         let deadline = Instant::now() + opts.timeout;
 
@@ -97,8 +112,9 @@ impl Client {
             username: opts.username,
             realname: opts.realname,
             wanted_caps: opts.wanted_caps,
-            sasl: Some(sasl),
+            sasl,
             bind_network: opts.bind_network,
+            password: opts.password,
         });
 
         let info = loop {
@@ -340,25 +356,34 @@ async fn send_message(transport: &mut dyn Transport, msg: &Message) -> Result<()
 async fn send_outgoing(transport: &mut dyn Transport, out: Outgoing) -> Result<(), ClientError> {
     match out {
         Outgoing::Message(msg) => send_message(transport, &msg).await,
-        Outgoing::Authenticate(arg) => send_authenticate(transport, &arg).await,
+        Outgoing::Authenticate(arg) => send_secret(transport, "AUTHENTICATE", &arg).await,
+        Outgoing::Pass(arg) => send_secret(transport, "PASS", &arg).await,
     }
 }
 
-/// An outgoing line as traced: channel keys (`JOIN #c key`) are passwords.
+/// An outgoing line as traced: channel keys (`JOIN #c key`) and NickServ
+/// logins are passwords.
 fn traced<'a>(msg: &Message, line: &'a str) -> std::borrow::Cow<'a, str> {
     if msg.command.eq_ignore_ascii_case("JOIN") && msg.params.len() > 1 {
         format!("JOIN {} <redacted>", msg.params[0]).into()
+    } else if msg.command.eq_ignore_ascii_case("PRIVMSG")
+        && msg
+            .param(0)
+            .is_some_and(|t| t.eq_ignore_ascii_case("NickServ"))
+    {
+        "PRIVMSG NickServ <redacted>".into()
     } else {
         line.into()
     }
 }
 
-async fn send_authenticate(
+async fn send_secret(
     transport: &mut dyn Transport,
+    command: &str,
     arg: &SecretString,
 ) -> Result<(), ClientError> {
-    tracing::trace!(target: RAW, "-> AUTHENTICATE <redacted>");
-    let line = Zeroizing::new(format!("AUTHENTICATE {}", arg.expose_secret()));
+    tracing::trace!(target: RAW, "-> {command} <redacted>");
+    let line = Zeroizing::new(format!("{command} {}", arg.expose_secret()));
     transport.send(&line).await?;
     Ok(())
 }
@@ -370,6 +395,9 @@ mod tests {
         let msg = Message::new("JOIN", ["#secret", "sesame"]);
         let line = msg.to_string();
         assert_eq!(traced(&msg, &line), "JOIN #secret <redacted>");
+        let msg = Message::new("PRIVMSG", ["NickServ", "IDENTIFY hunter2"]);
+        let line = msg.to_string();
+        assert_eq!(traced(&msg, &line), "PRIVMSG NickServ <redacted>");
         let msg = Message::new("JOIN", ["#open"]);
         let line = msg.to_string();
         assert_eq!(traced(&msg, &line), "JOIN #open");

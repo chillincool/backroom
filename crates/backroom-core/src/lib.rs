@@ -7,6 +7,7 @@ pub mod batch;
 pub mod bouncer;
 pub mod client;
 pub mod live;
+pub mod local;
 pub mod model;
 pub mod proto;
 pub mod sasl;

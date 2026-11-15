@@ -5,7 +5,7 @@
 #   soju-oauth2    18081 ws   16667 irc+insecure   16697 ircs
 #   soju-internal  28081 ws   26667 irc+insecure   26697 ircs
 #   soju-http      38081 ws   36667 irc+insecure   36697 ircs
-#   ergo           (internal) upstream IRC server for history tests
+#   ergo           46667 irc+insecure (upstream for soju; standalone tests)
 #   httpauth       (internal) stub for soju's `auth http`
 name: backroom-e2e
 
@@ -31,6 +31,7 @@ services:
 
   ergo:
     image: ghcr.io/ergochat/ergo:v2.19.1@sha256:ef885e44f7fa19101bbbc41baef11dc280dc8107465dccaf6f0860f41b48a682
+    ports: ["127.0.0.1:46667:6667"]
 
   httpauth:
     image: caddy:2.11.7-alpine@sha256:eb4d35b7452d1ab6171fbdbe8d9275b2301dad6dad92115d91e19fb9b24d510f

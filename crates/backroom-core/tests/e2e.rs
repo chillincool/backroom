@@ -16,6 +16,7 @@ use backroom_core::auth::{
     TokenSet, TokenStore,
 };
 use backroom_core::live::{self, Command, ConnectionState, Event, SessionConfig};
+use backroom_core::local::{LocalStore, SecretVault, Standalone};
 use backroom_core::model::{BufferKind, MessageKind};
 use backroom_core::proto::Message;
 use backroom_core::sasl::SaslCredentials;
@@ -628,4 +629,168 @@ async fn live_session_talks_loads_history_and_syncs_read_markers() {
     session.shutdown();
     next_event(&mut events, "shutdown", |e| *e == Event::Stopped).await;
     erin.quit().await.ok();
+}
+
+// -- standalone (no bouncer), straight to ergo -----------------------------------
+
+const ERGO: &str = "irc+insecure://127.0.0.1:46667";
+
+/// The Keychain's stand-in.
+#[derive(Default)]
+struct MemoryVault(Mutex<std::collections::HashMap<String, String>>);
+
+impl SecretVault for MemoryVault {
+    fn get(&self, key: &str) -> Result<Option<SecretString>, StoreError> {
+        Ok(self.0.lock().unwrap().get(key).cloned().map(Into::into))
+    }
+    fn set(&self, key: &str, value: &SecretString) -> Result<(), StoreError> {
+        let value = value.expose_secret().to_owned();
+        self.0.lock().unwrap().insert(key.to_owned(), value);
+        Ok(())
+    }
+    fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.0.lock().unwrap().remove(key);
+        Ok(())
+    }
+}
+
+fn standalone_session(
+    dir: &std::path::Path,
+    vault: Arc<MemoryVault>,
+) -> (
+    live::SessionHandle,
+    tokio::sync::mpsc::UnboundedReceiver<Event>,
+) {
+    let store = LocalStore::open(&dir.join("standalone.sqlite")).unwrap();
+    live::start(SessionConfig::standalone(
+        Standalone {
+            store: Arc::new(store),
+            secrets: vault,
+            text_logs: Some(dir.join("logs")),
+            tls: TlsOptions::default(),
+        },
+        "backroom",
+    ))
+}
+
+#[tokio::test]
+#[ignore = "needs the e2e stack (scripts/e2e.sh)"]
+async fn standalone_connects_rejoins_and_keeps_history() {
+    let id = unique();
+    let channel = format!("#solo-{id}");
+    let dir = tempfile::tempdir().unwrap();
+    let vault = Arc::new(MemoryVault::default());
+
+    let (session, mut events) = standalone_session(dir.path(), vault.clone());
+    session.send(Command::AddNetwork {
+        attributes: [
+            ("name", "ergo"),
+            ("host", "127.0.0.1"),
+            ("port", "46667"),
+            ("tls", "0"),
+            ("nickname", &format!("solo{id}")),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect(),
+    });
+    let Event::NetworkUpdated(info) = next_event(&mut events, "the network", |e| {
+        matches!(e, Event::NetworkUpdated(_))
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    let net = info.id;
+    next_event(&mut events, "connected to ergo", |e| {
+        matches!(e, Event::Connection { network: Some(n), state: ConnectionState::Connected } if *n == net)
+    })
+    .await;
+    session.send(Command::Join {
+        network: net.clone(),
+        channel: channel.clone(),
+        key: None,
+    });
+    next_event(&mut events, "our JOIN", |e| {
+        matches!(e, Event::Message { buffer, message, .. }
+            if buffer.eq_ignore_ascii_case(&channel) && message.kind == MessageKind::Join && message.own)
+    })
+    .await;
+
+    // bob, an ordinary client without a bouncer, says hello.
+    let bob_nick = format!("bob{id}");
+    let mut bob = Client::connect_with(
+        connector_for_url(ERGO, tls()).unwrap().as_ref(),
+        None,
+        ConnectOptions::new(bob_nick.clone()),
+    )
+    .await
+    .unwrap();
+    bob.send(&Message::new("JOIN", [channel.clone()]))
+        .await
+        .unwrap();
+    bob.wait_for("bob's JOIN", |m| m.command == "JOIN")
+        .await
+        .unwrap();
+    bob.send(&Message::new(
+        "PRIVMSG",
+        [channel.as_str(), "hello from bob"],
+    ))
+    .await
+    .unwrap();
+    next_event(
+        &mut events,
+        "bob's message",
+        |e| matches!(e, Event::Message { message, .. } if message.text == "hello from bob"),
+    )
+    .await;
+
+    session.shutdown();
+    next_event(&mut events, "the session to stop", |e| *e == Event::Stopped).await;
+
+    // Next launch: the network and channel come back from the database,
+    // and so does the history.
+    let (session, mut events) = standalone_session(dir.path(), vault);
+    next_event(&mut events, "connected again", |e| {
+        matches!(e, Event::Connection { network: Some(n), state: ConnectionState::Connected } if *n == net)
+    })
+    .await;
+    next_event(&mut events, "the channel after rejoining", |e| {
+        matches!(e, Event::BufferAdded { name, kind: BufferKind::Channel, .. }
+            if name.eq_ignore_ascii_case(&channel))
+    })
+    .await;
+    session.send(Command::LoadHistory {
+        network: net.clone(),
+        target: channel.clone(),
+        before: None,
+        limit: 50,
+    });
+    let Event::History { messages, .. } = next_event(&mut events, "history", |e| {
+        matches!(e, Event::History { .. })
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.text == "hello from bob" && m.sender == bob_nick),
+        "{messages:?}"
+    );
+    session.shutdown();
+    bob.quit().await.ok();
+
+    let day = std::fs::read_dir(dir.path().join("logs/ergo").join(channel.to_lowercase()))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let log = std::fs::read_to_string(day).unwrap();
+    assert!(
+        log.contains(&format!("<{bob_nick}> hello from bob")),
+        "{log}"
+    );
 }

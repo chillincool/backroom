@@ -1,9 +1,12 @@
-//! A long-lived session with soju: what a chat app runs on.
+//! A long-lived session: what a chat app runs on.
 //!
-//! [`start`] connects a control connection (which lists and watches the
-//! bouncer's networks) plus one connection bound to each network, keeps them
-//! connected, and turns IRC traffic into [`Event`]s. The front end sends
-//! [`Command`]s through the returned [`SessionHandle`].
+//! With soju ([`Backend::Bouncer`]), [`start`] connects a control connection
+//! (which lists and watches the bouncer's networks) plus one connection
+//! bound to each network. Without a bouncer ([`Backend::Standalone`]), it
+//! connects to each saved network directly and keeps networks, channels,
+//! history and read markers itself ([`crate::local`]). Either way it keeps
+//! the connections up and turns IRC traffic into the same [`Event`]s; the
+//! front end sends [`Command`]s through the returned [`SessionHandle`].
 //!
 //! ```text
 //!  front end ──Command──▶ coordinator ──ToConn──▶ connection task (control)
@@ -27,17 +30,30 @@ use chrono::{DateTime, Utc};
 use tokio::sync::mpsc;
 
 use crate::auth::CredentialProvider;
+use crate::local::Standalone;
 use crate::model::{
     BanEntry, BufferKind, ChannelListing, ChatMessage, Member, NetworkId, NetworkInfo, TypingState,
     WhoisInfo,
 };
 use crate::transport::Connector;
 
+/// Where the networks are.
+#[derive(Clone)]
+pub enum Backend {
+    /// A soju bouncer: it keeps the networks, channels and history.
+    Bouncer {
+        connector: Arc<dyn Connector>,
+        credentials: Arc<dyn CredentialProvider>,
+    },
+    /// No bouncer: networks are saved locally and connected to directly.
+    Standalone(Arc<Standalone>),
+}
+
 #[derive(Clone)]
 pub struct SessionConfig {
-    pub connector: Arc<dyn Connector>,
-    pub credentials: Arc<dyn CredentialProvider>,
-    /// Nick to register with; soju replaces it with each network's own nick.
+    pub backend: Backend,
+    /// Nick to register with: soju replaces it with each network's own
+    /// nick; standalone networks without a `nickname` use it.
     pub nick: String,
     pub backoff: Backoff,
     /// Send a PING after this long without traffic; give up on the
@@ -48,14 +64,29 @@ pub struct SessionConfig {
 }
 
 impl SessionConfig {
+    /// A session with soju.
     pub fn new(
         connector: Arc<dyn Connector>,
         credentials: Arc<dyn CredentialProvider>,
         nick: impl Into<String>,
     ) -> Self {
+        Self::with_backend(
+            Backend::Bouncer {
+                connector,
+                credentials,
+            },
+            nick,
+        )
+    }
+
+    /// A session without a bouncer.
+    pub fn standalone(local: Standalone, nick: impl Into<String>) -> Self {
+        Self::with_backend(Backend::Standalone(Arc::new(local)), nick)
+    }
+
+    fn with_backend(backend: Backend, nick: impl Into<String>) -> Self {
         SessionConfig {
-            connector,
-            credentials,
+            backend,
             nick: nick.into(),
             backoff: Backoff::default(),
             keepalive: Duration::from_secs(60),
@@ -251,9 +282,11 @@ pub enum Command {
         before: Option<DateTime<Utc>>,
         limit: usize,
     },
-    /// Adds a network to soju (`BOUNCER ADDNETWORK`): attributes such as
-    /// `name`, `host`, `port`, `tls` (`1`/`0`) and `nickname`. It appears as
-    /// [`Event::NetworkUpdated`]; a rejection arrives as [`Event::Error`].
+    /// Adds a network (`BOUNCER ADDNETWORK` with soju): attributes such as
+    /// `name`, `host`, `port`, `tls` (`1`/`0`) and `nickname`; standalone
+    /// networks also take a login (see [`crate::local::NetworkConfig`]). It
+    /// appears as [`Event::NetworkUpdated`]; a rejection arrives as
+    /// [`Event::Error`].
     AddNetwork {
         attributes: BTreeMap<String, String>,
     },
@@ -263,7 +296,7 @@ pub enum Command {
         network: NetworkId,
         attributes: BTreeMap<String, String>,
     },
-    /// Deletes a network from soju (`BOUNCER DELNETWORK`).
+    /// Deletes a network (`BOUNCER DELNETWORK` with soju), with its history.
     RemoveNetwork {
         network: NetworkId,
     },
@@ -272,8 +305,8 @@ pub enum Command {
     ListChannels {
         network: NetworkId,
     },
-    /// Searches a buffer's history on soju (`soju.im/search`). Answered with
-    /// [`Event::SearchResults`].
+    /// Searches a buffer's history (`soju.im/search`, or the local store).
+    /// Answered with [`Event::SearchResults`].
     Search {
         network: NetworkId,
         target: String,
@@ -302,7 +335,7 @@ pub enum Command {
         network: NetworkId,
         name: String,
     },
-    /// Mark everything up to `time` as read, on every device.
+    /// Mark everything up to `time` as read (with soju, on every device).
     MarkRead {
         network: NetworkId,
         target: String,

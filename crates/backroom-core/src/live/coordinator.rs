@@ -4,14 +4,19 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use secrecy::SecretString;
 use tokio::sync::mpsc;
 
-use super::connection::{self, ConnId, FromConn, FromConnTx, ToConn};
+use super::connection::{self, ConnId, ConnSpec, FromConn, FromConnTx, Login, ToConn};
 use super::members::{Members, WHO_TOKEN};
-use super::{Command, ConnectionState, Event, SessionConfig};
+use super::{Backend, Command, ConnectionState, Event, SessionConfig};
 use crate::batch::Batch;
 use crate::bouncer::{NetworkUpdate, parse_network_message};
-use crate::client::Incoming;
+use crate::client::{ConnectOptions, Incoming};
+use crate::local::{
+    NetworkConfig, SECRET_ATTRIBUTES, Standalone, TextLog, channel_key_key, network::validate,
+    secret_key,
+};
 use crate::model::{
     BanEntry, BufferKind, ChannelListing, ChatMessage, MessageKind, NetworkId, NetworkInfo,
     RouteContext, SERVER_BUFFER, TypingState, WhoisInfo, buffer_key, irc_timestamp, quit_or_nick,
@@ -19,7 +24,9 @@ use crate::model::{
 };
 use crate::proto::Message;
 use crate::proto::message::escape_tag_value;
+use crate::sasl::SaslCredentials;
 use crate::session::Registered;
+use crate::transport::connector_for_url;
 
 /// Messages fetched to check whether a correspondent from TARGETS ever
 /// sent more than notices.
@@ -43,18 +50,17 @@ fn is_ctcp_query(msg: &Message) -> bool {
 const LIST_CHUNK: usize = 500;
 
 /// Starts a connection task; replaced in tests.
-type Spawner = Box<dyn FnMut(ConnId, FromConnTx) -> mpsc::UnboundedSender<ToConn> + Send>;
+type Spawner =
+    Box<dyn FnMut(ConnId, Arc<ConnSpec>, FromConnTx) -> mpsc::UnboundedSender<ToConn> + Send>;
 
 pub(super) async fn run(
     config: Arc<SessionConfig>,
     mut commands: mpsc::UnboundedReceiver<Command>,
     events: mpsc::UnboundedSender<Event>,
 ) {
-    let version = config.client_version.clone();
-    let spawner: Spawner = Box::new(move |id, tx| connection::spawn(id, config.clone(), tx));
+    let spawner: Spawner = Box::new(connection::spawn);
     let (from_conn_tx, mut from_conn) = mpsc::unbounded_channel();
-    let mut c = Coordinator::new(spawner, from_conn_tx, events);
-    c.version = version;
+    let mut c = Coordinator::new(config, spawner, from_conn_tx, events);
     loop {
         tokio::select! {
             cmd = commands.recv() => match cmd {
@@ -104,9 +110,43 @@ struct Network {
     client_tag_deny: String,
     /// Ban lists being collected, by channel key.
     bans: HashMap<String, Vec<BanEntry>>,
+    /// Standalone: the saved attributes (no passwords, no state).
+    saved: BTreeMap<String, String>,
+    /// Standalone: identify to NickServ after connecting.
+    nickserv: Option<SecretString>,
+    /// Standalone: keys of channels being joined, saved once we're in.
+    pending_keys: HashMap<String, SecretString>,
 }
 
 impl Network {
+    fn new(info: NetworkInfo, conn: mpsc::UnboundedSender<ToConn>) -> Self {
+        Network {
+            info,
+            conn,
+            connected: false,
+            nick: String::new(),
+            chantypes: "#&".into(),
+            caps: BTreeSet::new(),
+            history_max: None,
+            buffers: HashMap::new(),
+            requested_joins: HashSet::new(),
+            members: Members::new(&BTreeMap::new()),
+            channel_list: Vec::new(),
+            whox: false,
+            who_requested: HashSet::new(),
+            who_pending: HashSet::new(),
+            whois: HashMap::new(),
+            probing: HashSet::new(),
+            searches: VecDeque::new(),
+            monitor: false,
+            client_tag_deny: String::new(),
+            bans: HashMap::new(),
+            saved: BTreeMap::new(),
+            nickserv: None,
+            pending_keys: HashMap::new(),
+        }
+    }
+
     /// Applies one ISUPPORT token (`None`: removed), at registration or
     /// later: soju re-sends them once it reaches the upstream network.
     fn set_isupport(&mut self, key: &str, value: Option<&str>) {
@@ -147,34 +187,84 @@ impl Network {
 }
 
 pub(super) struct Coordinator {
+    config: Arc<SessionConfig>,
     spawn: Spawner,
     from_conn_tx: FromConnTx,
     events: mpsc::UnboundedSender<Event>,
-    control: mpsc::UnboundedSender<ToConn>,
+    /// soju's control connection; none without a bouncer.
+    control: Option<mpsc::UnboundedSender<ToConn>>,
     networks: BTreeMap<NetworkId, Network>,
+    /// Without a bouncer: where networks, channels and history are kept.
+    local: Option<Arc<Standalone>>,
+    text_log: Option<TextLog>,
     /// Our CTCP VERSION reply.
     version: String,
 }
 
 impl Coordinator {
     fn new(
-        mut spawn: Spawner,
+        config: Arc<SessionConfig>,
+        spawn: Spawner,
         from_conn_tx: FromConnTx,
         events: mpsc::UnboundedSender<Event>,
     ) -> Self {
-        let control = spawn(None, from_conn_tx.clone());
-        Coordinator {
+        let mut c = Coordinator {
+            version: config.client_version.clone(),
+            config,
             spawn,
             from_conn_tx,
             events,
-            control,
+            control: None,
             networks: BTreeMap::new(),
-            version: "Backroom".into(),
+            local: None,
+            text_log: None,
+        };
+        match c.config.backend.clone() {
+            Backend::Bouncer {
+                connector,
+                credentials,
+            } => {
+                let spec = ConnSpec::bouncer(connector, credentials, &None, &c.config);
+                c.control = Some((c.spawn)(None, Arc::new(spec), c.from_conn_tx.clone()));
+            }
+            Backend::Standalone(local) => {
+                c.text_log = local.text_logs.as_ref().map(TextLog::new);
+                c.local = Some(local);
+                c.start_local();
+            }
         }
+        c
     }
 
     fn emit(&self, event: Event) {
+        if let Event::Message {
+            network,
+            buffer,
+            message,
+        } = &event
+        {
+            self.record(network, buffer, message);
+        }
         let _ = self.events.send(event);
+    }
+
+    /// Standalone: keeps a message in the history (and the text log).
+    /// Server replies aren't kept; soju doesn't keep them either.
+    fn record(&self, network: &str, buffer: &str, message: &ChatMessage) {
+        let Some(local) = &self.local else {
+            return;
+        };
+        if matches!(message.kind, MessageKind::Reply | MessageKind::Error) {
+            return;
+        }
+        if let Err(e) = local.store.append(network, buffer, message) {
+            tracing::warn!(error = %e, "couldn't save a message");
+        }
+        if let (Some(log), Some(net)) = (&self.text_log, self.networks.get(network))
+            && let Err(e) = log.write(net.info.name(), buffer, message)
+        {
+            tracing::warn!(error = %e, "couldn't write the text log");
+        }
     }
 
     fn error(&self, network: Option<&str>, message: impl Into<String>) {
@@ -185,7 +275,9 @@ impl Coordinator {
     }
 
     fn shutdown(&mut self) {
-        let _ = self.control.send(ToConn::Stop);
+        if let Some(control) = &self.control {
+            let _ = control.send(ToConn::Stop);
+        }
         for net in self.networks.values() {
             let _ = net.conn.send(ToConn::Stop);
         }
@@ -233,6 +325,14 @@ impl Coordinator {
                 if let Some(net) = self.networks.get_mut(&network) {
                     net.requested_joins
                         .extend(channel.split(',').map(buffer_key));
+                    // Standalone: saved with the channel once we're in.
+                    if self.local.is_some()
+                        && let Some(key) = &key
+                        && !channel.contains(',')
+                    {
+                        net.pending_keys
+                            .insert(buffer_key(&channel), SecretString::from(key.clone()));
+                    }
                 }
                 let mut params = vec![channel];
                 params.extend(key);
@@ -243,6 +343,25 @@ impl Coordinator {
                 target,
                 text,
             } => {
+                if let Some(local) = &self.local {
+                    let results = local.store.search(&network, &target, &text, 100);
+                    return self.emit(match results {
+                        Ok(found) => Event::SearchResults {
+                            network,
+                            results: found.into_iter().map(|m| (target.clone(), m)).collect(),
+                            target,
+                            text,
+                            error: None,
+                        },
+                        Err(e) => Event::SearchResults {
+                            network,
+                            target,
+                            text,
+                            results: vec![],
+                            error: Some(e.to_string()),
+                        },
+                    });
+                }
                 let Some(net) = self.networks.get_mut(&network) else {
                     return self.error(Some(&network), "unknown network");
                 };
@@ -300,6 +419,9 @@ impl Coordinator {
                 before,
                 limit,
             } => {
+                if self.local.is_some() {
+                    return self.local_history(&network, &target, before, limit);
+                }
                 let Some(net) = self.networks.get(&network) else {
                     return self.error(Some(&network), "unknown network");
                 };
@@ -329,6 +451,17 @@ impl Coordinator {
                 target,
                 time,
             } => {
+                if let Some(local) = &self.local {
+                    match local.store.mark_read(&network, &target, time) {
+                        Ok(time) => self.emit(Event::ReadMarker {
+                            network,
+                            buffer: target,
+                            time,
+                        }),
+                        Err(e) => self.error(Some(&network), e.to_string()),
+                    }
+                    return;
+                }
                 let Some(net) = self.networks.get(&network) else {
                     return self.error(Some(&network), "unknown network");
                 };
@@ -343,6 +476,16 @@ impl Coordinator {
                     ),
                 );
             }
+            Command::AddNetwork { attributes } if self.local.is_some() => {
+                self.local_add_network(attributes);
+            }
+            Command::ChangeNetwork {
+                network,
+                attributes,
+            } if self.local.is_some() => self.local_change_network(&network, attributes),
+            Command::RemoveNetwork { network } if self.local.is_some() => {
+                self.local_remove_network(&network);
+            }
             Command::AddNetwork { attributes } => {
                 let attrs = attributes
                     .iter()
@@ -350,7 +493,7 @@ impl Coordinator {
                     .collect::<Vec<_>>()
                     .join(";");
                 let msg = Message::new("BOUNCER", ["ADDNETWORK".to_owned(), attrs]);
-                let _ = self.control.send(ToConn::Send(msg));
+                self.send_control(msg);
             }
             Command::ChangeNetwork {
                 network,
@@ -362,11 +505,11 @@ impl Coordinator {
                     .collect::<Vec<_>>()
                     .join(";");
                 let msg = Message::new("BOUNCER", ["CHANGENETWORK".to_owned(), network, attrs]);
-                let _ = self.control.send(ToConn::Send(msg));
+                self.send_control(msg);
             }
             Command::RemoveNetwork { network } => {
                 let msg = Message::new("BOUNCER", ["DELNETWORK".to_owned(), network]);
-                let _ = self.control.send(ToConn::Send(msg));
+                self.send_control(msg);
             }
             Command::SendRaw { network, line } => match Message::parse(line.trim()) {
                 Ok(msg) => {
@@ -387,6 +530,12 @@ impl Coordinator {
                 }
             }
             Command::Shutdown => {}
+        }
+    }
+
+    fn send_control(&self, msg: Message) {
+        if let Some(control) = &self.control {
+            let _ = control.send(ToConn::Send(msg));
         }
     }
 
@@ -441,10 +590,33 @@ impl Coordinator {
                     return;
                 };
                 net.connected = state == ConnectionState::Connected;
+                // soju reports the upstream state as network attributes;
+                // standalone networks report it the same way.
+                let info = self.local.is_some().then(|| {
+                    let (value, error) = match &state {
+                        ConnectionState::Connecting => ("connecting", ""),
+                        ConnectionState::Connected => ("connected", ""),
+                        ConnectionState::Disconnected { error, .. } => {
+                            ("disconnected", error.as_str())
+                        }
+                        ConnectionState::AuthFailed { reason } => ("disconnected", reason.as_str()),
+                    };
+                    let attrs = &mut net.info.attributes;
+                    attrs.insert("state".into(), value.into());
+                    if error.is_empty() {
+                        attrs.remove("error");
+                    } else {
+                        attrs.insert("error".into(), error.into());
+                    }
+                    net.info.clone()
+                });
                 self.emit(Event::Connection {
                     network: Some(id),
                     state,
                 });
+                if let Some(info) = info {
+                    self.emit(Event::NetworkUpdated(info));
+                }
             }
             (Some(id), FromConn::Registered(reg)) => self.registered(&id, *reg),
             (Some(id), FromConn::Incoming(Incoming::Batch(batch))) => self.batch(&id, batch),
@@ -474,32 +646,23 @@ impl Coordinator {
                             id: update.id.clone(),
                             attributes: update.attributes,
                         };
-                        let conn = (self.spawn)(Some(update.id.clone()), self.from_conn_tx.clone());
-                        self.networks.insert(
-                            update.id,
-                            Network {
-                                info: info.clone(),
-                                conn,
-                                connected: false,
-                                nick: String::new(),
-                                chantypes: "#&".into(),
-                                caps: BTreeSet::new(),
-                                history_max: None,
-                                buffers: HashMap::new(),
-                                requested_joins: HashSet::new(),
-                                members: Members::new(&BTreeMap::new()),
-                                channel_list: Vec::new(),
-                                whox: false,
-                                who_requested: HashSet::new(),
-                                who_pending: HashSet::new(),
-                                whois: HashMap::new(),
-                                probing: HashSet::new(),
-                                searches: VecDeque::new(),
-                                monitor: false,
-                                client_tag_deny: String::new(),
-                                bans: HashMap::new(),
-                            },
+                        let Backend::Bouncer {
+                            connector,
+                            credentials,
+                        } = &self.config.backend
+                        else {
+                            return;
+                        };
+                        let id = Some(update.id.clone());
+                        let spec = ConnSpec::bouncer(
+                            connector.clone(),
+                            credentials.clone(),
+                            &id,
+                            &self.config,
                         );
+                        let conn = (self.spawn)(id, Arc::new(spec), self.from_conn_tx.clone());
+                        self.networks
+                            .insert(update.id, Network::new(info.clone(), conn));
                         info
                     }
                 };
@@ -516,6 +679,8 @@ impl Coordinator {
     }
 
     fn registered(&mut self, id: &str, reg: Registered) {
+        let logged_in = reg.account.is_some();
+        let local = self.local.is_some();
         let Some(net) = self.networks.get_mut(id) else {
             return;
         };
@@ -534,7 +699,7 @@ impl Coordinator {
         for (key, value) in &reg.isupport {
             net.set_isupport(key, Some(value));
         }
-        if net.caps.contains("draft/chathistory") {
+        if !local && net.caps.contains("draft/chathistory") {
             // Every conversation with history, so queries show up too.
             let msg = Message::new(
                 "CHATHISTORY",
@@ -555,6 +720,9 @@ impl Coordinator {
                 network: id.to_owned(),
                 nick: net.nick.clone(),
             });
+        }
+        if local {
+            self.local_registered(id, logged_in);
         }
         self.monitor_all(id);
     }
@@ -663,6 +831,7 @@ impl Coordinator {
     }
 
     fn message(&mut self, id: &str, msg: &Message) {
+        self.local_channels(id, msg);
         let Some(net) = self.networks.get_mut(id) else {
             return;
         };
@@ -1245,7 +1414,10 @@ impl Coordinator {
                 .conn
                 .send(ToConn::Send(Message::new("MONITOR", ["+", name])));
         }
-        if kind != BufferKind::Server && net.caps.contains("draft/read-marker") {
+        if self.local.is_none()
+            && kind != BufferKind::Server
+            && net.caps.contains("draft/read-marker")
+        {
             // Ask for the read marker; the reply is a MARKREAD.
             let _ = net
                 .conn
@@ -1256,6 +1428,356 @@ impl Coordinator {
             name: name.to_owned(),
             kind,
         });
+        if let Some(local) = &self.local
+            && kind != BufferKind::Server
+        {
+            match local.store.read_marker(id, name) {
+                Ok(time) => self.emit(Event::ReadMarker {
+                    network: id.to_owned(),
+                    buffer: name.to_owned(),
+                    time,
+                }),
+                Err(e) => self.error(Some(id), e.to_string()),
+            }
+        }
+    }
+}
+
+// -- without a bouncer --------------------------------------------------------
+
+impl Coordinator {
+    /// Standalone startup: "connected" at once (there's no bouncer to
+    /// reach), then every saved network.
+    fn start_local(&mut self) {
+        self.emit(Event::Connection {
+            network: None,
+            state: ConnectionState::Connected,
+        });
+        let Some(local) = self.local.clone() else {
+            return;
+        };
+        match local.store.networks() {
+            Ok(networks) => {
+                for (id, saved) in networks {
+                    self.add_local(id, saved);
+                }
+            }
+            Err(e) => self.error(None, e.to_string()),
+        }
+    }
+
+    /// Starts a connection for a saved network. Returns the connection and
+    /// the network's settings (`None` if they can't be used).
+    fn local_connect(
+        &mut self,
+        id: &str,
+        saved: &BTreeMap<String, String>,
+    ) -> (mpsc::UnboundedSender<ToConn>, Option<NetworkConfig>) {
+        let Some(local) = self.local.clone() else {
+            return (mpsc::unbounded_channel().0, None);
+        };
+        let made = NetworkConfig::new(id, saved, &self.config.nick, local.secrets.as_ref())
+            .map_err(|e| e.to_string())
+            .and_then(|cfg| {
+                let connector =
+                    connector_for_url(&cfg.url(), local.tls.clone()).map_err(|e| e.to_string())?;
+                Ok((cfg, connector))
+            });
+        let (cfg, connector) = match made {
+            Ok(made) => made,
+            Err(e) => {
+                self.error(Some(id), format!("can't connect: {e}"));
+                return (mpsc::unbounded_channel().0, None);
+            }
+        };
+        let mut opts = ConnectOptions::new(cfg.nick.clone());
+        opts.username = cfg.username.clone();
+        opts.realname = cfg.realname.clone();
+        opts.password = cfg.password.clone();
+        let sasl = cfg.sasl.clone().map(|s| SaslCredentials::Plain {
+            username: s.username,
+            password: s.password,
+        });
+        let spec = ConnSpec {
+            connector: Arc::from(connector),
+            login: Login::Sasl(sasl),
+            opts,
+            backoff: self.config.backoff,
+            keepalive: self.config.keepalive,
+        };
+        let conn = (self.spawn)(
+            Some(id.to_owned()),
+            Arc::new(spec),
+            self.from_conn_tx.clone(),
+        );
+        (conn, Some(cfg))
+    }
+
+    /// What the front end sees of a saved network: its attributes, which
+    /// passwords are saved (`<name>-set`), and the connection state.
+    fn local_info(
+        id: &str,
+        saved: &BTreeMap<String, String>,
+        cfg: Option<&NetworkConfig>,
+    ) -> NetworkInfo {
+        let mut attributes = saved.clone();
+        if let Some(cfg) = cfg {
+            let set = [
+                ("pass", cfg.password.is_some()),
+                ("sasl-password", cfg.sasl.is_some()),
+                ("nickserv-password", cfg.nickserv.is_some()),
+            ];
+            for (name, is_set) in set {
+                if is_set {
+                    attributes.insert(format!("{name}-set"), "1".into());
+                }
+            }
+        }
+        attributes.insert("state".into(), "connecting".into());
+        NetworkInfo {
+            id: id.to_owned(),
+            attributes,
+        }
+    }
+
+    fn add_local(&mut self, id: NetworkId, saved: BTreeMap<String, String>) {
+        let (conn, cfg) = self.local_connect(&id, &saved);
+        let info = Self::local_info(&id, &saved, cfg.as_ref());
+        let mut net = Network::new(info.clone(), conn);
+        net.nickserv = cfg.and_then(|c| c.nickserv);
+        net.saved = saved;
+        self.networks.insert(id, net);
+        self.emit(Event::NetworkUpdated(info));
+    }
+
+    /// Splits off the passwords, which go to the vault.
+    fn split_secrets(
+        attributes: BTreeMap<String, String>,
+    ) -> (BTreeMap<String, String>, Vec<(String, String)>) {
+        let (secrets, rest) = attributes
+            .into_iter()
+            .partition::<Vec<_>, _>(|(k, _)| SECRET_ATTRIBUTES.contains(&k.as_str()));
+        (rest.into_iter().collect(), secrets)
+    }
+
+    /// Saves (or, if empty, deletes) passwords for a network.
+    fn save_secrets(&self, id: &str, secrets: &[(String, String)]) -> Result<(), String> {
+        let Some(local) = &self.local else {
+            return Ok(());
+        };
+        for (name, value) in secrets {
+            let key = secret_key(id, name);
+            let result = if value.is_empty() {
+                local.secrets.delete(&key)
+            } else {
+                local.secrets.set(&key, &SecretString::from(value.clone()))
+            };
+            result.map_err(|e| format!("couldn't save the {name}: {}", e.0))?;
+        }
+        Ok(())
+    }
+
+    fn local_add_network(&mut self, attributes: BTreeMap<String, String>) {
+        let Some(local) = self.local.clone() else {
+            return;
+        };
+        if let Err(e) = validate(&attributes, true) {
+            return self.error(None, e);
+        }
+        let (mut saved, secrets) = Self::split_secrets(attributes);
+        saved.retain(|_, v| !v.is_empty());
+        let id = match local.store.add_network(&saved) {
+            Ok(id) => id,
+            Err(e) => return self.error(None, e.to_string()),
+        };
+        if let Err(e) = self.save_secrets(&id, &secrets) {
+            self.error(Some(&id), e);
+        }
+        self.add_local(id, saved);
+    }
+
+    /// Changes attributes (empty values remove them) and reconnects.
+    fn local_change_network(&mut self, id: &str, attributes: BTreeMap<String, String>) {
+        let Some(local) = self.local.clone() else {
+            return;
+        };
+        let Some(mut saved) = self.networks.get(id).map(|n| n.saved.clone()) else {
+            return self.error(Some(id), "unknown network");
+        };
+        if let Err(e) = validate(&attributes, false) {
+            return self.error(Some(id), e);
+        }
+        let (changes, secrets) = Self::split_secrets(attributes);
+        for (k, v) in changes {
+            if v.is_empty() {
+                saved.remove(&k);
+            } else {
+                saved.insert(k, v);
+            }
+        }
+        if let Err(e) = validate(&saved, true) {
+            return self.error(Some(id), e);
+        }
+        if let Err(e) = local.store.set_network(id, &saved) {
+            return self.error(Some(id), e.to_string());
+        }
+        if let Err(e) = self.save_secrets(id, &secrets) {
+            self.error(Some(id), e);
+        }
+        if let Some(old) = self.networks.remove(id) {
+            let _ = old.conn.send(ToConn::Stop);
+        }
+        self.add_local(id.to_owned(), saved);
+    }
+
+    /// Deletes a network with its history, channels and passwords.
+    fn local_remove_network(&mut self, id: &str) {
+        let Some(local) = self.local.clone() else {
+            return;
+        };
+        let Some(net) = self.networks.remove(id) else {
+            return self.error(Some(id), "unknown network");
+        };
+        let _ = net.conn.send(ToConn::Stop);
+        let keyed: Vec<String> = local
+            .store
+            .channels(id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_, has_key)| *has_key)
+            .map(|(name, _)| channel_key_key(id, &name))
+            .collect();
+        let secrets = SECRET_ATTRIBUTES.iter().map(|name| secret_key(id, name));
+        for key in keyed.into_iter().chain(secrets) {
+            if let Err(e) = local.secrets.delete(&key) {
+                tracing::warn!(error = %e.0, "couldn't delete a saved password");
+            }
+        }
+        if let Err(e) = local.store.remove_network(id) {
+            self.error(Some(id), e.to_string());
+        }
+        self.emit(Event::NetworkRemoved(id.to_owned()));
+    }
+
+    fn local_history(
+        &mut self,
+        network: &str,
+        target: &str,
+        before: Option<DateTime<Utc>>,
+        limit: usize,
+    ) {
+        let (Some(local), Some(net)) = (self.local.clone(), self.networks.get(network)) else {
+            return self.error(Some(network), "unknown network");
+        };
+        let kind = if target == SERVER_BUFFER {
+            BufferKind::Server
+        } else if net.ctx().is_channel(target) {
+            BufferKind::Channel
+        } else {
+            BufferKind::Query
+        };
+        match local.store.before(network, target, before, limit.max(1)) {
+            Ok(messages) => {
+                self.ensure_buffer(network, target, kind);
+                self.emit(Event::History {
+                    network: network.to_owned(),
+                    buffer: target.to_owned(),
+                    messages,
+                });
+            }
+            Err(e) => self.error(Some(network), e.to_string()),
+        }
+    }
+
+    /// After connecting: private conversations from the history, NickServ,
+    /// and the channels we were in.
+    fn local_registered(&mut self, id: &str, logged_in: bool) {
+        let Some(local) = self.local.clone() else {
+            return;
+        };
+        let is_channel = |name: &str| {
+            self.networks
+                .get(id)
+                .is_some_and(|net| net.ctx().is_channel(name))
+        };
+        let conversations: Vec<String> = local
+            .store
+            .conversations(id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|name| name != SERVER_BUFFER && !is_channel(name))
+            .collect();
+        for name in conversations {
+            self.ensure_buffer(id, &name, BufferKind::Query);
+        }
+        let channels = match local.store.channels(id) {
+            Ok(channels) => channels,
+            Err(e) => return self.error(Some(id), e.to_string()),
+        };
+        let Some(net) = self.networks.get(id) else {
+            return;
+        };
+        if !logged_in && let Some(password) = &net.nickserv {
+            use secrecy::ExposeSecret;
+            let identify = format!("IDENTIFY {}", password.expose_secret());
+            let _ = net.conn.send(ToConn::Send(Message::new(
+                "PRIVMSG",
+                ["NickServ".to_owned(), identify],
+            )));
+        }
+        for (name, has_key) in channels {
+            let key = if has_key {
+                local
+                    .secrets
+                    .get(&channel_key_key(id, &name))
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+            let mut params = vec![name];
+            if let Some(key) = key {
+                use secrecy::ExposeSecret;
+                params.push(key.expose_secret().to_owned());
+            }
+            let _ = net.conn.send(ToConn::Send(Message::new("JOIN", params)));
+        }
+    }
+
+    /// Standalone: remembers channels we join and forgets ones we leave.
+    fn local_channels(&mut self, id: &str, msg: &Message) {
+        let Some(local) = self.local.clone() else {
+            return;
+        };
+        let Some(net) = self.networks.get_mut(id) else {
+            return;
+        };
+        let own = msg
+            .source_nick()
+            .is_some_and(|n| n.eq_ignore_ascii_case(&net.nick));
+        if msg.command == "JOIN"
+            && own
+            && let Some(channel) = msg.param(0)
+        {
+            let key = net.pending_keys.remove(&buffer_key(channel));
+            let saved = key.is_some_and(|key| {
+                local
+                    .secrets
+                    .set(&channel_key_key(id, channel), &key)
+                    .inspect_err(|e| tracing::warn!(error = %e.0, "couldn't save a channel key"))
+                    .is_ok()
+            });
+            if let Err(e) = local.store.add_channel(id, channel, saved) {
+                self.error(Some(id), e.to_string());
+            }
+        } else if let Some(channel) = left_channel(msg, &net.nick) {
+            if let Err(e) = local.secrets.delete(&channel_key_key(id, &channel)) {
+                tracing::warn!(error = %e.0, "couldn't delete a channel key");
+            }
+            if let Err(e) = local.store.remove_channel(id, &channel) {
+                self.error(Some(id), e.to_string());
+            }
+        }
     }
 }
 
@@ -1286,10 +1808,20 @@ mod tests {
     }
 
     impl Harness {
+        /// With soju.
         fn new() -> Self {
+            let creds = crate::auth::StaticCredentials(crate::sasl::SaslCredentials::Plain {
+                username: "me".into(),
+                password: "pw".into(),
+            });
+            let connector = Arc::new(crate::transport::mock::MockConnector::new(vec![]));
+            Self::with(SessionConfig::new(connector, Arc::new(creds), "me"))
+        }
+
+        fn with(config: SessionConfig) -> Self {
             let conns = Arc::new(Mutex::new(Vec::new()));
             let spawned = conns.clone();
-            let spawner: Spawner = Box::new(move |id, _| {
+            let spawner: Spawner = Box::new(move |id, _, _| {
                 let (tx, rx) = mpsc::unbounded_channel();
                 spawned.lock().unwrap().push((id, rx));
                 tx
@@ -1297,7 +1829,7 @@ mod tests {
             let (from_tx, _from_rx) = mpsc::unbounded_channel();
             let (ev_tx, events) = mpsc::unbounded_channel();
             Harness {
-                c: Coordinator::new(spawner, from_tx, ev_tx),
+                c: Coordinator::new(Arc::new(config), spawner, from_tx, ev_tx),
                 events,
                 conns,
             }
@@ -1349,6 +1881,353 @@ mod tests {
             self.events();
             self.sent(Some("1"));
         }
+    }
+
+    // -- without a bouncer ----------------------------------------------------
+
+    use crate::local::tests::MemoryVault;
+    use crate::local::{LocalStore, SecretVault, Standalone};
+
+    struct Local {
+        h: Harness,
+        store: Arc<LocalStore>,
+        vault: Arc<MemoryVault>,
+    }
+
+    /// A standalone session over `store` (networks saved beforehand).
+    fn standalone(store: LocalStore, vault: MemoryVault) -> Local {
+        let (store, vault) = (Arc::new(store), Arc::new(vault));
+        let local = Standalone {
+            store: store.clone(),
+            secrets: vault.clone(),
+            text_logs: None,
+            tls: Default::default(),
+        };
+        let h = Harness::with(SessionConfig::standalone(local, "me"));
+        Local { h, store, vault }
+    }
+
+    fn attrs(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    /// One saved network ("1", irc.example), registered as "me".
+    fn local_network(store: LocalStore, vault: MemoryVault, account: Option<&str>) -> Local {
+        store
+            .add_network(&attrs(&[("host", "irc.example"), ("name", "Example")]))
+            .unwrap();
+        let mut l = standalone(store, vault);
+        let reg = Registered {
+            nick: "me".into(),
+            account: account.map(str::to_owned),
+            isupport: [("CHANTYPES".into(), "#".into())].into(),
+            ..Default::default()
+        };
+        l.h.c
+            .on_connection(Some("1".into()), FromConn::Registered(Box::new(reg)));
+        l.h.c.on_connection(
+            Some("1".into()),
+            FromConn::State(ConnectionState::Connected),
+        );
+        l
+    }
+
+    #[test]
+    fn standalone_starts_saved_networks() {
+        let store = LocalStore::in_memory().unwrap();
+        store
+            .add_network(&attrs(&[("host", "irc.example"), ("name", "Example")]))
+            .unwrap();
+        let mut l = standalone(store, MemoryVault::default());
+        let ev = l.h.events();
+        assert_eq!(
+            ev[0],
+            Event::Connection {
+                network: None,
+                state: ConnectionState::Connected
+            }
+        );
+        let Event::NetworkUpdated(info) = &ev[1] else {
+            panic!("{ev:?}")
+        };
+        assert_eq!((info.id.as_str(), info.name()), ("1", "Example"));
+        assert_eq!(info.attributes["state"], "connecting");
+        let ids: Vec<ConnId> =
+            l.h.conns
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(id, _)| id.clone())
+                .collect();
+        assert_eq!(ids, [Some("1".to_owned())], "no control connection");
+
+        l.h.c.on_connection(
+            Some("1".into()),
+            FromConn::State(ConnectionState::Disconnected {
+                error: "refused".into(),
+                retry_in: std::time::Duration::from_secs(1),
+            }),
+        );
+        let ev = l.h.events();
+        let Event::NetworkUpdated(info) = &ev[1] else {
+            panic!("{ev:?}")
+        };
+        assert_eq!(info.attributes["state"], "disconnected");
+        assert_eq!(info.attributes["error"], "refused");
+    }
+
+    #[test]
+    fn standalone_networks_keep_passwords_in_the_vault() {
+        let mut l = standalone(LocalStore::in_memory().unwrap(), MemoryVault::default());
+        l.h.events();
+        l.h.c.command(Command::AddNetwork {
+            attributes: attrs(&[
+                ("name", "Libera"),
+                ("host", "irc.libera.chat"),
+                ("sasl-password", "hunter2"),
+            ]),
+        });
+        let ev = l.h.events();
+        let Event::NetworkUpdated(info) = &ev[0] else {
+            panic!("{ev:?}")
+        };
+        assert_eq!(
+            info.attributes.get("sasl-password-set").map(String::as_str),
+            Some("1")
+        );
+        assert!(!format!("{ev:?}").contains("hunter2"));
+        let saved = l.store.networks().unwrap();
+        assert_eq!(
+            saved[0].1,
+            attrs(&[("name", "Libera"), ("host", "irc.libera.chat")])
+        );
+        assert_eq!(
+            l.vault
+                .0
+                .lock()
+                .unwrap()
+                .get("network/1/sasl-password")
+                .map(String::as_str),
+            Some("hunter2")
+        );
+
+        // Changing reconnects; an empty password deletes it.
+        l.h.c.command(Command::ChangeNetwork {
+            network: "1".into(),
+            attributes: attrs(&[("port", "7000"), ("sasl-password", "")]),
+        });
+        assert_eq!(l.h.sent(Some("1")), ["<stop>"]);
+        assert_eq!(l.h.conns.lock().unwrap().len(), 2);
+        assert!(l.vault.0.lock().unwrap().is_empty());
+        assert_eq!(l.store.networks().unwrap()[0].1["port"], "7000");
+        let ev = l.h.events();
+        assert!(
+            matches!(&ev[0], Event::NetworkUpdated(i) if !i.attributes.contains_key("sasl-password-set")),
+            "{ev:?}"
+        );
+
+        l.h.c.command(Command::RemoveNetwork {
+            network: "1".into(),
+        });
+        assert_eq!(l.h.events(), [Event::NetworkRemoved("1".into())]);
+        assert!(l.store.networks().unwrap().is_empty());
+
+        l.h.c.command(Command::AddNetwork {
+            attributes: attrs(&[("name", "No host")]),
+        });
+        assert!(
+            matches!(&l.h.events()[0], Event::Error { message, .. } if message.contains("host"))
+        );
+    }
+
+    #[test]
+    fn standalone_rejoins_channels_and_identifies() {
+        let vault = MemoryVault::default();
+        let store = LocalStore::in_memory().unwrap();
+        store
+            .add_network(&attrs(&[("host", "irc.example"), ("name", "Example")]))
+            .unwrap();
+        store.add_channel("1", "#rust", false).unwrap();
+        store.add_channel("1", "#secret", true).unwrap();
+        store
+            .append(
+                "1",
+                "erin",
+                &ChatMessage {
+                    id: None,
+                    time: Utc::now(),
+                    sender: "erin".into(),
+                    kind: MessageKind::Privmsg,
+                    text: "hi".into(),
+                    own: false,
+                },
+            )
+            .unwrap();
+        vault
+            .set("network/1/channel-key/#secret", &"sesame".into())
+            .unwrap();
+        vault
+            .set("network/1/nickserv-password", &"pw".into())
+            .unwrap();
+        let mut l = standalone(store, vault);
+        let reg = Registered {
+            nick: "me".into(),
+            isupport: [("CHANTYPES".into(), "#".into())].into(),
+            ..Default::default()
+        };
+        l.h.c
+            .on_connection(Some("1".into()), FromConn::Registered(Box::new(reg)));
+        assert_eq!(
+            l.h.sent(Some("1")),
+            [
+                "PRIVMSG NickServ :IDENTIFY pw",
+                "JOIN #rust",
+                "JOIN #secret sesame"
+            ]
+        );
+        let ev = l.h.events();
+        assert!(
+            ev.contains(&Event::BufferAdded {
+                network: "1".into(),
+                name: "erin".into(),
+                kind: BufferKind::Query
+            }),
+            "{ev:?}"
+        );
+        // The rejoin echo makes the buffer but isn't news.
+        l.h.c.on_connection(
+            Some("1".into()),
+            FromConn::Incoming(Incoming::Message(
+                Message::parse(":me!u@h JOIN #rust").unwrap(),
+            )),
+        );
+        let ev = l.h.events();
+        assert!(
+            matches!(&ev[0], Event::BufferAdded { name, .. } if name == "#rust"),
+            "{ev:?}"
+        );
+        assert!(
+            !ev.iter().any(|e| matches!(e, Event::Message { .. })),
+            "{ev:?}"
+        );
+    }
+
+    #[test]
+    fn standalone_skips_nickserv_after_sasl() {
+        let vault = MemoryVault::default();
+        vault
+            .set("network/1/nickserv-password", &"pw".into())
+            .unwrap();
+        let l = local_network(LocalStore::in_memory().unwrap(), vault, Some("me"));
+        assert!(l.h.sent(Some("1")).is_empty());
+    }
+
+    #[test]
+    fn standalone_remembers_channels_and_their_keys() {
+        let mut l = local_network(
+            LocalStore::in_memory().unwrap(),
+            MemoryVault::default(),
+            None,
+        );
+        l.h.c.command(Command::Join {
+            network: "1".into(),
+            channel: "#Secret".into(),
+            key: Some("sesame".into()),
+        });
+        l.h.line(Some("1"), ":me!u@h JOIN #Secret");
+        assert_eq!(
+            l.store.channels("1").unwrap(),
+            [("#Secret".to_owned(), true)]
+        );
+        assert_eq!(
+            l.vault
+                .0
+                .lock()
+                .unwrap()
+                .get("network/1/channel-key/#secret")
+                .map(String::as_str),
+            Some("sesame")
+        );
+        l.h.line(Some("1"), ":me!u@h PART #secret :bye");
+        assert!(l.store.channels("1").unwrap().is_empty());
+        assert!(l.vault.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn standalone_history_markers_and_search() {
+        let mut l = local_network(
+            LocalStore::in_memory().unwrap(),
+            MemoryVault::default(),
+            None,
+        );
+        l.h.line(
+            Some("1"),
+            "@time=2026-11-14T10:00:00.000Z :erin!e@h PRIVMSG #rust :hello there",
+        );
+        l.h.line(
+            Some("1"),
+            "@time=2026-11-14T10:01:00.000Z :erin!e@h PRIVMSG #rust :again",
+        );
+        // Our own message, without echo-message: shown and kept at once.
+        l.h.c.command(Command::SendMessage {
+            network: "1".into(),
+            target: "#rust".into(),
+            text: "hello back".into(),
+        });
+        l.h.events();
+
+        l.h.c.command(Command::LoadHistory {
+            network: "1".into(),
+            target: "#Rust".into(),
+            before: None,
+            limit: 2,
+        });
+        let ev = l.h.events();
+        let Event::History { messages, .. } = &ev[0] else {
+            panic!("{ev:?}")
+        };
+        let texts: Vec<&str> = messages.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(texts, ["again", "hello back"]);
+        assert!(messages[1].own);
+
+        let time = DateTime::parse_from_rfc3339("2026-11-14T10:01:00Z")
+            .unwrap()
+            .to_utc();
+        l.h.c.command(Command::MarkRead {
+            network: "1".into(),
+            target: "#rust".into(),
+            time,
+        });
+        assert_eq!(
+            l.h.events(),
+            [Event::ReadMarker {
+                network: "1".into(),
+                buffer: "#rust".into(),
+                time: Some(time)
+            }]
+        );
+
+        l.h.c.command(Command::Search {
+            network: "1".into(),
+            target: "#rust".into(),
+            text: "HELLO".into(),
+        });
+        let ev = l.h.events();
+        let Event::SearchResults { results, error, .. } = &ev[0] else {
+            panic!("{ev:?}")
+        };
+        assert_eq!(error, &None);
+        let found: Vec<&str> = results.iter().map(|(_, m)| m.text.as_str()).collect();
+        assert_eq!(found, ["hello there", "hello back"]);
+        // Nothing went to the network for any of this.
+        assert!(
+            l.h.sent(Some("1"))
+                .iter()
+                .all(|l| l.starts_with("PRIVMSG #rust"))
+        );
     }
 
     #[test]
