@@ -7,21 +7,24 @@ use backroom_core::auth::{
     StaticCredentials, TokenStore,
 };
 use backroom_core::live::{self, Command, Event, SessionConfig, SessionHandle};
+use backroom_core::local::{LocalStore, Standalone};
 use backroom_core::sasl::SaslCredentials;
 use backroom_core::transport::{TlsOptions, connector_for_url};
 use secrecy::SecretString;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use crate::store::{ForeignTokenStore, SecretStore};
+use crate::store::{ForeignTokenStore, ForeignVault, SecretStore};
 use crate::{BackroomError, SessionEvent};
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct ClientConfig {
     /// soju's URL: `wss://`, `ws://`, `ircs://` or `irc+insecure://`.
+    /// Unused for [`LoginMethod::Standalone`].
     pub server_url: String,
     pub login: LoginMethod,
     /// Nick to register with; soju replaces it with each network's nick.
+    /// Without a bouncer, the nick for networks that don't set one.
     pub nick: String,
     /// Our answer to CTCP VERSION, e.g. "Backroom 0.1.0 (macOS)".
     pub client_version: String,
@@ -45,6 +48,14 @@ pub enum LoginMethod {
     /// soju's own accounts (`auth internal`, also `auth http`): SASL PLAIN
     /// with a password saved by `login_with_password`.
     Password { username: String },
+    /// No bouncer: networks, channels and history are kept in the SQLite
+    /// database at `database`, and the client connects to each network
+    /// itself. The secret store holds the networks' passwords.
+    Standalone {
+        database: String,
+        /// Also write plain-text logs to this folder; see `set_text_logs`.
+        text_logs: Option<String>,
+    },
 }
 
 struct Running {
@@ -70,6 +81,11 @@ pub struct BackroomClient {
     oidc: tokio::sync::Mutex<Option<OidcClient>>,
     pending: Mutex<Option<PendingAuthorization>>,
     session: Mutex<Option<Running>>,
+    /// Standalone: the passwords (in the secret store) and the database,
+    /// opened on the first `connect`.
+    vault: Arc<ForeignVault>,
+    local_store: Mutex<Option<Arc<LocalStore>>>,
+    text_logs: Mutex<Option<String>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -133,7 +149,34 @@ impl BackroomClient {
                     password,
                 })))
             }
+            LoginMethod::Standalone { .. } => Err(BackroomError::Internal {
+                message: "a standalone session has no bouncer login".into(),
+            }),
         }
+    }
+
+    /// The session for [`LoginMethod::Standalone`].
+    fn standalone_config(&self, database: &str) -> Result<SessionConfig, BackroomError> {
+        let config_error = |message: String| BackroomError::Config { message };
+        let store = {
+            let mut cached = lock(&self.local_store);
+            match cached.as_ref() {
+                Some(store) => store.clone(),
+                None => {
+                    let store = LocalStore::open(std::path::Path::new(database)).map_err(|e| {
+                        config_error(format!("couldn't open the history database: {e}"))
+                    })?;
+                    cached.insert(Arc::new(store)).clone()
+                }
+            }
+        };
+        let local = Standalone {
+            store,
+            secrets: self.vault.clone(),
+            text_logs: lock(&self.text_logs).clone().map(Into::into),
+            tls: TlsOptions::default(),
+        };
+        Ok(SessionConfig::standalone(local, self.config.nick.clone()))
     }
 
     fn command(&self, command: Command) -> Result<(), BackroomError> {
@@ -152,11 +195,13 @@ impl BackroomClient {
         config: ClientConfig,
         secret_store: Arc<dyn SecretStore>,
     ) -> Result<Arc<Self>, BackroomError> {
-        connector_for_url(&config.server_url, TlsOptions::default()).map_err(|e| {
-            BackroomError::Config {
-                message: e.to_string(),
-            }
-        })?;
+        if !matches!(config.login, LoginMethod::Standalone { .. }) {
+            connector_for_url(&config.server_url, TlsOptions::default()).map_err(|e| {
+                BackroomError::Config {
+                    message: e.to_string(),
+                }
+            })?;
+        }
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("backroom")
@@ -165,9 +210,16 @@ impl BackroomClient {
             .map_err(|e| BackroomError::Internal {
                 message: e.to_string(),
             })?;
+        let text_logs = match &config.login {
+            LoginMethod::Standalone { text_logs, .. } => text_logs.clone(),
+            _ => None,
+        };
         Ok(Arc::new(BackroomClient {
             runtime,
             config,
+            vault: Arc::new(ForeignVault::new(secret_store.clone())),
+            local_store: Mutex::new(None),
+            text_logs: Mutex::new(text_logs),
             store: Arc::new(ForeignTokenStore::new(secret_store.clone())),
             secret: secret_store,
             password: Mutex::new(None),
@@ -183,6 +235,7 @@ impl BackroomClient {
         Ok(match self.config.login {
             LoginMethod::Oidc { .. } => self.store.load()?.is_some(),
             LoginMethod::Password { .. } => self.stored_password()?.is_some(),
+            LoginMethod::Standalone { .. } => true,
         })
     }
 
@@ -191,7 +244,7 @@ impl BackroomClient {
     pub fn login_with_password(&self, password: String) -> Result<(), BackroomError> {
         if !matches!(self.config.login, LoginMethod::Password { .. }) {
             return Err(BackroomError::Config {
-                message: "this account logs in with single sign-on".into(),
+                message: "this account doesn't log in with a password".into(),
             });
         }
         let password = SecretString::from(password);
@@ -231,15 +284,16 @@ impl BackroomClient {
     /// Starts (or restarts) the session with the stored login. Progress and
     /// failures, including a rejected login, arrive through `next_event`.
     pub async fn connect(&self) -> Result<(), BackroomError> {
-        let credentials = self.credentials().await?;
-        let connector =
-            connector_for_url(&self.config.server_url, TlsOptions::default()).map_err(|e| {
-                BackroomError::Config {
+        let mut config = if let LoginMethod::Standalone { database, .. } = &self.config.login {
+            self.standalone_config(database)?
+        } else {
+            let credentials = self.credentials().await?;
+            let connector = connector_for_url(&self.config.server_url, TlsOptions::default())
+                .map_err(|e| BackroomError::Config {
                     message: e.to_string(),
-                }
-            })?;
-        let mut config =
-            SessionConfig::new(Arc::from(connector), credentials, self.config.nick.clone());
+                })?;
+            SessionConfig::new(Arc::from(connector), credentials, self.config.nick.clone())
+        };
         config.client_version = self.config.client_version.clone();
         let (handle, events) = self.runtime.spawn(async { live::start(config) }).await?;
         let running = Running {
@@ -427,9 +481,24 @@ impl BackroomClient {
         }
     }
 
-    /// Disconnects and deletes the stored login.
+    /// Standalone: starts or stops writing plain-text logs (one file per
+    /// conversation per day under `folder`), now and for later connects.
+    pub fn set_text_logs(&self, folder: Option<String>) {
+        *lock(&self.text_logs) = folder.clone();
+        if let Some(running) = lock(&self.session).as_ref() {
+            running.handle.send(Command::SetTextLogs {
+                folder: folder.map(Into::into),
+            });
+        }
+    }
+
+    /// Disconnects and deletes the stored login. Without a bouncer there is
+    /// no login: it only disconnects, keeping the networks' passwords.
     pub fn logout(&self) -> Result<(), BackroomError> {
         self.disconnect();
+        if matches!(self.config.login, LoginMethod::Standalone { .. }) {
+            return Ok(());
+        }
         lock(&self.pending).take();
         let mut password = lock(&self.password);
         self.store.clear()?;
@@ -563,6 +632,65 @@ mod tests {
         let sso = client();
         let err = sso.login_with_password("x".into()).unwrap_err();
         assert!(matches!(err, BackroomError::Config { .. }), "{err:?}");
+    }
+
+    fn standalone_client(dir: &std::path::Path, memory: Arc<MemoryStore>) -> Arc<BackroomClient> {
+        let mut config = config("");
+        config.login = LoginMethod::Standalone {
+            database: dir.join("sub/standalone.sqlite").display().to_string(),
+            text_logs: None,
+        };
+        BackroomClient::new(config, memory).unwrap()
+    }
+
+    #[test]
+    fn standalone_connects_without_a_login() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = Arc::new(MemoryStore::default());
+        let client = standalone_client(dir.path(), memory.clone());
+        assert!(client.has_login().unwrap());
+        assert!(client.login_with_password("x".into()).is_err());
+        assert!(block_on_elsewhere(client.begin_login()).is_err());
+
+        block_on_elsewhere(client.connect()).unwrap();
+        assert!(dir.path().join("sub/standalone.sqlite").exists());
+        let first = block_on_elsewhere(client.next_event()).unwrap();
+        assert!(
+            matches!(
+                first,
+                SessionEvent::Connection {
+                    network: None,
+                    state: crate::ConnectionState::Connected,
+                }
+            ),
+            "{first:?}"
+        );
+        // A network with a password: the password goes to the secret store.
+        let attributes = [("host", "127.0.0.1"), ("port", "1"), ("tls", "0")]
+            .into_iter()
+            .chain([("sasl-password", "hunter2")])
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
+        client.add_network(attributes).unwrap();
+        let added = block_on_elsewhere(client.next_event()).unwrap();
+        let SessionEvent::NetworkUpdated { network } = added else {
+            panic!("{added:?}")
+        };
+        assert_eq!(
+            network
+                .attributes
+                .get("sasl-password-set")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert!(!network.attributes.contains_key("sasl-password"));
+        let saved = memory.0.lock().unwrap().clone().unwrap();
+        assert!(saved.contains("hunter2"), "saved in the secret store");
+
+        client.set_text_logs(Some(dir.path().join("logs").display().to_string()));
+        // Logging out keeps the networks' passwords.
+        client.logout().unwrap();
+        assert!(memory.0.lock().unwrap().is_some());
     }
 
     /// Polls a future on a separate runtime, the way Swift's executor polls

@@ -1,8 +1,10 @@
+import AppKit
 import SwiftUI
 
 /// The saved servers (one in use at a time) and the login.
 struct AccountSettings: View {
     @Environment(AppModel.self) private var model
+    @Environment(Preferences.self) private var prefs
     @State private var editing: ServerSettings?
 
     var body: some View {
@@ -30,9 +32,10 @@ struct AccountSettings: View {
             } header: {
                 Text("Servers")
             } footer: {
-                Text("Backroom uses one server at a time; pick it here or on the login screen. Each server keeps its own login.")
+                Text("Backroom uses one server at a time; pick it here or on the login screen. Each server keeps its own login. With No bouncer, Backroom connects to networks itself.")
                     .foregroundStyle(.secondary)
             }
+            TextLogSettings()
             Section("Login") {
                 LabeledContent("Status") {
                     Text(status).foregroundStyle(.secondary)
@@ -41,7 +44,7 @@ struct AccountSettings: View {
                     HStack {
                         Spacer()
                         if model.phase == .online {
-                            Button("Log Out", role: .destructive) { model.logOut() }
+                            Button(model.isStandalone ? "Disconnect" : "Log Out", role: .destructive) { model.logOut() }
                         } else {
                             Button("Cancel Login") { model.cancelLogin() }
                         }
@@ -66,9 +69,11 @@ struct AccountSettings: View {
 
     private var status: String {
         switch model.phase {
+        case .online where model.isStandalone: "Connected without a bouncer"
         case .online: model.control?.summary ?? "Connecting…"
         case .loggingIn: "Finish logging in in your browser"
-        case .loggedOut: model.servers.servers.isEmpty ? "No server yet" : "Logged out; log in from the main window"
+        case .loggedOut where model.isStandalone: "Not connected; connect from the main window"
+        case .loggedOut: "Logged out; log in from the main window"
         case .failed(let message): "Couldn't connect: \(message)"
         }
     }
@@ -86,7 +91,7 @@ private struct ServerRow: View {
                 .foregroundStyle(inUse ? AnyShapeStyle(.tint) : AnyShapeStyle(.tertiary))
             VStack(alignment: .leading, spacing: 2) {
                 Text(server.displayName)
-                Text("\(server.serverURL) · \(method)")
+                Text(server.isStandalone ? method : "\(server.serverURL) · \(method)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -102,6 +107,7 @@ private struct ServerRow: View {
         switch server.login {
         case .password: server.username.isEmpty ? "password" : "password as \(server.username)"
         case .singleSignOn: "single sign-on"
+        case .standalone: "Connects to networks directly; history on this Mac"
         }
     }
 }
@@ -126,30 +132,20 @@ private struct ServerEditor: View {
     var body: some View {
         VStack(spacing: 0) {
             Form {
-                Section {
-                    TextField("soju URL", text: $draft.serverURL, prompt: Text("wss://irc.example.net/socket"))
-                    TextField("Name", text: $draft.name, prompt: Text(draft.serverURL.isEmpty ? "Optional" : draft.displayName))
-                    Picker("Log in with", selection: $draft.login) {
-                        Text("Username & password").tag(ServerSettings.Login.password)
-                        Text("Single sign-on (OIDC)").tag(ServerSettings.Login.singleSignOn)
+                if draft.isStandalone {
+                    Section {
+                        TextField("Nick", text: $draft.nick, prompt: Text("backroom"))
+                    } footer: {
+                        Text("Used on networks that don't set their own nick. Networks, their logins and history are kept on this Mac; add networks in Settings → Networks once connected.")
+                            .foregroundStyle(.secondary)
                     }
-                    switch draft.login {
-                    case .password:
-                        TextField("Username", text: $draft.username, prompt: Text("Your soju username"))
-                    case .singleSignOn:
-                        TextField("Issuer", text: $draft.issuer, prompt: Text("https://login.example.net/realms/main"))
-                    }
-                    TextField("Nick", text: $draft.nick, prompt: Text(draft.login == .password ? "Same as username" : "Optional"))
-                } footer: {
-                    Text(draft.login == .password
-                         ? "For a soju with its own accounts (the default)."
-                         : "For a soju using `auth oauth2`. The issuer is your OIDC provider: a Keycloak realm, Authentik, …")
-                        .foregroundStyle(.secondary)
+                } else {
+                    serverSection
                 }
             }
             .formStyle(.grouped)
             HStack {
-                if !isNew {
+                if !isNew && !draft.isStandalone {
                     Button("Remove Server…", role: .destructive) { confirmRemove = true }
                 }
                 Spacer()
@@ -174,5 +170,81 @@ private struct ServerEditor: View {
         } message: {
             Text("Its saved login is deleted too. Your networks and history stay on the server.")
         }
+    }
+
+    @ViewBuilder private var serverSection: some View {
+        Section {
+            TextField("soju URL", text: $draft.serverURL, prompt: Text("wss://irc.example.net/socket"))
+            TextField("Name", text: $draft.name, prompt: Text(draft.serverURL.isEmpty ? "Optional" : draft.displayName))
+            Picker("Log in with", selection: $draft.login) {
+                Text("Username & password").tag(ServerSettings.Login.password)
+                Text("Single sign-on (OIDC)").tag(ServerSettings.Login.singleSignOn)
+            }
+            switch draft.login {
+            case .password:
+                TextField("Username", text: $draft.username, prompt: Text("Your soju username"))
+            case .singleSignOn:
+                TextField("Issuer", text: $draft.issuer, prompt: Text("https://login.example.net/realms/main"))
+            case .standalone:
+                EmptyView()
+            }
+            TextField("Nick", text: $draft.nick, prompt: Text(draft.login == .password ? "Same as username" : "Optional"))
+        } footer: {
+            Text(draft.login == .password
+                 ? "For a soju with its own accounts (the default)."
+                 : "For a soju using `auth oauth2`. The issuer is your OIDC provider: a Keycloak realm, Authentik, …")
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+/// Standalone mode's optional plain-text logs, besides the history database.
+private struct TextLogSettings: View {
+    @Environment(Preferences.self) private var prefs
+
+    var body: some View {
+        @Bindable var prefs = prefs
+        Section {
+            Toggle("Also write plain-text logs", isOn: $prefs.textLogs)
+            LabeledContent("Folder") {
+                HStack {
+                    Text(prefs.textLogURL.path(percentEncoded: false).replacingOccurrences(of: NSHomeDirectory(), with: "~"))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .foregroundStyle(.secondary)
+                        .help(prefs.textLogURL.path(percentEncoded: false))
+                    Button("Choose…", action: choose)
+                    if !prefs.textLogFolder.isEmpty {
+                        Button("Default") { prefs.textLogFolder = "" }
+                    }
+                }
+            }
+            HStack {
+                Spacer()
+                Button("Show in Finder", action: showInFinder)
+            }
+        } header: {
+            Text("Without a Bouncer")
+        } footer: {
+            Text("History is always kept in Backroom's database. Text logs are an extra copy you can read with any editor: one file per conversation per day.")
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func choose() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.directoryURL = prefs.textLogURL
+        panel.prompt = "Choose"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        prefs.textLogFolder = url.path(percentEncoded: false)
+    }
+
+    private func showInFinder() {
+        let url = prefs.textLogURL
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 }

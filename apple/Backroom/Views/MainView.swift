@@ -244,7 +244,7 @@ struct NetworkGroup: View {
         ) {
             Button("Remove Network", role: .destructive) { model.removeNetwork(network.id) }
         } message: {
-            Text("soju disconnects from it and deletes its channels and history.")
+            Text(model.removeNetworkMessage)
         }
     }
 }

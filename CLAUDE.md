@@ -43,10 +43,14 @@ services. Owner: chillincool. Public repo: github.com/chillincool/backroom.
     (numerics), `quit_or_nick`, `WhoisInfo`, `ChannelListing`, `BanEntry`
 - `crates/backroom-ffi`: UniFFI 0.32 bindings. One `BackroomClient` object
   (owns a tokio runtime; async methods spawn onto it). `ClientConfig.login`
-  is a `LoginMethod`: `Oidc` (browser login, OAUTHBEARER) or `Password`
-  (soju's own accounts, SASL PLAIN; `login_with_password`). Swift implements
-  `SecretStore` (`#[uniffi::export(foreign)]`): one opaque Keychain value per
-  login, the token JSON from `TokenSet::to_json` or the password. FFI copies of model/events use
+  is a `LoginMethod`: `Oidc` (browser login, OAUTHBEARER), `Password`
+  (soju's own accounts, SASL PLAIN; `login_with_password`) or `Standalone`
+  (no bouncer: SQLite path, optional text log folder; `set_text_logs`
+  switches logs live). Swift implements `SecretStore`
+  (`#[uniffi::export(foreign)]`): one opaque Keychain value per login, the
+  token JSON from `TokenSet::to_json` or the password; standalone keeps all
+  network passwords and channel keys as one JSON object in one item
+  (`ForeignVault`, account `standalone`), so at most one Keychain prompt. FFI copies of model/events use
   `SystemTime`/`Duration`. `--features bindgen` builds `uniffi-bindgen`.
 - `apple/BackroomCore`: Swift package (XCFramework + generated bindings, both
   git-ignored, from `scripts/build-apple.sh`) plus `KeychainSecretStore`.
@@ -58,7 +62,9 @@ services. Owner: chillincool. Public repo: github.com/chillincool/backroom.
   views through the environment (`\.theme`). `Model/`: `AppModel`,
   `ChatState` (`BufferModel` per buffer), `Composer` (slash commands, Tab
   `Completion`), `ServerSettings` (`ServerList`: saved servers, one in use;
-  each a password or single sign-on login with its own Keychain item),
+  each a password or single sign-on login with its own Keychain item, plus
+  the built-in "No bouncer" entry, always last; `NetworkLogin` for
+  standalone networks' SASL / server password / NickServ),
   `Timeline` (folding, day separators, New line), `Panes`
   (`PaneLayout` split tree, `WorkspaceTab`), `Mentions`, `Notifier`,
   `Preferences`, `Theme`. `Views/`: `MainView` (sidebar | panes | members,
@@ -208,13 +214,14 @@ server that doesn't offer our SASL mechanism. Each connection gets a
 
 ## Pick up here (2026-11-14)
 
-- PRs #12–#15 merged (#15: soju password login + saved servers). **PR B**
-  (branch `feat/standalone-core`): standalone mode in the core. **Next: PR
-  C** (FFI + app): `ClientConfig` standalone mode with a data folder; Swift
-  `SecretVault` over the Keychain (cache reads); "No bouncer" in the
-  server menu with Connect; network sheet gains the login (SASL / server
-  password / NickServ); "Also write plain-text logs" setting + Show in
-  Finder. Roadmap agreed with the owner:
+- PRs #12–#16 merged (#15: soju password login + saved servers; #16:
+  standalone mode in the core). **PR C** (branch `feat/standalone-app`):
+  `LoginMethod::Standalone`, "No bouncer" in the login menu with Connect
+  (reconnects at launch only if it was connected when the app quit;
+  UserDefaults `standaloneConnected`), network form login section,
+  Settings → Account "Without a Bouncer" text log toggle/folder/Show in
+  Finder. Database: `~/Library/Application Support/Backroom/standalone.sqlite`;
+  logs default to `…/Backroom/logs`. Roadmap agreed with the owner:
   **standalone mode** (no bouncer: networks stored locally, direct
   connections, SASL/NickServ, rejoin; local history in SQLite via
   `rusqlite` bundled, plus an optional "also write plain-text logs" setting,

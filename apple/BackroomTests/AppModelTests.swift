@@ -64,6 +64,7 @@ final class FakeClient: BackroomClientProtocol, @unchecked Sendable {
         calls.append("change \(network) " + attributes.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: ";"))
     }
     func sendRaw(network: String, line: String) throws { calls.append("raw \(network) \(line)") }
+    func setTextLogs(folder: String?) { calls.append("text logs \(folder ?? "off")") }
 }
 
 struct FakeAuthenticator: WebAuthenticator {
@@ -131,8 +132,10 @@ let net = Network(id: "1", name: "libera", upstreamState: "connected", attribute
         let model = AppModel(servers: ServerList(), authenticator: FakeAuthenticator(), defaults: defaults,
                              makeClient: { _ in made += 1; return FakeClient() })
         await model.start()
+        // "No bouncer" is selected, but waits for Connect.
+        #expect(model.settings.isStandalone)
         #expect(model.phase == .loggedOut)
-        #expect(made == 0)
+        #expect(made == 1)
     }
 
     @Test func firstSavedServerIsUsed() async {
@@ -144,9 +147,9 @@ let net = Network(id: "1", name: "libera", upstreamState: "connected", attribute
         await model.start()
         await model.save(server: .e2ePassword)
         #expect(model.settings == .e2ePassword)
-        #expect(made == ["Test stack (dave, password)"])
+        #expect(made == ["No bouncer", "Test stack (dave, password)"])
         await model.logIn(password: "dave-secret")
-        #expect(client.calls == ["password 11 chars", "connect"])
+        #expect(client.calls == ["disconnect", "password 11 chars", "connect"])
         #expect(model.phase == .online)
         #expect(ServerList.load(from: defaults).current == .e2ePassword)
 
@@ -156,7 +159,7 @@ let net = Network(id: "1", name: "libera", upstreamState: "connected", attribute
         var renamed = ServerSettings.e2ePassword
         renamed.name = "dave"
         await model.save(server: renamed)
-        #expect(made.count == 1)
+        #expect(made.count == 2)
         #expect(model.phase == .online)
     }
 
@@ -175,7 +178,7 @@ let net = Network(id: "1", name: "libera", upstreamState: "connected", attribute
 
         // Removing the server in use deletes its login and falls back.
         await model.remove(server: ServerSettings.e2ePassword.id)
-        #expect(model.servers.servers == [.e2e])
+        #expect(model.servers.bouncers == [.e2e])
         #expect(model.settings == .e2e)
         #expect(client.calls.contains("logout"))
     }
@@ -200,16 +203,16 @@ let net = Network(id: "1", name: "libera", upstreamState: "connected", attribute
         let settings = ServerSettings.e2ePassword
         #expect(settings.keychainAccount == "password dave ws://127.0.0.1:28081/")
         #expect(ServerSettings.e2e.keychainAccount == "http://localhost:18080/realms/e2e ws://127.0.0.1:18081/")
-        guard case .password(let username) = settings.clientConfig.login else {
+        guard case .password(let username) = settings.clientConfig().login else {
             Issue.record("not a password login"); return
         }
         #expect(username == "dave")
         var noNick = settings
         noNick.nick = ""
-        #expect(noNick.clientConfig.nick == "dave")
+        #expect(noNick.clientConfig().nick == "dave")
         noNick.username = ""
         #expect(!noNick.isComplete)
-        #expect(noNick.clientConfig.nick == "backroom")
+        #expect(noNick.clientConfig().nick == "backroom")
         #expect(!ServerSettings.blank.isComplete)
         #expect(ServerSettings(serverURL: "wss://irc.example.net/socket", login: .password, nick: "").displayName
                 == "irc.example.net")
@@ -220,11 +223,79 @@ let net = Network(id: "1", name: "libera", upstreamState: "connected", attribute
         let defaults = UserDefaults(suiteName: "backroom-tests-\(UUID().uuidString)")!
         defaults.set(Data(old.utf8), forKey: "serverSettings")
         let list = ServerList.load(from: defaults)
-        #expect(list.servers.count == 1)
+        #expect(list.bouncers.count == 1)
         let settings = try #require(list.current)
         #expect(settings.login == .singleSignOn)
         #expect(settings.issuer == "https://id.example.net/realms/main")
         #expect(settings.keychainAccount == "https://id.example.net/realms/main wss://irc.example.net/socket")
+    }
+
+    @Test func noBouncerIsAlwaysListedAndKept() throws {
+        var list = ServerList(servers: [.e2e])
+        #expect(list.servers.map(\.id) == [ServerSettings.e2e.id, ServerSettings.standalone.id])
+        list.remove(ServerSettings.standalone.id)
+        #expect(list.servers.count == 2)
+        // Lists saved before standalone mode get it too.
+        let old = #"{"servers":[],"selected":null}"#
+        let decoded = try JSONDecoder().decode(ServerList.self, from: Data(old.utf8))
+        #expect(decoded.current?.isStandalone == true)
+        #expect(ServerSettings.standalone.keychainAccount == "standalone")
+        guard case .standalone(let database, let textLogs) = ServerSettings.standalone.clientConfig(textLogs: "/tmp/logs").login
+        else { Issue.record("not standalone"); return }
+        #expect(database.hasSuffix("Backroom/standalone.sqlite"))
+        #expect(textLogs == "/tmp/logs")
+    }
+
+    @Test func noBouncerConnectsOnceAskedAndThenAtLaunch() async {
+        let defaults = UserDefaults(suiteName: "backroom-tests-\(UUID().uuidString)")!
+        let client = FakeClient()
+        client.loggedIn = true  // the core says a standalone client always has a login
+        let make = { AppModel(servers: ServerList(), authenticator: FakeAuthenticator(), defaults: defaults,
+                              makeClient: { _ in client }) }
+        let model = make()
+        await model.start()
+        #expect(model.phase == .loggedOut)
+        await model.connectStandalone()
+        #expect(model.phase == .online)
+        #expect(client.calls == ["connect"])
+
+        // Text logs follow the preference while connected.
+        model.preferences.textLogs = true
+        model.applyTextLogs()
+        #expect(client.calls.last == "text logs \(model.preferences.textLogURL.path(percentEncoded: false))")
+
+        // Next launch reconnects; after Disconnect it doesn't.
+        let again = make()
+        await again.start()
+        #expect(again.phase == .online)
+        again.logOut()
+        let third = make()
+        await third.start()
+        #expect(third.phase == .loggedOut)
+    }
+
+    @Test func networkLoginAttributes() {
+        // Adding with SASL: the password goes along, the others are cleared.
+        let sasl = NetworkLogin(method: .sasl, username: "dave", password: "pw")
+        #expect(sasl.attributes == ["sasl-username": "dave", "sasl-password": "pw", "pass": "", "nickserv-password": ""])
+        // Editing: the saved method is read from the -set flags, and an
+        // empty password keeps the saved one.
+        let saved = NetworkLogin(attributes: ["host": "h", "nickserv-password-set": "1"])
+        #expect(saved.method == .nickServ)
+        #expect(saved.isComplete(saved: saved))
+        #expect(saved.attributes == ["sasl-username": "", "sasl-password": "", "pass": ""])
+        // Switching method needs the new password.
+        var switched = saved
+        switched.method = .serverPassword
+        #expect(!switched.isComplete(saved: saved))
+        switched.password = "secret"
+        #expect(switched.isComplete(saved: saved))
+        #expect(NetworkLogin().attributes == ["sasl-username": "", "sasl-password": "", "pass": "", "nickserv-password": ""])
+
+        let fields = NetworkFields(name: "", host: "irc.libera.chat", port: 6697, tls: true, nick: "", login: sasl)
+        #expect(fields.attributes(keepEmpty: false)["sasl-password"] == "pw")
+        let soju = NetworkFields(name: "", host: "irc.libera.chat", port: 6697, tls: true, nick: "")
+        #expect(soju.attributes(keepEmpty: false).keys.sorted() == ["host", "port", "tls"])
     }
 
     @Test func cancelledLoginIsQuiet() async {

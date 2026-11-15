@@ -128,6 +128,8 @@ final class AppModel {
     private static let lastBufferKey = "lastBuffer"
     private static let layoutKey = "paneLayout"
     private static let tabsKey = "tabs"
+    /// Whether "No bouncer" was connected (reconnect at launch).
+    private static let standaloneKey = "standaloneConnected"
 
     @ObservationIgnored private var client: (any BackroomClientProtocol)?
     @ObservationIgnored private var eventTask: Task<Void, Never>?
@@ -186,7 +188,10 @@ final class AppModel {
         do {
             let client = try makeClient(settings)
             self.client = client
-            if autoConnect, try client.hasLogin() {
+            // "No bouncer" has no login: it reconnects at launch if it was
+            // connected when the app quit.
+            let remembered = settings.isStandalone ? defaults.bool(forKey: Self.standaloneKey) : try client.hasLogin()
+            if autoConnect, remembered {
                 await connect()
             } else {
                 phase = .loggedOut
@@ -202,6 +207,24 @@ final class AppModel {
         servers.selected = id
         servers.save(to: defaults)
         await start()
+    }
+
+    /// Without a bouncer, whether the selected entry is "No bouncer".
+    var isStandalone: Bool { settings.isStandalone }
+
+    /// Without a bouncer: connects to the saved networks.
+    func connectStandalone() async {
+        guard isStandalone, phase != .online else { return }
+        if client == nil { await start(connect: false) }
+        notice = nil
+        defaults.set(true, forKey: Self.standaloneKey)
+        await connect()
+    }
+
+    /// Starts or stops the plain-text logs of a running standalone session.
+    func applyTextLogs() {
+        guard isStandalone else { return }
+        client?.setTextLogs(folder: preferences.activeTextLogPath)
     }
 
     /// Adds a server or saves changes to one. Changing the server in use
@@ -266,6 +289,7 @@ final class AppModel {
     }
 
     func logOut() {
+        if isStandalone { defaults.set(false, forKey: Self.standaloneKey) }
         do { try client?.logout() } catch { notice = Self.describe(error) }
         eventTask = nil
         resetChat()
@@ -767,6 +791,13 @@ final class AppModel {
         }
     }
 
+    /// What removing a network deletes, for the confirmation.
+    var removeNetworkMessage: String {
+        isStandalone
+            ? "Backroom disconnects from it and deletes its channels and history on this Mac."
+            : "soju disconnects from it and deletes its channels and history."
+    }
+
     /// Asks soju to add a network; it appears once soju has it.
     func addNetwork(_ fields: NetworkFields) {
         guard let client else { return }
@@ -901,6 +932,7 @@ final class AppModel {
         // soju's 904 text is generic ("Authentication failed").
         case .password: return "Wrong username or password."
         case .singleSignOn: return "Your login was rejected (\(reason)). Log in again."
+        case .standalone: return reason
         }
     }
 

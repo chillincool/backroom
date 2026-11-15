@@ -49,7 +49,7 @@ struct SearchView: View {
                 } else if state == nil {
                     ContentUnavailableView(
                         "Search History", systemImage: "magnifyingglass",
-                        description: Text("Finds messages soju has stored. Double-click a result to go to it."))
+                        description: Text("Finds messages in the stored history. Double-click a result to go to it."))
                 }
             }
             HStack {
