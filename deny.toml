@@ -26,6 +26,7 @@ allow = [
   "ISC",
   "MIT",
   "Unicode-3.0",
+  "Zlib", # foldhash, via rusqlite's hashlink
 ]
 exceptions = [
   # Weak, file-level copyleft; used unmodified via `dirs` in the CLI only.

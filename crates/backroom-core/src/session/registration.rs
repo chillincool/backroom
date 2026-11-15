@@ -22,6 +22,8 @@ pub struct RegistrationConfig {
     pub sasl: Option<SaslCredentials>,
     /// `soju.im/bouncer-networks` network ID to bind this connection to.
     pub bind_network: Option<String>,
+    /// Server password, sent as `PASS` first.
+    pub password: Option<SecretString>,
 }
 
 /// A message for the driver to send.
@@ -29,6 +31,8 @@ pub enum Outgoing {
     Message(Message),
     /// An `AUTHENTICATE` line carrying credentials. Never log the argument.
     Authenticate(SecretString),
+    /// `PASS <password>`. Never log the argument.
+    Pass(SecretString),
 }
 
 /// The result of successful registration.
@@ -113,6 +117,9 @@ impl Registration {
             nick_attempts: 0,
             cfg,
         };
+        if let Some(password) = reg.cfg.password.clone() {
+            reg.out.push(Outgoing::Pass(password));
+        }
         reg.send(Message::new("CAP", ["LS", "302"]));
         reg.send(Message::new("NICK", [reg.cfg.nick.clone()]));
         reg.send(Message::new(
@@ -195,6 +202,14 @@ impl Registration {
                 }
                 self.result.nick.push('_');
                 self.send(Message::new("NICK", [self.result.nick.clone()]));
+            }
+            // A server without IRCv3 ignores CAP (or answers 421) and
+            // welcomes us straight away: fine, unless SASL was required.
+            RPL_WELCOME if self.cfg.sasl.is_some() && self.state == State::CapLs => {
+                return Err(RegistrationError::SaslUnavailable {
+                    wanted: self.sasl_mechanism(),
+                    offered: None,
+                });
             }
             RPL_WELCOME => {
                 if let Some(nick) = msg.param(0) {
@@ -374,6 +389,7 @@ mod tests {
             wanted_caps: WANTED_CAPS.iter().map(|s| s.to_string()).collect(),
             sasl,
             bind_network: bind.map(str::to_owned),
+            password: None,
         }
     }
 
@@ -394,6 +410,7 @@ mod tests {
                 sent.push(match o {
                     Outgoing::Message(m) => m.to_string(),
                     Outgoing::Authenticate(a) => format!("AUTHENTICATE {}", a.expose_secret()),
+                    Outgoing::Pass(p) => format!("PASS {}", p.expose_secret()),
                 });
             }
         };
@@ -414,6 +431,51 @@ mod tests {
 
     const LS: &str = ":soju CAP * LS * :batch cap-notify echo-message server-time draft/chathistory draft/read-marker";
     const LS_END: &str = ":soju CAP * LS :sasl=PLAIN,OAUTHBEARER soju.im/bouncer-networks soju.im/bouncer-networks-notify soju.im/webpush";
+
+    #[test]
+    fn server_password_goes_first() {
+        let mut c = cfg(None, None);
+        c.password = Some(SecretString::from("letmein"));
+        let mut reg = Registration::new(c);
+        let (sent, _) = run(&mut reg, &[]);
+        assert_eq!(sent[0], "PASS letmein");
+        assert_eq!(sent[1], "CAP LS 302");
+    }
+
+    /// Servers without IRCv3 answer CAP with 421 (or nothing) and welcome
+    /// us anyway.
+    #[test]
+    fn server_without_cap_registers_without_sasl() {
+        let mut reg = Registration::new(cfg(None, None));
+        let (_, res) = run(
+            &mut reg,
+            &[
+                ":old 421 chris CAP :Unknown command",
+                ":old 001 chris :Welcome",
+                ":old 422 chris :No MOTD",
+            ],
+        );
+        let done = res.unwrap().unwrap();
+        assert_eq!(done.nick, "chris");
+        assert!(done.enabled_caps.is_empty());
+    }
+
+    #[test]
+    fn server_without_cap_fails_required_sasl() {
+        let plain = SaslCredentials::Plain {
+            username: "chris".into(),
+            password: SecretString::from("pw"),
+        };
+        let mut reg = Registration::new(cfg(Some(plain), None));
+        let (_, res) = run(&mut reg, &[":old 001 chris :Welcome"]);
+        assert!(
+            matches!(
+                res,
+                Err(RegistrationError::SaslUnavailable { offered: None, .. })
+            ),
+            "{res:?}"
+        );
+    }
 
     #[test]
     fn oauthbearer_happy_path_with_bind() {

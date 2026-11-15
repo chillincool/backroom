@@ -35,6 +35,10 @@ services. Owner: chillincool. Public repo: github.com/chillincool/backroom.
   - `client.rs` async driver; `next_incoming()` is cancel-safe for `select!`
   - `live/` long-lived session for apps (see below); `members.rs` member
     lists and away state
+  - `local/` standalone mode (no bouncer): `LocalStore` (SQLite via
+    `rusqlite` bundled: networks, channels, messages, read markers),
+    `NetworkConfig` (network attributes → connection), `SecretVault` trait
+    (passwords; front end implements), `TextLog` (optional plain-text logs)
   - `model.rs` chat model: `route` (message → buffer), `route_reply`
     (numerics), `quit_or_nick`, `WhoisInfo`, `ChannelListing`, `BanEntry`
 - `crates/backroom-ffi`: UniFFI 0.32 bindings. One `BackroomClient` object
@@ -70,7 +74,8 @@ services. Owner: chillincool. Public repo: github.com/chillincool/backroom.
 - `crates/backroom-cli`: `backroom` test CLI (`login`, `networks`, `history`,
   `token`, `logout`; `--sasl plain`, `--raw`, `--ca-file`). Dev-only token file
   at `~/Library/Application Support/backroom/dev-tokens.json`.
-- `test/e2e/`: Docker Compose stack; `scripts/e2e.sh up|test|down|all|realm`
+- `test/e2e/`: Docker Compose stack; `scripts/e2e.sh up|test|down|all|realm`.
+  ergo is on `127.0.0.1:46667` for standalone tests.
 - `MAINTAINING.md`: repo settings, Renovate app setup, key rotation
 
 ## Commands
@@ -120,7 +125,21 @@ Homebrew. Install tools with mise, not brew (`mise use -g` for personal tools).
 `live::start(SessionConfig)` → `(SessionHandle, Receiver<Event>)`. A
 coordinator task owns all state; one task per connection (control +
 one per network) does I/O with backoff (1 s doubling to 60 s), keepalive PINGs,
-and stops after a rejected login (`ConnectionState::AuthFailed`).
+and stops after a rejected login (`ConnectionState::AuthFailed`), including a
+server that doesn't offer our SASL mechanism. Each connection gets a
+`ConnSpec` (connector, login, `ConnectOptions`).
+
+- `SessionConfig.backend`: `Bouncer` (soju) or `Standalone` (`local/`).
+  Standalone: no control connection (control state is `Connected` at once);
+  networks come from the store and connect directly (SASL PLAIN, `PASS`, or
+  NickServ IDENTIFY when SASL didn't log in); network state goes into the
+  `state`/`error` attributes like soju's. History, read markers, search
+  and recent conversations are answered from SQLite; every `Event::Message`
+  except replies/errors is recorded (one hook in `emit`). Own JOINs save
+  the channel (keys go to the vault on success), PART/KICK forget it;
+  rejoins on connect are hidden like soju's replayed JOINs. Network
+  passwords (`pass`, `sasl-password`, `nickserv-password`) never reach the
+  database; events carry `<name>-set=1`.
 
 - Events: connection state, networks, buffers, members, topics, live
   messages, history pages, read markers, channel list chunks, own nick,
@@ -189,9 +208,13 @@ and stops after a rejected login (`ConnectionState::AuthFailed`).
 
 ## Pick up here (2026-11-14)
 
-- PRs #12–#14 merged (the owner's first four asks). Roadmap agreed with the
-  owner: **PR A** soju password login + saved servers (branch
-  `feat/password-login`, PR open), then
+- PRs #12–#15 merged (#15: soju password login + saved servers). **PR B**
+  (branch `feat/standalone-core`): standalone mode in the core. **Next: PR
+  C** (FFI + app): `ClientConfig` standalone mode with a data folder; Swift
+  `SecretVault` over the Keychain (cache reads); "No bouncer" in the
+  server menu with Connect; network sheet gains the login (SASL / server
+  password / NickServ); "Also write plain-text logs" setting + Show in
+  Finder. Roadmap agreed with the owner:
   **standalone mode** (no bouncer: networks stored locally, direct
   connections, SASL/NickServ, rejoin; local history in SQLite via
   `rusqlite` bundled, plus an optional "also write plain-text logs" setting,
@@ -203,6 +226,11 @@ and stops after a rejected login (`ConnectionState::AuthFailed`).
   issuer are set per saved server; no detection. Login screen: server menu,
   then that server's form; "Add Server…" opens Settings → Account. Standalone
   mode will be another entry in that menu with a Connect button.
+- Local stack quirk: soju-internal's dave/erin have piled up ergo networks
+  from test runs, so ergo answers "Too many clients from your network" and
+  `history_round_trip_through_ergo` / `live_session_…` fail locally (fine on
+  CI's fresh stack). Fix by recreating the stack (`e2e.sh down`, which
+  wipes alice's dev data too: ask first).
 - Dev setup: e2e stack up (`mise run e2e:up`); soju-oauth2 data lives on
   volume `soju-oauth2-data` (survives recreation; `e2e.sh down` deletes it,
   so warn first). alice has networks libera (nick backroom-dev),

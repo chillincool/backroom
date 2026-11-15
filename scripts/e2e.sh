@@ -59,7 +59,7 @@ up() {
 
 	log "Starting soju (oauth2, internal, http)"
 	"${COMPOSE[@]}" up -d --quiet-pull soju-oauth2 soju-internal soju-http
-	for port in 18081 16667 16697 28081 26667 26697 38081 36667 36697; do
+	for port in 18081 16667 16697 28081 26667 26697 38081 36667 36697 46667; do
 		wait_until 60 "port $port" tcp_open "$port"
 	done
 
