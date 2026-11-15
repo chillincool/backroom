@@ -529,6 +529,11 @@ impl Coordinator {
                     self.remove_buffer(&network, &name);
                 }
             }
+            Command::SetTextLogs { folder } => {
+                if self.local.is_some() {
+                    self.text_log = folder.map(TextLog::new);
+                }
+            }
             Command::Shutdown => {}
         }
     }
@@ -2154,6 +2159,32 @@ mod tests {
         l.h.line(Some("1"), ":me!u@h PART #secret :bye");
         assert!(l.store.channels("1").unwrap().is_empty());
         assert!(l.vault.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn standalone_text_logs_switch_on_and_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut l = local_network(
+            LocalStore::in_memory().unwrap(),
+            MemoryVault::default(),
+            None,
+        );
+        l.h.line(Some("1"), ":erin!u@h PRIVMSG me :before");
+        l.h.c.command(Command::SetTextLogs {
+            folder: Some(dir.path().to_owned()),
+        });
+        l.h.line(Some("1"), ":erin!u@h PRIVMSG me :during");
+        l.h.c.command(Command::SetTextLogs { folder: None });
+        l.h.line(Some("1"), ":erin!u@h PRIVMSG me :after");
+        let day = std::fs::read_dir(dir.path().join("Example/erin"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let text = std::fs::read_to_string(day).unwrap();
+        assert!(text.ends_with("<erin> during\n"), "{text}");
+        assert_eq!(text.lines().count(), 1);
     }
 
     #[test]

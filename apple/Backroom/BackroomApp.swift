@@ -17,9 +17,9 @@ struct BackroomApp: App {
             servers: ServerList.load(),
             authenticator: Self.login,
             preferences: prefs,
-            makeClient: { settings in
+            makeClient: { [prefs] settings in
                 try BackroomClient(
-                    config: settings.clientConfig,
+                    config: settings.clientConfig(textLogs: prefs.activeTextLogPath),
                     secretStore: KeychainSecretStore(
                         service: "net.chillincool.backroom", account: settings.keychainAccount))
             })

@@ -10,7 +10,7 @@ mod error;
 mod store;
 mod types;
 
-pub use client::{BackroomClient, ClientConfig};
+pub use client::{BackroomClient, ClientConfig, LoginMethod};
 pub use error::BackroomError;
 pub use store::SecretStore;
 pub use types::{

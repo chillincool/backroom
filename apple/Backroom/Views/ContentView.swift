@@ -28,6 +28,7 @@ struct ContentView: View {
             NSApp?.dockTile.badgeLabel = count > 0 ? "\(count)" : nil
         }
         .onChange(of: prefs.ignored) { model.refreshMentions() }
+        .onChange(of: prefs.activeTextLogPath) { model.applyTextLogs() }
     }
 }
 
@@ -67,40 +68,34 @@ struct LoginView: View {
                 Text("Backroom").font(.largeTitle.bold())
             }
 
-            if model.servers.servers.isEmpty {
-                Text("Add your soju server to get started.")
-                    .foregroundStyle(.secondary)
-                Button("Add Server…", action: addServer)
-                    .keyboardShortcut(.defaultAction)
-                    .controlSize(.large)
-            } else {
-                if case .failed(let message) = model.phase {
-                    Text("Couldn't connect: \(message)")
-                        .foregroundStyle(.red)
-                        .multilineTextAlignment(.center)
-                        .frame(maxWidth: 420)
-                }
-                Form {
-                    Picker("Server", selection: serverSelection) {
-                        ForEach(model.servers.servers) { Text($0.displayName).tag($0.id) }
-                    }
-                    if server.login == .password && server.isComplete {
-                        LabeledContent("Username", value: server.username)
-                        SecureField("Password", text: $password)
-                            .textContentType(.password)
-                            .focused($passwordFocused)
-                            .onSubmit(logIn)
-                    }
-                }
-                .frame(width: 360)
-                .fixedSize(horizontal: false, vertical: true)
-                .disabled(model.phase == .loggingIn)
-
-                loginButtons
-
-                Button("Add Server…", action: addServer)
-                    .buttonStyle(.link)
+            if case .failed(let message) = model.phase {
+                Text("Couldn't connect: \(message)")
+                    .foregroundStyle(.red)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 420)
             }
+            Form {
+                Picker("Server", selection: serverSelection) {
+                    ForEach(model.servers.bouncers) { Text($0.displayName).tag($0.id) }
+                    if !model.servers.bouncers.isEmpty { Divider() }
+                    Text(model.servers.standalone.displayName).tag(model.servers.standalone.id)
+                }
+                if server.login == .password && server.isComplete {
+                    LabeledContent("Username", value: server.username)
+                    SecureField("Password", text: $password)
+                        .textContentType(.password)
+                        .focused($passwordFocused)
+                        .onSubmit(logIn)
+                }
+            }
+            .frame(width: 360)
+            .fixedSize(horizontal: false, vertical: true)
+            .disabled(model.phase == .loggingIn)
+
+            loginButtons
+
+            Button("Add soju Server…", action: addServer)
+                .buttonStyle(.link)
         }
         .padding(40)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -116,10 +111,18 @@ struct LoginView: View {
     }
 
     @ViewBuilder private var loginButtons: some View {
-        if !server.isComplete {
-            Text(server.login == .password
-                 ? "This server needs a username."
-                 : "This server needs a single sign-on issuer.")
+        if server.isStandalone {
+            Button("Connect") { Task { await model.connectStandalone() } }
+                .keyboardShortcut(.defaultAction)
+                .controlSize(.large)
+            Text("Connects to your networks directly, without a bouncer.\nHistory is kept on this Mac.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        } else if !server.isComplete {
+            Text(server.login == .singleSignOn
+                 ? "This server needs a single sign-on issuer."
+                 : "This server needs a username.")
                 .foregroundStyle(.secondary)
             Button("Edit Server…", action: editServer)
         } else if model.phase == .loggingIn {
@@ -142,6 +145,8 @@ struct LoginView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
+            case .standalone:
+                EmptyView()
             }
         }
     }
@@ -155,6 +160,8 @@ struct LoginView: View {
             Task { await model.logIn(password: entered) }
         case .singleSignOn:
             Task { await model.logIn() }
+        case .standalone:
+            Task { await model.connectStandalone() }
         }
     }
 

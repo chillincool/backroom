@@ -341,6 +341,10 @@ pub enum Command {
         target: String,
         time: DateTime<Utc>,
     },
+    /// Standalone: start or stop writing plain-text logs (to this folder).
+    SetTextLogs {
+        folder: Option<std::path::PathBuf>,
+    },
     Shutdown,
 }
 

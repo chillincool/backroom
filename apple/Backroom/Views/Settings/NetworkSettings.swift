@@ -1,7 +1,7 @@
 import BackroomCore
 import SwiftUI
 
-/// soju's networks: add, edit, remove.
+/// The networks (soju's, or this Mac's without a bouncer): add, edit, remove.
 struct NetworkSettings: View {
     @Environment(AppModel.self) private var model
     @State private var selection: String?
@@ -13,8 +13,10 @@ struct NetworkSettings: View {
         Form {
             if model.phase != .online {
                 ContentUnavailableView(
-                    "Not Logged In", systemImage: "network.slash",
-                    description: Text("Log in to manage your networks."))
+                    model.isStandalone ? "Not Connected" : "Not Logged In", systemImage: "network.slash",
+                    description: Text(model.isStandalone
+                                      ? "Connect from the main window to manage your networks."
+                                      : "Log in to manage your networks."))
             } else {
                 Section {
                     List(selection: $selection) {
@@ -65,7 +67,7 @@ struct NetworkSettings: View {
                 if let removing { model.removeNetwork(removing.id) }
             }
         } message: {
-            Text("soju disconnects from it and deletes its channels and history.")
+            Text(model.removeNetworkMessage)
         }
     }
 

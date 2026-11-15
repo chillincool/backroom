@@ -124,6 +124,28 @@ final class Preferences {
     var notifyAllMessages: Bool { didSet { set(notifyAllMessages, "notifyAllMessages") } }
     /// Let others see when we're typing.
     var sendTyping: Bool { didSet { set(sendTyping, "sendTyping") } }
+    /// Without a bouncer: also write plain-text logs, one file per
+    /// conversation per day.
+    var textLogs: Bool { didSet { set(textLogs, "textLogs") } }
+    /// Where the text logs go; "" for `defaultTextLogFolder`.
+    var textLogFolder: String { didSet { set(textLogFolder, "textLogFolder") } }
+
+    /// `~/Library/Application Support/Backroom`: the standalone database and
+    /// the default text log folder.
+    nonisolated static var dataFolder: URL {
+        URL.applicationSupportDirectory.appending(path: "Backroom", directoryHint: .isDirectory)
+    }
+    nonisolated static var defaultTextLogFolder: URL {
+        dataFolder.appending(path: "logs", directoryHint: .isDirectory)
+    }
+
+    /// The text log folder in use.
+    var textLogURL: URL {
+        textLogFolder.isEmpty ? Self.defaultTextLogFolder : URL(filePath: textLogFolder, directoryHint: .isDirectory)
+    }
+
+    /// Where the core writes text logs; nil when they're off.
+    var activeTextLogPath: String? { textLogs ? textLogURL.path(percentEncoded: false) : nil }
 
     static let monospaced = "monospaced"
     static let fontSizes: ClosedRange<Double> = 10...24
@@ -161,6 +183,8 @@ final class Preferences {
         notificationSound = defaults.object(forKey: Self.prefix + "notificationSound") as? Bool ?? true
         notifyAllMessages = defaults.bool(forKey: Self.prefix + "notifyAllMessages")
         sendTyping = defaults.object(forKey: Self.prefix + "sendTyping") as? Bool ?? true
+        textLogs = defaults.bool(forKey: Self.prefix + "textLogs")
+        textLogFolder = string("textLogFolder") ?? ""
     }
 
     private nonisolated static func read(_ defaults: UserDefaults, _ key: String) -> String? {

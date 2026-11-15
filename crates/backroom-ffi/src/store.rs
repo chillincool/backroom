@@ -1,6 +1,8 @@
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use backroom_core::auth::{StoreError, TokenSet, TokenStore};
+use backroom_core::local::SecretVault;
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::BackroomError;
@@ -77,6 +79,85 @@ impl TokenStore for ForeignTokenStore {
         self.store.clear().map_err(store_error)?;
         *cache = Some(None);
         Ok(())
+    }
+}
+
+/// Standalone mode's passwords (network logins, channel keys) as one JSON
+/// object in a single foreign [`SecretStore`] item: one Keychain read at
+/// most, so at most one prompt, and nothing to clean up item by item.
+pub(crate) struct ForeignVault {
+    store: Arc<dyn SecretStore>,
+    /// `None` until the first read.
+    cache: Mutex<Option<BTreeMap<String, SecretString>>>,
+}
+
+impl ForeignVault {
+    pub(crate) fn new(store: Arc<dyn SecretStore>) -> Self {
+        ForeignVault {
+            store,
+            cache: Mutex::new(None),
+        }
+    }
+
+    /// Runs `f` on the loaded map; saves it if `f` says it changed.
+    fn with<T>(
+        &self,
+        f: impl FnOnce(&mut BTreeMap<String, SecretString>) -> (T, bool),
+    ) -> Result<T, StoreError> {
+        let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
+        if cache.is_none() {
+            let map = match self.store.load().map_err(store_error)? {
+                Some(json) => {
+                    let json = SecretString::from(json);
+                    serde_json::from_str::<BTreeMap<String, String>>(json.expose_secret())
+                        .map_err(|_| StoreError("the saved passwords are unreadable".into()))?
+                        .into_iter()
+                        .map(|(k, v)| (k, SecretString::from(v)))
+                        .collect()
+                }
+                None => BTreeMap::new(),
+            };
+            *cache = Some(map);
+        }
+        let mut map = cache.clone().unwrap_or_default();
+        let (out, changed) = f(&mut map);
+        if changed {
+            let plain: BTreeMap<&str, &str> = map
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.expose_secret()))
+                .collect();
+            let json = SecretString::from(
+                serde_json::to_string(&plain).map_err(|e| StoreError(e.to_string()))?,
+            );
+            if map.is_empty() {
+                self.store.clear()
+            } else {
+                self.store.save(json.expose_secret().to_owned())
+            }
+            .map_err(store_error)?;
+            *cache = Some(map);
+        }
+        Ok(out)
+    }
+}
+
+impl SecretVault for ForeignVault {
+    fn get(&self, key: &str) -> Result<Option<SecretString>, StoreError> {
+        self.with(|map| (map.get(key).cloned(), false))
+    }
+
+    fn set(&self, key: &str, value: &SecretString) -> Result<(), StoreError> {
+        self.with(|map| {
+            let changed = map
+                .get(key)
+                .is_none_or(|old| old.expose_secret() != value.expose_secret());
+            map.insert(key.to_owned(), value.clone());
+            ((), changed)
+        })
+    }
+
+    fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.with(|map| ((), map.remove(key).is_some()))
     }
 }
 
@@ -183,6 +264,38 @@ pub(crate) mod tests {
         let store = ForeignTokenStore::new(Arc::new(FailingStore));
         assert_eq!(store.load().unwrap_err().0, "keychain locked");
         assert_eq!(store.save(&tokens()).unwrap_err().0, "keychain locked");
+    }
+
+    #[test]
+    fn vault_keeps_every_secret_in_one_item() {
+        let counting = Arc::new(CountingStore::default());
+        let vault = ForeignVault::new(counting.clone());
+        assert!(vault.get("network/1/pass").unwrap().is_none());
+        vault.set("network/1/pass", &"one".into()).unwrap();
+        vault.set("network/2/pass", &"two".into()).unwrap();
+        let saved = counting.inner.0.lock().unwrap().clone().unwrap();
+        assert_eq!(saved, r#"{"network/1/pass":"one","network/2/pass":"two"}"#);
+
+        // A new launch reads the item once.
+        let vault = ForeignVault::new(counting.clone());
+        for _ in 0..3 {
+            let two = vault.get("network/2/pass").unwrap().unwrap();
+            assert_eq!(two.expose_secret(), "two");
+        }
+        assert_eq!(counting.loads.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        vault.delete("network/1/pass").unwrap();
+        vault.delete("network/2/pass").unwrap();
+        vault.delete("network/3/pass").unwrap();
+        assert!(counting.inner.0.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn vault_errors_pass_through() {
+        let vault = ForeignVault::new(Arc::new(FailingStore));
+        assert_eq!(vault.get("k").unwrap_err().0, "keychain locked");
+        let corrupt = ForeignVault::new(Arc::new(MemoryStore(Mutex::new(Some("[".into())))));
+        assert!(corrupt.get("k").is_err());
     }
 
     #[test]
