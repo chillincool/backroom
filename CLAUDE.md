@@ -289,10 +289,9 @@ server that doesn't offer our SASL mechanism. Each connection gets a
   server, and the e2e stack (dave password login incl. wrong password,
   alice SSO via the installed desktop entry's `backroom://` handler, both
   restored from the keyring after restart; join, send, Tab completion,
-  incoming mention/formatting/PM, history reload). Sidebar (owner's ask):
+  incoming mention/formatting/PM, history reload). Sidebar as on macOS:
   no separate "Server" row; a network's header row *is* its server buffer
-  (click opens it, arrow button folds the network). The macOS sidebar
-  still has the "Server" row. UI can be driven through AT-SPI
+  (click opens it, arrow button folds the network). UI can be driven through AT-SPI
   (`gi.repository.Atspi`: set text, select list rows); synthesized key
   presses go to whatever window really has focus, so don't use them.
   A locked screen stops rendering (screenshot action: "nothing to render"). CI's `checks` job installs `libgtk-4-dev
