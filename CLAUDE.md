@@ -1,8 +1,8 @@
 # Backroom: notes for Claude
 
 Native IRC client for the [soju](https://soju.im) bouncer. Rust core with all
-logic; front ends (SwiftUI on macOS first, iOS later) only supply platform
-services. Owner: chillincool. Public repo: github.com/chillincool/backroom.
+logic; front ends (SwiftUI on macOS, GTK 4 + libadwaita on Linux, iOS later)
+only supply platform services. Owner: chillincool. Public repo: github.com/chillincool/backroom.
 
 ## Rules
 
@@ -89,6 +89,40 @@ services. Owner: chillincool. Public repo: github.com/chillincool/backroom.
   Firefox fails it instantly as "cancelled". Signing: `Signing.xcconfig`
   (ad hoc) plus optional git-ignored `Signing.local.xcconfig`. Under XCTest
   the app doesn't start a session.
+- `crates/backroom-app`: toolkit-free app logic for Rust front ends, ported
+  from the Swift `Model/` (which stays as is): `AppState` (applies
+  `SessionEvent`s and user actions, reports `Changes` + one-shot `Effect`s:
+  notify, open dialog, scroll to), `BufferModel`, `composer` (slash commands,
+  `Completion`), `timeline`, `mentions`, `links` (linkify + `#channel`),
+  `panes` (tabs, split tree), `servers` (`ServerList`, `NetworkFields`),
+  `prefs`, `theme` (JSON compatible with macOS theme files), `storage::Paths`
+  (JSON files). Talks to the session through the `Client` trait
+  (`BackroomClient` uses `backroom-ffi` as a plain Rust crate; faked in tests).
+- `crates/backroom-gtk`: the Linux app, binary `backroom-gtk`, app ID
+  `net.chillincool.backroom`. All code is in `src/desktop/` behind
+  `cfg(all(unix, not(target_vendor = "apple")))`, deps likewise, so
+  `cargo clippy --workspace` works on the Mac (stub `main`). `Controller` owns
+  `RefCell<AppState>` + `Arc<BackroomClient>`; every state change goes
+  through `Controller::act` (deferred if the state is borrowed, then one
+  coalesced redraw: `Window::refresh(changes)`). Async login/connect run on
+  GLib's main loop (`glib::spawn_future_local`; the client's futures are
+  runtime-agnostic); keyring calls go through `gio::spawn_blocking`.
+  `secrets.rs`: `oo7` (Secret Service, or the Secret portal in a Flatpak) on
+  its own thread with a current-thread runtime; no keyring → memory only, UI
+  says so. Views: `window.rs` (header, sidebar | `adw::TabView` | members,
+  app actions + accels), `panes.rs` (split tree as nested `gtk::Paned`,
+  class `pane-split`), `messages.rs` (`BufferPane`: topic bar, `ListView` of
+  timeline rows diffed by common prefix/suffix, composer `TextView`),
+  `render.rs` (Pango markup; links are `<a>` styled as text, Ctrl-click
+  opens), `previews.rs` (hover popover), `style.rs` (CSS from theme;
+  `Palette` for markup colours; unset theme colours inherit), `sidebar`,
+  `members`, `dialogs`, `settings` (`adw::PreferencesDialog`), `login`,
+  `notify` (GNotification, Unity launcher badge). Baseline GTK 4.14 /
+  libadwaita 1.5 (crate features `gnome_46`, `v1_5`): don't use newer API.
+  `data/`: desktop entry (handles `x-scheme-handler/backroom` for the SSO
+  callback via GApplication `open`), metainfo, icons. Settings in
+  `~/.config/backroom/`, standalone DB + logs in `~/.local/share/backroom/`,
+  tabs/window in `~/.local/state/backroom/`.
 - `crates/backroom-cli`: `backroom` test CLI (`login`, `networks`, `history`,
   `token`, `logout`; `--sasl plain`, `--raw`, `--ca-file`). Dev-only token file
   at `~/Library/Application Support/backroom/dev-tokens.json`.
@@ -105,7 +139,17 @@ mise run e2e:up    # then e2e:test repeatedly, then e2e:down
 
 mise run apple:core # build backroom-ffi + regenerate apple/BackroomCore (needs Xcode)
 mise run apple:app  # generate apple/Backroom.xcodeproj (XcodeGen), build, unit tests
+
+mise run linux:run      # the GTK app from source (BACKROOM_LOG=debug for logs)
+mise run linux:install  # install for this user (menu entry, backroom:// handler); --remove
+mise run linux:deb      # / linux:rpm / linux:flatpak (build-aux/flatpak)
 ```
+
+Linux debug builds have a `screenshot` action that renders the window to a
+PNG even when it isn't on screen:
+`gapplication action net.chillincool.backroom screenshot "'/tmp/x.png'"`
+(other app actions work the same way, e.g. `split-right`, `preferences`).
+X captures (`import -window`) of a background window are stale.
 
 Run the app: `open apple/build/Build/Products/Debug/Backroom.app`. Against the
 e2e stack, log in as alice/alice (single sign-on), or with a password as
@@ -236,6 +280,26 @@ server that doesn't offer our SASL mechanism. Each connection gets a
 - Imported Keycloak users get no realm roles; the e2e realm gives test users
   `default-roles-e2e` (carries `offline_access`). Production: confirm the
   `backroom` client has `offline_access` as an optional client scope.
+- Linux app (this PR, 2026-11-16): `backroom-app` + `backroom-gtk`, the
+  macOS features except: no theme editor (themes import as JSON instead),
+  no tab renaming, drag-resized pane sizes aren't saved (splits come back at
+  their saved fractions), no notification sound switch (the desktop
+  decides).
+  Tested on Ubuntu 26.04 GNOME (Wayland): standalone against a fake IRC
+  server, and the e2e stack (dave password login incl. wrong password,
+  alice SSO via the installed desktop entry's `backroom://` handler, both
+  restored from the keyring after restart; join, send, Tab completion,
+  incoming mention/formatting/PM, history reload). Sidebar (owner's ask):
+  no separate "Server" row; a network's header row *is* its server buffer
+  (click opens it, arrow button folds the network). The macOS sidebar
+  still has the "Server" row. UI can be driven through AT-SPI
+  (`gi.repository.Atspi`: set text, select list rows); synthesized key
+  presses go to whatever window really has focus, so don't use them.
+  A locked screen stops rendering (screenshot action: "nothing to render"). CI's `checks` job installs `libgtk-4-dev
+  libadwaita-1-dev`. `deny.toml` ignores RUSTSEC-2026-0370/0371/0372 (zbus 6
+  merge notices via oo7 0.6; oo7 0.7 needs Rust 1.95).
+- Owner's Linux machine: Ubuntu 26.04, GNOME on Wayland, GTK 4.22 /
+  libadwaita 1.9; mise needed `mise trust` there.
 
 ## Pick up here (2026-11-14)
 

@@ -6,7 +6,15 @@ For anything larger, please open an issue first so we can agree on the approach.
 ## Development
 
 Install [mise](https://mise.jdx.dev); it installs the exact Rust toolchain and
-cargo-deny version CI uses. The end-to-end tests also need Docker.
+cargo-deny version CI uses. The end-to-end tests also need Docker. On Linux,
+the GTK app needs GTK 4 and libadwaita development packages:
+
+```sh
+sudo apt install libgtk-4-dev libadwaita-1-dev        # Debian, Ubuntu
+sudo dnf install gtk4-devel libadwaita-devel          # Fedora, RHEL
+sudo pacman -S gtk4 libadwaita                        # Arch
+sudo zypper install gtk4-devel libadwaita-devel       # openSUSE
+```
 
 ```sh
 mise install                 # once
@@ -41,7 +49,12 @@ Layout:
 | Path | What's there |
 | --- | --- |
 | `crates/backroom-core` | All client logic, no platform code: protocol, transports, SASL, OIDC, soju extensions |
+| `crates/backroom-ffi` | UniFFI bindings for the Swift app |
+| `crates/backroom-app` | App logic shared by native front ends: chat state, composer, timeline, panes, settings |
+| `crates/backroom-gtk` | The Linux app (GTK 4 + libadwaita); `data/` has its desktop entry, AppStream metadata and icons |
 | `crates/backroom-cli` | The `backroom` command-line client used to exercise the core |
+| `apple` | The macOS app (SwiftUI) |
+| `build-aux/flatpak` | The Flatpak manifest |
 | `test/e2e` | Docker Compose stack, soju configs, Keycloak realm for the e2e tests |
 | `scripts` | Helpers used by mise tasks and CI |
 

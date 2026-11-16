@@ -61,3 +61,29 @@ run = "xcodegen generate --spec apple/project.yml --quiet"
 description = "Build the macOS app and run its tests (after apple:core)"
 depends = ["apple:project"]
 run = "xcodebuild -project apple/Backroom.xcodeproj -scheme Backroom -destination 'platform=macOS' -derivedDataPath apple/build -quiet test"
+
+[tasks."linux:run"]
+description = "Run the Linux app (GTK) from source; BACKROOM_LOG=debug for logs"
+run = "cargo run --locked -p backroom-gtk"
+
+[tasks."linux:install"]
+description = "Build the Linux app and install it for this user (menu entry, login callback); --remove to uninstall"
+run = "scripts/linux-install.sh"
+
+[tasks."linux:flatpak"]
+description = "Build the Flatpak and install it for this user (needs flatpak-builder)"
+run = "scripts/flatpak.sh"
+
+[tasks."linux:deb"]
+description = "Build a .deb of the Linux app (target/debian/)"
+run = [
+  "cargo build --locked --release -p backroom-gtk",
+  "mise x cargo:cargo-deb@3.8.0 -- cargo deb --locked --no-build -p backroom-gtk",
+]
+
+[tasks."linux:rpm"]
+description = "Build an .rpm of the Linux app (target/generate-rpm/)"
+run = [
+  "cargo build --locked --release -p backroom-gtk",
+  "mise x cargo:cargo-generate-rpm@0.21.1 -- cargo generate-rpm -p crates/backroom-gtk",
+]

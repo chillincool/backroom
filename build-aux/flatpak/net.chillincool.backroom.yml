@@ -1,0 +1,50 @@
+# Backroom as a Flatpak: runs the same on any distro and desktop.
+#   scripts/flatpak.sh      build and install for this user
+# Local builds fetch crates over the network while building. A Flathub
+# submission needs them vendored instead: generate cargo-sources.json with
+# flatpak-builder-tools' flatpak-cargo-generator and list it in `sources`.
+id: net.chillincool.backroom
+runtime: org.gnome.Platform
+# GNOME 49 brings GTK 4.20 and libadwaita 1.8; bump with the runtime.
+runtime-version: "49"
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: backroom-gtk
+finish-args:
+  - --share=network
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  # Logins: the Secret portal where there is one (GNOME), else the
+  # desktop's Secret Service (KWallet, KeePassXC).
+  - --talk-name=org.freedesktop.secrets
+  # The unread count on launchers that show one (KDE, Ubuntu's dock).
+  - --talk-name=com.canonical.Unity
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/backroom/cargo
+modules:
+  - name: backroom
+    buildsystem: simple
+    build-options:
+      # Local builds only (see above).
+      build-args:
+        - --share=network
+    build-commands:
+      - cargo build --locked --release -p backroom-gtk
+      - install -Dm755 target/release/backroom-gtk /app/bin/backroom-gtk
+      - install -Dm644 crates/backroom-gtk/data/net.chillincool.backroom.desktop /app/share/applications/net.chillincool.backroom.desktop
+      - install -Dm644 crates/backroom-gtk/data/net.chillincool.backroom.metainfo.xml /app/share/metainfo/net.chillincool.backroom.metainfo.xml
+      - install -Dm644 crates/backroom-gtk/data/icons/hicolor/scalable/apps/net.chillincool.backroom.svg /app/share/icons/hicolor/scalable/apps/net.chillincool.backroom.svg
+      - install -Dm644 crates/backroom-gtk/data/icons/hicolor/symbolic/apps/net.chillincool.backroom-symbolic.svg /app/share/icons/hicolor/symbolic/apps/net.chillincool.backroom-symbolic.svg
+    sources:
+      - type: dir
+        path: ../..
+        skip:
+          - target
+          - .flatpak-builder
+          - build-flatpak
+          - apple

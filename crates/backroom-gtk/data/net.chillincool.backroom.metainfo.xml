@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>net.chillincool.backroom</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Backroom</name>
+  <summary>Chat on IRC through the soju bouncer or directly</summary>
+  <developer id="net.chillincool">
+    <name>chillincool</name>
+  </developer>
+  <description>
+    <p>
+      Backroom is an IRC client built for the soju bouncer: your networks,
+      channels and history live on soju, and every device picks up where you
+      left off. It also connects to IRC networks directly, keeping history
+      on your computer.
+    </p>
+    <ul>
+      <li>Log in to soju with a password or single sign-on</li>
+      <li>Chat history, read markers and search from soju</li>
+      <li>Tabs and split panes</li>
+      <li>Notifications for mentions and private messages</li>
+      <li>Themes, fonts and message layouts</li>
+      <li>Link previews only when you ask for them</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">net.chillincool.backroom.desktop</launchable>
+  <url type="homepage">https://github.com/chillincool/backroom</url>
+  <url type="bugtracker">https://github.com/chillincool/backroom/issues</url>
+  <url type="vcs-browser">https://github.com/chillincool/backroom</url>
+  <content_rating type="oars-1.1">
+    <content_attribute id="social-chat">intense</content_attribute>
+  </content_rating>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </supports>
+  <requires>
+    <display_length compare="ge">360</display_length>
+  </requires>
+  <branding>
+    <color type="primary" scheme_preference="light">#c9b8f0</color>
+    <color type="primary" scheme_preference="dark">#3b2a6b</color>
+  </branding>
+  <releases>
+    <release version="0.1.0" date="2026-11-16">
+      <description>
+        <p>First Linux release.</p>
+      </description>
+    </release>
+  </releases>
+</component>
