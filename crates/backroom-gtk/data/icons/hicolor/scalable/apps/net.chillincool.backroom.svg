@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#6d4fc2"/>
+      <stop offset="1" stop-color="#3b2a6b"/>
+    </linearGradient>
+    <linearGradient id="door" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffd27a"/>
+      <stop offset="1" stop-color="#f6a13a"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="12" width="112" height="104" rx="22" fill="url(#bg)"/>
+  <rect x="8" y="100" width="112" height="16" rx="8" fill="#000" opacity="0.15"/>
+  <!-- A door left ajar, light spilling out -->
+  <path d="M44 30 h40 a4 4 0 0 1 4 4 v62 h-48 v-62 a4 4 0 0 1 4 -4 z" fill="#241a45"/>
+  <path d="M48 36 h32 v60 h-32 z" fill="url(#door)"/>
+  <path d="M48 36 l18 6 v58 l-18 -4 z" fill="#4a3591"/>
+  <circle cx="61" cy="70" r="2.5" fill="#ffd27a"/>
+  <!-- Speech bubble -->
+  <path d="M78 46 h26 a6 6 0 0 1 6 6 v14 a6 6 0 0 1 -6 6 h-14 l-8 7 v-7 h-4 a6 6 0 0 1 -6 -6 v-14 a6 6 0 0 1 6 -6 z" fill="#ffffff"/>
+  <circle cx="84" cy="59" r="2.6" fill="#3b2a6b"/>
+  <circle cx="91" cy="59" r="2.6" fill="#3b2a6b"/>
+  <circle cx="98" cy="59" r="2.6" fill="#3b2a6b"/>
+</svg>

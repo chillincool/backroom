@@ -13,3 +13,8 @@
 /apple/Backroom/Info.plist
 /apple/build/
 /apple/Signing.local.xcconfig
+
+# Flatpak builds (scripts/flatpak.sh)
+/build-flatpak
+/.flatpak-builder
+/backroom.flatpak

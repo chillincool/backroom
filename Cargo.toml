@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["crates/backroom-core", "crates/backroom-cli", "crates/backroom-ffi"]
+members = [
+  "crates/backroom-core",
+  "crates/backroom-cli",
+  "crates/backroom-ffi",
+  "crates/backroom-app",
+  "crates/backroom-gtk",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,6 +17,8 @@ publish = false
 
 [workspace.dependencies]
 backroom-core = { path = "crates/backroom-core" }
+backroom-ffi = { path = "crates/backroom-ffi" }
+backroom-app = { path = "crates/backroom-app" }
 
 anyhow = "1"
 async-trait = "0.1"
@@ -20,6 +28,8 @@ clap = { version = "4", features = ["derive", "env"] }
 dirs = "7"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 httparse = "1"
+# Web links in message text (backroom-app).
+linkify = "0.11"
 oauth2 = { version = "5", default-features = false, features = ["reqwest", "rustls-tls"] }
 open = "5"
 # Link previews. Same major as oauth2 uses; rustls (ring) like everything else.
@@ -42,8 +52,17 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uniffi = "0.32.2"
 url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
 webpki-roots = "1"
 zeroize = "1"
+
+# Linux app (backroom-gtk). Baseline: GTK 4.14 and libadwaita 1.5 (GNOME
+# 46: Ubuntu 24.04, Debian 13, Fedora 40+, RHEL 10); the Flatpak brings newer.
+gtk = { package = "gtk4", version = "0.11", features = ["gnome_46"] }
+adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
+# Secret Service (GNOME Keyring, KWallet, KeePassXC) or, in a Flatpak, the
+# Secret portal. RustCrypto, not OpenSSL.
+oo7 = { version = "0.6", default-features = false, features = ["tokio", "native_crypto"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

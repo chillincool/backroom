@@ -1,11 +1,26 @@
 # Backroom
 
-A native IRC client for the [soju](https://soju.im) bouncer. A Rust core holds
-all the logic; front ends (SwiftUI on macOS/iOS later, via UniFFI) supply only
-platform services.
+A native IRC client for the [soju](https://soju.im) bouncer, or for IRC
+networks directly. A Rust core holds the logic; front ends supply only platform
+services: SwiftUI on macOS (via UniFFI) and GTK 4 + libadwaita on Linux.
 
-> **Early development.** The Rust core and a command-line test client work
-> against soju today; the macOS app doesn't exist yet.
+> **Early development.** The macOS and Linux apps work against soju and
+> without a bouncer; expect rough edges.
+
+## Linux
+
+Runs on any desktop (GNOME, KDE, Xfce, …) with GTK ≥ 4.14 and libadwaita ≥ 1.5
+(Ubuntu 24.04, Debian 13, Fedora 40, RHEL 10 or later), or anywhere as a
+Flatpak. Logins are kept in your keyring (GNOME Keyring, KWallet, KeePassXC).
+From a checkout, with [mise](https://mise.jdx.dev) and the GTK development
+packages (see [CONTRIBUTING](CONTRIBUTING.md)):
+
+```sh
+mise run linux:run        # run from source
+mise run linux:install    # install for your user: app menu entry, login callback
+mise run linux:flatpak    # or build and install the Flatpak
+mise run linux:deb        # or a .deb (target/debian/), linux:rpm for an .rpm
+```
 
 ## Layout
 
@@ -21,6 +36,11 @@ platform services.
     reconnect with backoff, events out (messages, buffers, history, read
     markers) and commands in
   - `model.rs`: platform-neutral chat model and message routing
+- `crates/backroom-ffi`: UniFFI bindings for the Swift app
+- `crates/backroom-app`: app logic shared by native front ends (chat state,
+  composer commands, Tab completion, timeline, panes and tabs, settings, themes)
+- `crates/backroom-gtk`: the Linux app (GTK 4 + libadwaita)
+- `apple/`: the macOS app (SwiftUI)
 - `crates/backroom-cli`: the `backroom` spike CLI
 
 ## CLI

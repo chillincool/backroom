@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=Backroom
+GenericName=IRC Client
+Comment=Chat on IRC through the soju bouncer or directly
+Exec=backroom-gtk %U
+Icon=net.chillincool.backroom
+Terminal=false
+Categories=Network;Chat;InstantMessaging;IRCClient;GTK;
+Keywords=IRC;chat;soju;bouncer;
+# The single sign-on login returns to backroom://oauth/callback.
+MimeType=x-scheme-handler/backroom;
+StartupNotify=true
+StartupWMClass=net.chillincool.backroom
+SingleMainWindow=true

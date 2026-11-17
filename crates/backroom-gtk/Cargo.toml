@@ -1,0 +1,70 @@
+[package]
+name = "backroom-gtk"
+description = "Backroom for Linux: GTK 4 and libadwaita"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "backroom-gtk"
+path = "src/main.rs"
+
+# GTK is the front end for Linux and the BSDs; on macOS this builds a stub
+# so `cargo clippy --workspace` works there without GTK installed.
+[target.'cfg(all(unix, not(target_vendor = "apple")))'.dependencies]
+adw.workspace = true
+backroom-app.workspace = true
+backroom-ffi.workspace = true
+chrono.workspace = true
+gtk.workspace = true
+oo7.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true
+
+# `mise run linux:deb` (cargo-deb): Debian, Ubuntu and derivatives with
+# GTK ≥ 4.14 and libadwaita ≥ 1.5 (Ubuntu 24.04, Debian 13 and later).
+[package.metadata.deb]
+name = "backroom"
+maintainer = "chillincool"
+copyright = "chillincool"
+license-file = ["../../LICENSE", "0"]
+section = "net"
+priority = "optional"
+depends = "$auto"
+extended-description = """\
+An IRC client for the soju bouncer (password or single sign-on login, \
+history, read markers and search from soju), or for IRC networks directly. \
+Tabs and split panes, notifications, themes, link previews on request."""
+assets = [
+  ["target/release/backroom-gtk", "usr/bin/", "755"],
+  ["data/net.chillincool.backroom.desktop", "usr/share/applications/", "644"],
+  ["data/net.chillincool.backroom.metainfo.xml", "usr/share/metainfo/", "644"],
+  ["data/icons/hicolor/scalable/apps/net.chillincool.backroom.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+  ["data/icons/hicolor/symbolic/apps/net.chillincool.backroom-symbolic.svg", "usr/share/icons/hicolor/symbolic/apps/", "644"],
+]
+
+# `mise run linux:rpm` (cargo-generate-rpm): Fedora 40+, RHEL 10 and the like.
+[package.metadata.generate-rpm]
+name = "backroom"
+summary = "IRC client for the soju bouncer"
+url = "https://github.com/chillincool/backroom"
+assets = [
+  { source = "target/release/backroom-gtk", dest = "/usr/bin/backroom-gtk", mode = "755" },
+  { source = "data/net.chillincool.backroom.desktop", dest = "/usr/share/applications/net.chillincool.backroom.desktop", mode = "644" },
+  { source = "data/net.chillincool.backroom.metainfo.xml", dest = "/usr/share/metainfo/net.chillincool.backroom.metainfo.xml", mode = "644" },
+  { source = "data/icons/hicolor/scalable/apps/net.chillincool.backroom.svg", dest = "/usr/share/icons/hicolor/scalable/apps/net.chillincool.backroom.svg", mode = "644" },
+  { source = "data/icons/hicolor/symbolic/apps/net.chillincool.backroom-symbolic.svg", dest = "/usr/share/icons/hicolor/symbolic/apps/net.chillincool.backroom-symbolic.svg", mode = "644" },
+]
+
+[package.metadata.generate-rpm.requires]
+gtk4 = ">= 4.14"
+libadwaita = ">= 1.5"
