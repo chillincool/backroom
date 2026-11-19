@@ -4,10 +4,10 @@
 #   mise tasks          list tasks
 
 [tools]
-rust = { version = "1.93.0", components = "clippy,rustfmt" }
-"aqua:EmbarkStudios/cargo-deny" = "0.20.2"
+rust = { version = "1.100.0", components = "clippy,rustfmt" }
+"aqua:EmbarkStudios/cargo-deny" = "0.22.0"
 # Generates apple/Backroom.xcodeproj from apple/project.yml; macOS only.
-xcodegen = { version = "2.46.0", os = ["macos"] }
+xcodegen = { version = "2.48.0", os = ["macos"] }
 
 [tasks.fmt]
 description = "Fail if any Rust file needs rustfmt"
